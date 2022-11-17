@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package greptime.v1.client;
+
+import "greptime/v1/client/common.proto";
+
+// TODO(jiachun, fys)
+// An `AdminRequest` operates on the same tenant.
+message AdminRequest {
+  RequestHeader header = 1;
+}
+
+message AdminResponse {
+  ResponseHeader header = 1;
+}

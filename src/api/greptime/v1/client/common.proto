@@ -1,23 +1,29 @@
 syntax = "proto3";
 
-package greptime.v1;
+package greptime.v1.client;
 
 message RequestHeader {
-  string tenant = 1;
+  uint64 protocol_version = 1;
+  string tenant = 2;
+}
+
+message ResponseHeader {
+  uint64 protocol_version = 1;
+}
+
+message Error {
+  int32 code = 1;
+  string err_msg = 2;
 }
 
 message ExprHeader {
   uint32 version = 1;
-  // The region number list of current request.
-  repeated uint32 region_numbers = 2;
 }
 
 message ResultHeader {
   uint32 version = 1;
   uint32 code = 2;
   string err_msg = 3;
-  // The region number list of current respone.
-  repeated uint32 region_numbers = 4;
 }
 
 message MutateResult {

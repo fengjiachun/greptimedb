@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package greptime.v1.client;
+
+import "greptime/v1/client/admin.proto";
+import "greptime/v1/client/database.proto";
+
+service Greptime {
+  rpc Database(DatabaseRequest) returns (DatabaseResponse) {}
+  
+  rpc Admin(AdminRequest) returns (AdminResponse) {}
+}

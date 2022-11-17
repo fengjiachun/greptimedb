@@ -1,18 +1,20 @@
 syntax = "proto3";
 
-package greptime.v1;
+package greptime.v1.client;
 
-import "greptime/v1/common.proto";
+import "greptime/v1/column.proto";
+import "greptime/v1/client/common.proto";
 
-// An `DatabaseRequest` operates on the same schema.
+// An `DatabaseRequest` operates on the same database.
 message DatabaseRequest {
-  string catalog_name = 1;
-  string schema_name = 2;
+  RequestHeader header = 1;
+  string database_name = 2;
   repeated ObjectExpr exprs = 3;
 }
 
 message DatabaseResponse {
-  repeated ObjectResult results = 1;
+  ResponseHeader header = 1;
+  repeated ObjectResult results = 2;
 }
 
 message ObjectExpr {
@@ -25,18 +27,10 @@ message ObjectExpr {
   }
 }
 
-// TODO(fys): Only support sql now, and will support promql etc in the future
 message SelectExpr {
   oneof expr {
     string sql = 1;
-    bytes logical_plan = 2;
-    PhysicalPlan physical_plan = 15;
   }
-}
-
-message PhysicalPlan {
-  bytes original_ql = 1;
-  bytes plan = 2;
 }
 
 message InsertExpr {
@@ -46,9 +40,9 @@ message InsertExpr {
   map<string, bytes> options = 4;
 }
 
-// TODO(jiachun)
+// TODO(jiachun, fys)
 message UpdateExpr {}
-// TODO(jiachun)
+// TODO(jiachun, fys)
 message DeleteExpr {}
 
 message ObjectResult {
