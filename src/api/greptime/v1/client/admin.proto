@@ -5,9 +5,11 @@ package greptime.v1.client;
 import "greptime/v1/client/common.proto";
 
 // TODO(jiachun, fys)
-// An `AdminRequest` operates on the same tenant.
+// An `AdminRequest` operates on the same database.
 message AdminRequest {
   RequestHeader header = 1;
+  // database_name is not required if the request is `CreateDatabase`.
+  optional string database_name = 2;
 }
 
 message AdminResponse {

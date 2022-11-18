@@ -8,7 +8,9 @@ import "greptime/v1/common.proto";
 // An `AdminRequest` operates on the same catalog.
 message AdminRequest {
   string catalog_name = 1;
-  repeated AdminExpr exprs = 2;
+  // schema_name is not required if the request is `CreateDatabase`.
+  optional string schema_name = 2;
+  repeated AdminExpr exprs = 3;
 }
 
 message AdminResponse {
@@ -32,16 +34,15 @@ message AdminResult {
 }
 
 message CreateTableExpr {
-  string schema_name = 1;
-  string table_name = 2;
-  string desc = 3;
-  repeated ColumnDef column_defs = 4;
-  string time_index = 5;
-  repeated string primary_keys = 6;
-  bool create_if_not_exists = 7;
-  map<string, string> table_options = 8;
-  uint32 table_id = 9;
-  repeated uint32 region_ids = 10;
+  string table_name = 1;
+  string desc = 2;
+  repeated ColumnDef column_defs = 3;
+  string time_index = 4;
+  repeated string primary_keys = 5;
+  bool create_if_not_exists = 6;
+  map<string, string> table_options = 7;
+  uint32 table_id = 8;
+  repeated uint32 region_ids = 9;
 }
 
 message AlterExpr {

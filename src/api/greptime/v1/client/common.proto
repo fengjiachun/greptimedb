@@ -10,6 +10,7 @@ message RequestHeader {
 
 message ResponseHeader {
   uint64 protocol_version = 1;
+  map<string, string> attrs = 16;
 }
 
 message Error {

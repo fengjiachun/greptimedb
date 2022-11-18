@@ -3,19 +3,20 @@ syntax = "proto3";
 package greptime.v1;
 
 import "greptime/v1/common.proto";
+import "greptime/v1/column.proto";
 
 // An `DatabaseRequest` operates on the same schema.
 message DatabaseRequest {
   string catalog_name = 1;
   string schema_name = 2;
-  repeated ObjectExpr exprs = 3;
+  repeated DatabaseExpr exprs = 3;
 }
 
 message DatabaseResponse {
-  repeated ObjectResult results = 1;
+  repeated DatabaseResult results = 1;
 }
 
-message ObjectExpr {
+message DatabaseExpr {
   ExprHeader header = 1;
   oneof expr {
     InsertExpr insert = 2;
@@ -43,7 +44,6 @@ message InsertExpr {
   string table_name = 1;
   repeated Column columns = 2;
   uint32 row_count = 3;
-  map<string, bytes> options = 4;
 }
 
 // TODO(jiachun)
@@ -51,7 +51,7 @@ message UpdateExpr {}
 // TODO(jiachun)
 message DeleteExpr {}
 
-message ObjectResult {
+message DatabaseResult {
   ResultHeader header = 1;
   oneof result {
     SelectResult select = 2;
