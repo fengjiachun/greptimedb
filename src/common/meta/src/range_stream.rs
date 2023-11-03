@@ -100,11 +100,9 @@ const DEFAULT_ADAPTIVE_PAGE_SIZE: usize = 1024;
 
 impl PaginationStreamFactory {
     fn try_reduce_adaptive_page_size(&mut self) -> Result<()> {
-        let adaptive_page_size = self.adaptive_page_size.unwrap_or(if self.page_size == 0 {
-            DEFAULT_ADAPTIVE_PAGE_SIZE * 2
-        } else {
-            self.page_size
-        });
+        let Some(adaptive_page_size) = self.adaptive_page_size else {
+            Ok(())
+        };
 
         let new_adaptive_page_size = adaptive_page_size / 2;
         ensure!(
@@ -141,11 +139,20 @@ impl PaginationStreamFactory {
 
     pub async fn read_next(mut self) -> Result<(Self, Option<RangeResponse>)> {
         if self.more {
+            if self.adaptive_page_size.is_none() {
+                self.adaptive_page_size = if self.page_size == 0 {
+                    Some(DEFAULT_ADAPTIVE_PAGE_SIZE)
+                } else {
+                    Some(self.page_size)
+                };
+            }
+
             let resp = self
                 .adaptive_range(RangeRequest {
                     key: self.key.clone(),
                     range_end: self.range_end.clone(),
-                    limit: self.adaptive_page_size.unwrap_or(self.page_size) as i64,
+                    // Safety: must exist.
+                    limit: self.adaptive_page_size.unwrap() as i64,
                     keys_only: self.keys_only,
                 })
                 .await?;
