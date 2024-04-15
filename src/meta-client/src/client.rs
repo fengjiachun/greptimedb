@@ -283,6 +283,7 @@ impl ClusterInfo for MetaClient {
         };
 
         if let Some(prefix) = nodes_key_prefix {
+            // Looks for all nodes with the given prefix (`cluster/` or `cluster/role/`).
             let req = RangeRequest::new().with_prefix(prefix);
             let res = cluster_client.range(req).await?;
             for kv in res.kvs {
@@ -468,47 +469,40 @@ impl MetaClient {
         Ok(res)
     }
 
-    #[inline]
     pub fn heartbeat_client(&self) -> Result<HeartbeatClient> {
         self.heartbeat.clone().context(NotStartedSnafu {
             name: "heartbeat_client",
         })
     }
 
-    #[inline]
     pub fn store_client(&self) -> Result<StoreClient> {
         self.store.clone().context(NotStartedSnafu {
             name: "store_client",
         })
     }
 
-    #[inline]
     pub fn lock_client(&self) -> Result<LockClient> {
         self.lock.clone().context(NotStartedSnafu {
             name: "lock_client",
         })
     }
 
-    #[inline]
     pub fn procedure_client(&self) -> Result<ProcedureClient> {
-        self.procedure
-            .clone()
-            .context(NotStartedSnafu { name: "procedure_client" })
+        self.procedure.clone().context(NotStartedSnafu {
+            name: "procedure_client",
+        })
     }
 
-    #[inline]
     pub fn cluster_client(&self) -> Result<ClusterClient> {
         self.cluster.clone().context(NotStartedSnafu {
             name: "cluster_client",
         })
     }
 
-    #[inline]
     pub fn channel_config(&self) -> &ChannelConfig {
         self.channel_manager.config()
     }
 
-    #[inline]
     pub fn id(&self) -> Id {
         self.id
     }

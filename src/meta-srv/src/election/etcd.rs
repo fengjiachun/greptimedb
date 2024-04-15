@@ -166,7 +166,10 @@ impl Election for EtcdElection {
 
             if let Some(res) = receiver.message().await.context(error::EtcdFailedSnafu)? {
                 if res.ttl() <= 0 {
-                    // Failed to keep alive, just break the loop.
+                    warn!(
+                        "Failed to keep alive for candidate: {}, will retry.",
+                        self.leader_value
+                    );
                     break;
                 }
             }
@@ -186,7 +189,7 @@ impl Election for EtcdElection {
 
         res.kvs()
             .iter()
-            .map(|kv| Ok(LeaderValue(String::from_utf8_lossy(kv.value()).to_string())))
+            .map(|kv| Ok(LeaderValue::from(kv.value())))
             .collect()
     }
 
@@ -273,8 +276,7 @@ impl Election for EtcdElection {
                 .await
                 .context(error::EtcdFailedSnafu)?;
             let leader_value = res.kv().context(error::NoLeaderSnafu)?.value();
-            let leader_value = String::from_utf8_lossy(leader_value).to_string();
-            Ok(LeaderValue(leader_value))
+            Ok(LeaderValue::from(leader_value))
         }
     }
 

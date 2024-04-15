@@ -208,6 +208,12 @@ impl Context {
 
 pub struct LeaderValue(pub String);
 
+impl From<&[u8]> for LeaderValue {
+    fn from(v: &[u8]) -> Self {
+        LeaderValue(String::from_utf8_lossy(v).to_string())
+    }
+}
+
 #[derive(Clone)]
 pub struct SelectorContext {
     pub server_addr: String,
