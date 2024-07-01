@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["moka_cache_manager"],"trait":["CacheManager","DirWriterProvider"],"traitalias":["InitBlobFn","InitDirFn"],"type":["BoxWriter","CacheManagerRef","DirWriterProviderRef","WriteResult"]};

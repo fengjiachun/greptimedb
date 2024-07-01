@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["dir_meta","reader","writer"],"struct":["CachedPuffinReader","CachedPuffinWriter"]};

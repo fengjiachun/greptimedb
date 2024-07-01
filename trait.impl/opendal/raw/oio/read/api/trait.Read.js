@@ -1,0 +1,3 @@
+(function() {var implementors = {
+"object_store":[["impl&lt;I: Access&gt; Read for <a class=\"struct\" href=\"object_store/layers/lru_cache/read_cache/struct.ReadCacheReader.html\" title=\"struct object_store::layers::lru_cache::read_cache::ReadCacheReader\">ReadCacheReader</a>&lt;I&gt;"],["impl&lt;R: Read&gt; Read for <a class=\"struct\" href=\"object_store/layers/prometheus/struct.PrometheusMetricWrapper.html\" title=\"struct object_store::layers::prometheus::PrometheusMetricWrapper\">PrometheusMetricWrapper</a>&lt;R&gt;"]]
+};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
