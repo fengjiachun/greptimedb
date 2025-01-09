@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ELASTICSEARCH_VERSION"],"fn":["convert_es_input_to_log_values","elasticsearch_headers","get_log_value_from_msg_field","handle_bulk_api","handle_get_license","handle_get_version","write_bulk_response"],"static":["ELASTICSEARCH_HEADERS"]};
