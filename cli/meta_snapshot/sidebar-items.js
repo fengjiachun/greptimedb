@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["MetaCommand","MetaSnapshotCommand"],"fn":["create_local_file_object_store"],"struct":["MetaConnection","MetaInfoCommand","MetaInfoTool","MetaRestoreCommand","MetaRestoreTool","MetaSaveCommand","MetaSnapshotTool","S3Config"]};

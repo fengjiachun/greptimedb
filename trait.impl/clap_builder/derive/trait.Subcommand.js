@@ -1,0 +1,9 @@
+(function() {
+    var implementors = Object.fromEntries([["cli",[["impl Subcommand for <a class=\"enum\" href=\"cli/enum.DataCommand.html\" title=\"enum cli::DataCommand\">DataCommand</a>"],["impl Subcommand for <a class=\"enum\" href=\"cli/enum.MetaCommand.html\" title=\"enum cli::MetaCommand\">MetaCommand</a>"],["impl Subcommand for <a class=\"enum\" href=\"cli/meta_snapshot/enum.MetaSnapshotCommand.html\" title=\"enum cli::meta_snapshot::MetaSnapshotCommand\">MetaSnapshotCommand</a>"]]],["cmd",[["impl Subcommand for <a class=\"enum\" href=\"cmd/datanode/enum.SubCommand.html\" title=\"enum cmd::datanode::SubCommand\">SubCommand</a>"],["impl Subcommand for <a class=\"enum\" href=\"cmd/flownode/enum.SubCommand.html\" title=\"enum cmd::flownode::SubCommand\">SubCommand</a>"],["impl Subcommand for <a class=\"enum\" href=\"cmd/frontend/enum.SubCommand.html\" title=\"enum cmd::frontend::SubCommand\">SubCommand</a>"],["impl Subcommand for <a class=\"enum\" href=\"cmd/metasrv/enum.SubCommand.html\" title=\"enum cmd::metasrv::SubCommand\">SubCommand</a>"],["impl Subcommand for <a class=\"enum\" href=\"cmd/standalone/enum.SubCommand.html\" title=\"enum cmd::standalone::SubCommand\">SubCommand</a>"]]],["greptime",[["impl Subcommand for <a class=\"enum\" href=\"greptime/enum.SubCommand.html\" title=\"enum greptime::SubCommand\">SubCommand</a>"]]],["plugins",[["impl Subcommand for <a class=\"enum\" href=\"plugins/enum.SubCommand.html\" title=\"enum plugins::SubCommand\">SubCommand</a>"]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":57,"fragment_lengths":[437,717,147,144]}
