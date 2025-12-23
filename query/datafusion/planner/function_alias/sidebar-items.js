@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["AGGREGATE_ALIASES","SCALAR_ALIASES"],"fn":["aggregate_alias_names","resolve_aggregate","resolve_scalar","scalar_alias_names"],"static":["AGGREGATE_FUNCTION_ALIAS","SCALAR_FUNCTION_ALIAS"]};
