@@ -29,6 +29,7 @@ common-datasource.workspace = true
 common-error.workspace = true
 common-function.workspace = true
 common-macro.workspace = true
+common-memory-manager.workspace = true
 common-meta.workspace = true
 common-plugins.workspace = true
 common-query.workspace = true

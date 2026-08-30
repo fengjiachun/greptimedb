@@ -14,6 +14,7 @@
 
 mod context;
 mod default_serializer;
+pub mod ledger_pool;
 pub mod options;
 pub mod runtime;
 mod state;
