@@ -11653,6 +11653,7 @@ dependencies = [
  "store-api",
  "substrait 1.3.0",
  "table",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",

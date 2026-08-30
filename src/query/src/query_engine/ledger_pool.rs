@@ -383,3 +383,273 @@ mod tests {
         assert_eq!(dyn_pool.reserved(), 0);
     }
 }
+
+/// End-to-end tests: real DataFusion `ORDER BY` queries executing on a
+/// [`LedgerMemoryPool`] (wrapped in `TrackConsumersPool`, with an explicit
+/// `DiskManager`), exercising the spill path, the graceful-error path, the
+/// one-account-two-faces contract, and runtime limit shrink.
+#[cfg(test)]
+mod e2e_tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    use common_memory_manager::ledger::Category;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::memory_pool::TrackConsumersPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::physical_plan::{ExecutionPlan, collect};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const MB: u64 = 1024 * 1024;
+    /// Payload width making a row cost ~262 B in Arrow memory (i64 key +
+    /// 250 B string data + 4 B offset), so row counts translate to sizes.
+    const PAYLOAD_LEN: usize = 250;
+    const ROWS_PER_BATCH: usize = 512;
+
+    fn query_account(limit_bytes: u64) -> Account {
+        Account::new(
+            "query/engine",
+            Category::Query,
+            limit_bytes,
+            PermitGranularity::Kilobyte,
+        )
+    }
+
+    /// A `SessionContext` whose operator memory comes from `account` through
+    /// `TrackConsumersPool<LedgerMemoryPool>`, with an explicit disk manager.
+    fn ledger_session(account: &Account, disk: DiskManagerMode) -> SessionContext {
+        let pool = TrackConsumersPool::new(
+            LedgerMemoryPool::new(account.clone(), account.granularity()),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(pool))
+            .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(disk))
+            .build_arc()
+            .unwrap();
+        let config = SessionConfig::new()
+            // One partition, one sort consumer: deterministic accounting.
+            .with_target_partitions(1)
+            .with_batch_size(ROWS_PER_BATCH)
+            // The 10 MiB default merge reservation dwarfs the test budgets
+            // and would fail the sort before it could ever spill.
+            .with_sort_spill_reservation_bytes(256 * 1024)
+            .with_sort_in_place_threshold_bytes(0);
+        SessionContext::new_with_config_rt(config, runtime)
+    }
+
+    /// A temp spill root (kept alive by the returned guard) and the disk
+    /// manager mode pointing at it.
+    fn spill_dir() -> (TempDir, DiskManagerMode) {
+        let dir = tempfile::Builder::new()
+            .prefix("ledger-pool-spill-")
+            .tempdir()
+            .unwrap();
+        let mode = DiskManagerMode::Directories(vec![dir.path().to_path_buf()]);
+        (dir, mode)
+    }
+
+    /// Registers table `t(k BIGINT, payload STRING)` holding `rows` rows in
+    /// descending key order, chunked into batches of `rows_per_batch`.
+    fn register_wide_table(ctx: &SessionContext, rows: usize, rows_per_batch: usize) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let mut batches = Vec::new();
+        let mut next = rows as i64;
+        while next > 0 {
+            let n = rows_per_batch.min(next as usize) as i64;
+            let keys: Vec<i64> = (0..n).map(|i| next - i).collect();
+            let payloads: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{k:0>width$}", width = PAYLOAD_LEN))
+                .collect();
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(StringArray::from(payloads)),
+            ];
+            batches.push(RecordBatch::try_new(schema.clone(), columns).unwrap());
+            next -= n;
+        }
+        let table = MemTable::try_new(schema, vec![batches]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+    }
+
+    /// Sums `spill_count`/`spilled_bytes` over the whole physical plan.
+    fn spill_metrics(plan: &dyn ExecutionPlan) -> (usize, usize) {
+        let (mut count, mut bytes) = (0, 0);
+        if let Some(metrics) = plan.metrics() {
+            count += metrics.spill_count().unwrap_or(0);
+            bytes += metrics.spilled_bytes().unwrap_or(0);
+        }
+        for child in plan.children() {
+            let (c, b) = spill_metrics(child.as_ref());
+            count += c;
+            bytes += b;
+        }
+        (count, bytes)
+    }
+
+    /// Runs the ordering query, asserts the result is complete and fully
+    /// sorted, and returns `(spill_count, spilled_bytes)` of the executed
+    /// plan.
+    async fn run_sorted_query(ctx: &SessionContext, rows: usize) -> (usize, usize) {
+        let df = ctx
+            .sql("SELECT k, payload FROM t ORDER BY k")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let batches = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, rows);
+        let mut expected = 1i64;
+        for batch in &batches {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for &k in keys.values().iter() {
+                assert_eq!(k, expected);
+                expected += 1;
+            }
+        }
+        spill_metrics(plan.as_ref())
+    }
+
+    /// A sort ~4x larger than the budget completes by spilling through the
+    /// explicitly configured disk manager, with the spill visible in the
+    /// plan metrics and the account fully drained afterwards.
+    #[tokio::test]
+    async fn sort_beyond_budget_spills_and_completes() {
+        const ROWS: usize = 64_000; // ~16 MiB against a 4 MiB budget
+
+        let account = query_account(4 * MB);
+        let (_dir, disk) = spill_dir();
+        let ctx = ledger_session(&account, disk);
+        register_wide_table(&ctx, ROWS, ROWS_PER_BATCH);
+
+        let (spill_count, spilled_bytes) = run_sorted_query(&ctx, ROWS).await;
+        assert!(spill_count > 0, "expected the sort to spill");
+        assert!(spilled_bytes > 0);
+
+        // Temp files are cleaned up and every reservation returned to the
+        // ledger: the account is immediately reusable.
+        assert_eq!(ctx.runtime_env().disk_manager.used_disk_space(), 0);
+        assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0);
+        assert_eq!(account.used_bytes(), 0);
+    }
+
+    /// With the disk manager disabled, a sort that cannot fit its input in
+    /// the budget fails with a resources-exhausted error naming the consumer
+    /// (via `TrackConsumersPool`) and the backing account — never a panic —
+    /// and leaves no reservation behind.
+    #[tokio::test]
+    async fn sort_beyond_budget_without_disk_fails_gracefully() {
+        const ROWS: usize = 40_000; // ~10 MiB in one batch against 4 MiB
+
+        let account = query_account(4 * MB);
+        let ctx = ledger_session(&account, DiskManagerMode::Disabled);
+        // A single batch larger than the whole budget: the sorter's very
+        // first reservation fails, surfacing the pool's error undiluted by
+        // a later failed-spill error.
+        register_wide_table(&ctx, ROWS, ROWS);
+
+        let df = ctx
+            .sql("SELECT k, payload FROM t ORDER BY k")
+            .await
+            .unwrap();
+        let err = df.collect().await.unwrap_err();
+
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "unexpected error: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("ExternalSorter"), "missing consumer: {msg}");
+        assert!(msg.contains("query/engine"), "missing account: {msg}");
+
+        // The failed query leaves no residue in the pool or the account.
+        assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0);
+        assert_eq!(account.used_bytes(), 0);
+    }
+
+    /// One account, two faces, under a real query: an async-face guard (the
+    /// scan-tracker face) squeezes the pool face until the same query has to
+    /// spill; releasing the guard restores in-memory execution.
+    #[tokio::test]
+    async fn external_guard_squeezes_query_into_spill_until_released() {
+        const ROWS: usize = 12_000; // ~3 MiB dataset
+
+        let account = query_account(16 * MB);
+        let (_dir, disk) = spill_dir();
+        let ctx = ledger_session(&account, disk);
+        register_wide_table(&ctx, ROWS, ROWS_PER_BATCH);
+
+        // Baseline: the query runs entirely in memory.
+        let (spill_count, _) = run_sorted_query(&ctx, ROWS).await;
+        assert_eq!(spill_count, 0, "baseline must not spill");
+
+        // The async face takes 12 of the 16 MiB.
+        let squeeze = account.acquire(12 * MB).await.unwrap();
+        assert_eq!(account.used_bytes(), 12 * MB);
+
+        // The pool face sees only the remainder: the same query now spills,
+        // yet still completes correctly.
+        let (spill_count, _) = run_sorted_query(&ctx, ROWS).await;
+        assert!(spill_count > 0, "expected the squeezed query to spill");
+        // The query returned its reservations; only the guard remains.
+        assert_eq!(account.used_bytes(), 12 * MB);
+
+        // Releasing the guard restores pure in-memory execution.
+        drop(squeeze);
+        let (spill_count, _) = run_sorted_query(&ctx, ROWS).await;
+        assert_eq!(spill_count, 0, "released budget must stop the spilling");
+        assert_eq!(account.used_bytes(), 0);
+    }
+
+    /// Shrinking the account limit at runtime changes how the next DataFusion
+    /// query executes: what ran in memory under the old limit spills under
+    /// the new one, once `collect_shrink` converges the deficit.
+    #[tokio::test]
+    async fn runtime_shrink_pushes_query_into_spill() {
+        const ROWS: usize = 32_000; // ~8 MiB dataset
+
+        let account = query_account(32 * MB);
+        let (_dir, disk) = spill_dir();
+        let ctx = ledger_session(&account, disk);
+        register_wide_table(&ctx, ROWS, ROWS_PER_BATCH);
+
+        // Under the initial limit the query runs entirely in memory.
+        let (spill_count, _) = run_sorted_query(&ctx, ROWS).await;
+        assert_eq!(spill_count, 0, "baseline must not spill");
+
+        // Shrink to 4 MiB while 28 MiB are granted to an async-face guard:
+        // the 4 idle MiB harvest instantly, the remaining 24 MiB deficit
+        // converges via the collector once the guard releases.
+        let held = account.acquire(28 * MB).await.unwrap();
+        assert_eq!(account.set_limit_bytes(4 * MB), 24 * MB);
+        assert_eq!(account.effective_limit_bytes(), 28 * MB);
+        drop(held);
+        account.collect_shrink().await;
+        assert_eq!(account.effective_limit_bytes(), 4 * MB);
+
+        // The pool reports the new limit, and the same query now spills.
+        assert!(matches!(
+            ctx.runtime_env().memory_pool.memory_limit(),
+            MemoryLimit::Finite(n) if n as u64 == 4 * MB
+        ));
+        let (spill_count, _) = run_sorted_query(&ctx, ROWS).await;
+        assert!(spill_count > 0, "expected the shrunk budget to force spill");
+        assert_eq!(account.used_bytes(), 0);
+    }
+}
