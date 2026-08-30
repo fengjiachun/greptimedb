@@ -75,6 +75,7 @@ use standalone::{
     StandaloneDatanodeManager, StandaloneInformationExtension,
     StandaloneRepartitionProcedureFactory,
 };
+use store_api::logstore::BoxedLogStore;
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::error::{OtherSnafu, Result, StartFlownodeSnafu};
@@ -422,7 +423,7 @@ impl StartCommand {
     pub async fn build_with(
         mut opts: StandaloneOptions,
         plugin_opts: Vec<PluginOptions>,
-        creator: InstanceCreator,
+        mut creator: InstanceCreator,
     ) -> Result<(Instance, InstanceCreatorResult)> {
         let mut plugins = Plugins::new();
         plugins.insert(StandaloneFlag);
@@ -486,6 +487,9 @@ impl StartCommand {
         let mut builder = DatanodeBuilder::new(dn_opts, plugins.clone(), kv_backend.clone());
         builder.with_cache_registry(layered_cache_registry.clone());
         builder.with_local_file_access(local_file_access.clone());
+        if let Some(log_store) = creator.mito_log_store.take() {
+            builder.with_mito_log_store(log_store);
+        }
         if let Some(writable) = creator.open_regions_writable_override {
             builder.with_open_regions_writable_override(writable);
         }
@@ -916,6 +920,7 @@ pub struct InstanceCreator {
     procedure_executor_creator: Box<dyn ProcedureExecutorCreator>,
     leader_services_controller: Box<dyn StandaloneLeaderServicesController>,
     open_regions_writable_override: Option<bool>,
+    mito_log_store: Option<BoxedLogStore>,
 }
 
 impl InstanceCreator {
@@ -931,6 +936,7 @@ impl InstanceCreator {
             procedure_executor_creator,
             leader_services_controller: Box::new(DefaultStandaloneLeaderServicesController),
             open_regions_writable_override: None,
+            mito_log_store: None,
         }
     }
 
@@ -992,6 +998,12 @@ impl InstanceCreator {
         self.open_regions_writable_override = Some(writable);
         self
     }
+
+    /// Uses a prebuilt log store for the standalone Mito engine.
+    pub fn with_mito_log_store(mut self, log_store: BoxedLogStore) -> Self {
+        self.mito_log_store = Some(log_store);
+        self
+    }
 }
 
 impl Default for InstanceCreator {
@@ -1003,6 +1015,7 @@ impl Default for InstanceCreator {
             procedure_executor_creator: Box::new(DefaultProcedureExecutorCreator),
             leader_services_controller: Box::new(DefaultStandaloneLeaderServicesController),
             open_regions_writable_override: None,
+            mito_log_store: None,
         }
     }
 }
@@ -1019,8 +1032,11 @@ pub struct InstanceCreatorResult {
 mod tests {
     use std::default::Default;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use api::v1::Rows;
     use auth::{Identity, Password, UserProviderRef};
     use clap::{CommandFactory, Parser};
     use common_base::readable_size::ReadableSize;
@@ -1029,11 +1045,248 @@ mod tests {
     use common_test_util::temp_dir::{create_named_temp_file, create_temp_dir};
     use common_wal::config::DatanodeWalConfig;
     use frontend::frontend::FrontendOptions;
+    use log_store::noop::log_store::NoopLogStore;
+    use mito2::engine::MITO_ENGINE_NAME;
+    use mito2::test_util::{CreateRequestBuilder, build_rows, rows_schema};
     use object_store::config::{FileConfig, GcsConfig};
     use servers::grpc::GrpcOptions;
+    use store_api::logstore::entry::Entry;
+    use store_api::logstore::provider::{ExternalProvider, Provider};
+    use store_api::logstore::{
+        AppendBatchResponse, EntryId, LogStore, SendableEntryStream, WalIndex,
+    };
+    use store_api::region_engine::RegionRole;
+    use store_api::region_request::{
+        PathType, RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
+    };
+    use store_api::storage::RegionId;
 
     use super::*;
     use crate::options::GlobalOptions;
+
+    #[derive(Default)]
+    struct TrackingLogStoreState {
+        resolve_calls: AtomicUsize,
+        read_calls: AtomicUsize,
+        entry_calls: AtomicUsize,
+        append_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
+        stopped_after_mito: AtomicBool,
+        region_server: Mutex<Option<RegionServer>>,
+    }
+
+    #[derive(Clone)]
+    struct TrackingLogStore {
+        state: Arc<TrackingLogStoreState>,
+    }
+
+    impl std::fmt::Debug for TrackingLogStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TrackingLogStore").finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl LogStore for TrackingLogStore {
+        type Error = log_store::error::Error;
+
+        async fn stop(&self) -> std::result::Result<(), Self::Error> {
+            self.state.stop_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(region_server) = self.state.region_server.lock().unwrap().as_ref() {
+                self.state
+                    .stopped_after_mito
+                    .store(region_server.mito_engine().is_none(), Ordering::Relaxed);
+            }
+            NoopLogStore.stop().await
+        }
+
+        fn resolve_provider(
+            &self,
+            region_id: RegionId,
+            _wal_options: &common_wal::options::WalOptions,
+        ) -> std::result::Result<Option<store_api::logstore::provider::ExternalProvider>, Self::Error>
+        {
+            self.state.resolve_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(ExternalProvider::local(
+                "tracking",
+                region_id.as_u64().to_string(),
+            )))
+        }
+
+        async fn append_batch(
+            &self,
+            entries: Vec<Entry>,
+        ) -> std::result::Result<AppendBatchResponse, Self::Error> {
+            self.state.append_calls.fetch_add(1, Ordering::Relaxed);
+            NoopLogStore.append_batch(entries).await
+        }
+
+        async fn read(
+            &self,
+            provider: &Provider,
+            entry_id: EntryId,
+            index: Option<WalIndex>,
+        ) -> std::result::Result<SendableEntryStream<'static, Entry, Self::Error>, Self::Error>
+        {
+            self.state.read_calls.fetch_add(1, Ordering::Relaxed);
+            NoopLogStore.read(provider, entry_id, index).await
+        }
+
+        async fn create_namespace(
+            &self,
+            provider: &Provider,
+        ) -> std::result::Result<(), Self::Error> {
+            NoopLogStore.create_namespace(provider).await
+        }
+
+        async fn delete_namespace(
+            &self,
+            provider: &Provider,
+        ) -> std::result::Result<(), Self::Error> {
+            NoopLogStore.delete_namespace(provider).await
+        }
+
+        async fn list_namespaces(&self) -> std::result::Result<Vec<Provider>, Self::Error> {
+            NoopLogStore.list_namespaces().await
+        }
+
+        async fn obsolete(
+            &self,
+            provider: &Provider,
+            region_id: RegionId,
+            entry_id: EntryId,
+        ) -> std::result::Result<(), Self::Error> {
+            NoopLogStore.obsolete(provider, region_id, entry_id).await
+        }
+
+        async fn obsolete_all(
+            &self,
+            provider: &Provider,
+            region_id: RegionId,
+        ) -> std::result::Result<(), Self::Error> {
+            NoopLogStore.obsolete_all(provider, region_id).await
+        }
+
+        fn entry(
+            &self,
+            data: Vec<u8>,
+            entry_id: EntryId,
+            region_id: RegionId,
+            provider: &Provider,
+        ) -> std::result::Result<Entry, Self::Error> {
+            self.state.entry_calls.fetch_add(1, Ordering::Relaxed);
+            NoopLogStore.entry(data, entry_id, region_id, provider)
+        }
+
+        fn latest_entry_id(
+            &self,
+            provider: &Provider,
+        ) -> std::result::Result<EntryId, Self::Error> {
+            NoopLogStore.latest_entry_id(provider)
+        }
+    }
+
+    fn test_options(name: &str) -> (StandaloneOptions, tempfile::TempDir) {
+        let data_home = create_temp_dir(name);
+        let options = StandaloneOptions {
+            enable_telemetry: false,
+            storage: StorageConfig {
+                data_home: data_home.path().display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (options, data_home)
+    }
+
+    async fn create_open_write(region_server: &RegionServer) {
+        let region_id = RegionId::new(1, 1);
+        let create = CreateRequestBuilder::new().build();
+        let schema = rows_schema(&create);
+        let table_dir = create.table_dir.clone();
+        let options = create.options.clone();
+
+        region_server
+            .handle_request(region_id, RegionRequest::Create(create))
+            .await
+            .unwrap();
+        region_server
+            .handle_request(
+                region_id,
+                RegionRequest::Close(RegionCloseRequest::default()),
+            )
+            .await
+            .unwrap();
+        region_server
+            .handle_request(
+                region_id,
+                RegionRequest::Open(RegionOpenRequest {
+                    engine: MITO_ENGINE_NAME.to_string(),
+                    table_dir,
+                    path_type: PathType::Bare,
+                    options,
+                    skip_wal_replay: false,
+                    checkpoint: None,
+                    requirements: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+        region_server
+            .set_region_role(region_id, RegionRole::Leader)
+            .unwrap();
+        region_server
+            .handle_request(
+                region_id,
+                RegionRequest::Put(RegionPutRequest {
+                    rows: Rows {
+                        schema,
+                        rows: build_rows(0, 1),
+                    },
+                    hint: None,
+                    partition_expr_version: None,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_default_mito_log_store_path() {
+        let (options, _data_home) = test_options("default_mito_log_store");
+        let (mut instance, _) = StartCommand::build_with(options, vec![], Default::default())
+            .await
+            .unwrap();
+
+        create_open_write(&instance.datanode.region_server()).await;
+        instance.datanode.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_injected_mito_log_store_lifecycle() {
+        let (options, _data_home) = test_options("injected_mito_log_store");
+        let state = Arc::new(TrackingLogStoreState::default());
+        let log_store = BoxedLogStore::new(Arc::new(TrackingLogStore {
+            state: state.clone(),
+        }));
+        let creator = InstanceCreator::default().with_mito_log_store(log_store);
+        let (mut instance, _) = StartCommand::build_with(options, vec![], creator)
+            .await
+            .unwrap();
+        let region_server = instance.datanode.region_server();
+        *state.region_server.lock().unwrap() = Some(region_server.clone());
+
+        create_open_write(&region_server).await;
+        assert!(state.resolve_calls.load(Ordering::Relaxed) >= 2);
+        assert!(state.read_calls.load(Ordering::Relaxed) >= 1);
+        assert!(state.entry_calls.load(Ordering::Relaxed) >= 1);
+        assert!(state.append_calls.load(Ordering::Relaxed) >= 1);
+
+        instance.datanode.shutdown().await.unwrap();
+        instance.datanode.shutdown().await.unwrap();
+        assert_eq!(1, state.stop_calls.load(Ordering::Relaxed));
+        assert!(state.stopped_after_mito.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn test_standalone_local_file_access_config() {

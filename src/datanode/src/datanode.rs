@@ -52,6 +52,7 @@ use query::QueryEngineFactory;
 use query::dummy_catalog::{DummyCatalogManager, TableProviderFactoryRef};
 use servers::server::ServerHandlers;
 use snafu::{OptionExt, ResultExt, ensure};
+use store_api::logstore::{BoxedLogStore, LogStore};
 use store_api::path_utils::WAL_DIR;
 use store_api::region_engine::{
     RegionEngineRef, RegionRole, SetRegionRoleStateResponse, SettableRegionRoleState,
@@ -85,6 +86,7 @@ pub struct Datanode {
     greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
     leases_notifier: Option<Arc<Notify>>,
     plugins: Plugins,
+    mito_log_store: Option<BoxedLogStore>,
 }
 
 impl Datanode {
@@ -131,20 +133,53 @@ impl Datanode {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        self.services
+        if self.mito_log_store.is_none() {
+            self.services
+                .shutdown_all()
+                .await
+                .context(ShutdownServerSnafu)?;
+
+            let _ = self.greptimedb_telemetry_task.stop().await;
+            if let Some(heartbeat_task) = &self.heartbeat_task {
+                heartbeat_task
+                    .close()
+                    .map_err(BoxedError::new)
+                    .context(ShutdownInstanceSnafu)?;
+            }
+            self.region_server.stop().await?;
+            return Ok(());
+        }
+
+        let services_result = self
+            .services
             .shutdown_all()
             .await
-            .context(ShutdownServerSnafu)?;
+            .context(ShutdownServerSnafu);
 
         let _ = self.greptimedb_telemetry_task.stop().await;
-        if let Some(heartbeat_task) = &self.heartbeat_task {
+        let heartbeat_result = if let Some(heartbeat_task) = &self.heartbeat_task {
             heartbeat_task
                 .close()
                 .map_err(BoxedError::new)
-                .context(ShutdownInstanceSnafu)?;
-        }
-        self.region_server.stop().await?;
-        Ok(())
+                .context(ShutdownInstanceSnafu)
+        } else {
+            Ok(())
+        };
+        let region_server_result = self.region_server.stop().await;
+        let log_store_result = if let Some(log_store) = self.mito_log_store.take() {
+            log_store
+                .stop()
+                .await
+                .map_err(BoxedError::new)
+                .context(ShutdownInstanceSnafu)
+        } else {
+            Ok(())
+        };
+
+        services_result?;
+        heartbeat_result?;
+        region_server_result?;
+        log_store_result
     }
 
     pub fn region_server(&self) -> RegionServer {
@@ -166,6 +201,7 @@ pub struct DatanodeBuilder {
     topic_stats_reporter: Option<Box<dyn TopicStatsReporter>>,
     open_regions_writable_override: Option<bool>,
     local_file_access: LocalFileAccess,
+    mito_log_store: Option<BoxedLogStore>,
     #[cfg(feature = "enterprise")]
     extension_range_provider_factory: Option<mito2::extension::BoxedExtensionRangeProviderFactory>,
 }
@@ -181,6 +217,7 @@ impl DatanodeBuilder {
             cache_registry: None,
             open_regions_writable_override: None,
             local_file_access: LocalFileAccess::Disabled,
+            mito_log_store: None,
             #[cfg(feature = "enterprise")]
             extension_range_provider_factory: None,
             topic_stats_reporter: None,
@@ -203,6 +240,12 @@ impl DatanodeBuilder {
 
     pub fn with_local_file_access(&mut self, local_file_access: LocalFileAccess) -> &mut Self {
         self.local_file_access = local_file_access;
+        self
+    }
+
+    /// Uses a prebuilt log store for the Mito engine.
+    pub fn with_mito_log_store(&mut self, log_store: BoxedLogStore) -> &mut Self {
+        self.mito_log_store = Some(log_store);
         self
     }
 
@@ -363,6 +406,7 @@ impl DatanodeBuilder {
             region_event_receiver,
             leases_notifier,
             plugins: self.plugins.clone(),
+            mito_log_store: self.mito_log_store.take(),
         })
     }
 
@@ -561,6 +605,26 @@ impl DatanodeBuilder {
             // Enable the write cache when setting object storage
             config.enable_write_cache = true;
             info!("Configured 'enable_write_cache=true' for mito engine.");
+        }
+
+        if let Some(log_store) = &self.mito_log_store {
+            let builder = MitoEngineBuilder::new(
+                &opts.storage.data_home,
+                config,
+                Arc::new(log_store.clone()),
+                object_store_manager,
+                schema_metadata_manager,
+                file_ref_manager,
+                partition_expr_fetcher,
+                plugins,
+            );
+
+            #[cfg(feature = "enterprise")]
+            let builder = builder.with_extension_range_provider_factory(
+                self.extension_range_provider_factory.take(),
+            );
+
+            return builder.try_build().await.context(BuildMitoEngineSnafu);
         }
 
         let mito_engine = match &opts.wal {
