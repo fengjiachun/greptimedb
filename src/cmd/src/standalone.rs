@@ -1030,8 +1030,11 @@ pub struct InstanceCreatorResult {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+    use std::collections::HashMap;
     use std::default::Default;
     use std::io::Write;
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1050,6 +1053,7 @@ mod tests {
     use mito2::test_util::{CreateRequestBuilder, build_rows, rows_schema};
     use object_store::config::{FileConfig, GcsConfig};
     use servers::grpc::GrpcOptions;
+    use servers::server::{Server, ServerHandlers};
     use store_api::logstore::entry::Entry;
     use store_api::logstore::provider::{ExternalProvider, Provider};
     use store_api::logstore::{
@@ -1083,6 +1087,29 @@ mod tests {
     impl std::fmt::Debug for TrackingLogStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("TrackingLogStore").finish_non_exhaustive()
+        }
+    }
+
+    struct FailingShutdownServer;
+
+    #[async_trait]
+    impl Server for FailingShutdownServer {
+        async fn shutdown(&self) -> servers::error::Result<()> {
+            Err(servers::error::Error::Internal {
+                err_msg: "test shutdown failure".to_string(),
+            })
+        }
+
+        async fn start(&mut self, _listening: SocketAddr) -> servers::error::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "failing-shutdown"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 
@@ -1283,6 +1310,32 @@ mod tests {
         assert!(state.append_calls.load(Ordering::Relaxed) >= 1);
 
         instance.datanode.shutdown().await.unwrap();
+        instance.datanode.shutdown().await.unwrap();
+        assert_eq!(1, state.stop_calls.load(Ordering::Relaxed));
+        assert!(state.stopped_after_mito.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_injected_mito_log_store_stops_after_shutdown_failure() {
+        let (options, _data_home) = test_options("injected_mito_log_store_shutdown_failure");
+        let state = Arc::new(TrackingLogStoreState::default());
+        let log_store = BoxedLogStore::new(Arc::new(TrackingLogStore {
+            state: state.clone(),
+        }));
+        let creator = InstanceCreator::default().with_mito_log_store(log_store);
+        let (mut instance, _) = StartCommand::build_with(options, vec![], creator)
+            .await
+            .unwrap();
+        let region_server = instance.datanode.region_server();
+        *state.region_server.lock().unwrap() = Some(region_server);
+        instance
+            .datanode
+            .setup_services(ServerHandlers::Started(Arc::new(HashMap::from([(
+                "failing-shutdown".to_string(),
+                Box::new(FailingShutdownServer) as Box<dyn Server>,
+            )]))));
+
+        assert!(instance.datanode.shutdown().await.is_err());
         instance.datanode.shutdown().await.unwrap();
         assert_eq!(1, state.stop_calls.load(Ordering::Relaxed));
         assert!(state.stopped_after_mito.load(Ordering::Relaxed));
