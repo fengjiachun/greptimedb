@@ -21,6 +21,7 @@
 mod error;
 mod granularity;
 mod guard;
+pub mod ledger;
 mod manager;
 mod policy;
 
