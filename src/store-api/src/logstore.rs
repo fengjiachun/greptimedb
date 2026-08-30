@@ -376,8 +376,20 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestLogStore {
         fail_append: AtomicBool,
+        fail_mutation: AtomicBool,
+        fail_read: AtomicBool,
         fail_read_item: AtomicBool,
+        mutation_calls: AtomicUsize,
         stop_calls: AtomicUsize,
+    }
+
+    impl TestLogStore {
+        fn mutation(&self, call: usize) -> Result<(), TestError> {
+            self.mutation_calls.fetch_or(call, Ordering::Relaxed);
+            (!self.fail_mutation.load(Ordering::Relaxed))
+                .then_some(())
+                .ok_or(TestError)
+        }
     }
 
     #[async_trait::async_trait]
@@ -418,6 +430,9 @@ mod tests {
             id: EntryId,
             _index: Option<WalIndex>,
         ) -> Result<SendableEntryStream<'static, Entry, Self::Error>, Self::Error> {
+            if self.fail_read.load(Ordering::Relaxed) {
+                return Err(TestError);
+            }
             if self.fail_read_item.load(Ordering::Relaxed) {
                 return Ok(Box::pin(stream::iter([Err(TestError)])));
             }
@@ -425,12 +440,14 @@ mod tests {
             Ok(Box::pin(stream::iter([Ok(vec![entry])])))
         }
 
-        async fn create_namespace(&self, _ns: &Provider) -> Result<(), Self::Error> {
-            Ok(())
+        async fn create_namespace(&self, ns: &Provider) -> Result<(), Self::Error> {
+            assert_eq!(&Provider::noop_provider(), ns);
+            self.mutation(1)
         }
 
-        async fn delete_namespace(&self, _ns: &Provider) -> Result<(), Self::Error> {
-            Ok(())
+        async fn delete_namespace(&self, ns: &Provider) -> Result<(), Self::Error> {
+            assert_eq!(&Provider::noop_provider(), ns);
+            self.mutation(2)
         }
 
         async fn list_namespaces(&self) -> Result<Vec<Provider>, Self::Error> {
@@ -439,19 +456,27 @@ mod tests {
 
         async fn obsolete(
             &self,
-            _provider: &Provider,
-            _region_id: RegionId,
-            _entry_id: EntryId,
+            provider: &Provider,
+            region_id: RegionId,
+            entry_id: EntryId,
         ) -> Result<(), Self::Error> {
-            Ok(())
+            assert_eq!(
+                (&Provider::noop_provider(), RegionId::new(1, 2), 7),
+                (provider, region_id, entry_id)
+            );
+            self.mutation(4)
         }
 
         async fn obsolete_all(
             &self,
-            _provider: &Provider,
-            _region_id: RegionId,
+            provider: &Provider,
+            region_id: RegionId,
         ) -> Result<(), Self::Error> {
-            Ok(())
+            assert_eq!(
+                (&Provider::noop_provider(), RegionId::new(1, 2)),
+                (provider, region_id)
+            );
+            self.mutation(8)
         }
 
         fn entry(
@@ -504,6 +529,12 @@ mod tests {
             vec![Provider::noop_provider()],
             store.list_namespaces().await.unwrap()
         );
+        let noop = Provider::noop_provider();
+        store.create_namespace(&noop).await.unwrap();
+        store.delete_namespace(&noop).await.unwrap();
+        store.obsolete(&noop, region_id, 7).await.unwrap();
+        store.obsolete_all(&noop, region_id).await.unwrap();
+        assert_eq!(15, inner.mutation_calls.load(Ordering::Relaxed));
 
         store.stop().await.unwrap();
         assert_eq!(1, inner.stop_calls.load(Ordering::Relaxed));
@@ -511,14 +542,44 @@ mod tests {
 
     #[tokio::test]
     async fn test_boxed_log_store_preserves_error_metadata() {
+        fn assert_metadata(error: BoxedError) {
+            assert_eq!(StatusCode::StorageUnavailable, error.status_code());
+            assert_eq!(RetryHint::Retryable, error.retry_hint());
+        }
+
         let inner = Arc::new(TestLogStore::default());
         inner.fail_append.store(true, Ordering::Relaxed);
         let error = BoxedLogStore::new(inner)
             .append_batch(vec![])
             .await
             .unwrap_err();
-        assert_eq!(StatusCode::StorageUnavailable, error.status_code());
-        assert_eq!(RetryHint::Retryable, error.retry_hint());
+        assert_metadata(error);
+
+        let inner = Arc::new(TestLogStore::default());
+        inner.fail_mutation.store(true, Ordering::Relaxed);
+        let store = BoxedLogStore::new(inner);
+        let noop = Provider::noop_provider();
+        assert_metadata(store.create_namespace(&noop).await.unwrap_err());
+        assert_metadata(store.delete_namespace(&noop).await.unwrap_err());
+        assert_metadata(
+            store
+                .obsolete(&noop, RegionId::new(1, 2), 7)
+                .await
+                .unwrap_err(),
+        );
+        assert_metadata(
+            store
+                .obsolete_all(&noop, RegionId::new(1, 2))
+                .await
+                .unwrap_err(),
+        );
+
+        let inner = Arc::new(TestLogStore::default());
+        inner.fail_read.store(true, Ordering::Relaxed);
+        let Err(error) = BoxedLogStore::new(inner).read(&noop, 0, None).await else {
+            panic!("expected read to fail")
+        };
+        assert_metadata(error);
 
         let inner = Arc::new(TestLogStore::default());
         inner.fail_read_item.store(true, Ordering::Relaxed);
@@ -530,7 +591,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap_err();
-        assert_eq!(StatusCode::StorageUnavailable, error.status_code());
-        assert_eq!(RetryHint::Retryable, error.retry_hint());
+        assert_metadata(error);
     }
 }
