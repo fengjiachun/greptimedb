@@ -84,6 +84,38 @@ impl AccountInner {
     }
 }
 
+/// RAII backstop that clears the shrink collector's single-flight flag.
+///
+/// [Account::collect_shrink] arms this right after winning the flag, so every
+/// exit path releases it — including the future being dropped at an await
+/// point (e.g. under `tokio::time::timeout`). The normal convergence path
+/// calls [Self::clear] inside the `control` critical section instead, which
+/// keeps "converged when the flag is released" atomic; the drop backstop only
+/// fires on cancellation or on a closed semaphore.
+struct CollectingFlagGuard<'a> {
+    collecting: &'a AtomicBool,
+    armed: bool,
+}
+
+impl CollectingFlagGuard<'_> {
+    /// Clears the flag immediately and disarms the drop backstop.
+    ///
+    /// Call while holding the `control` lock so the clear is atomic with the
+    /// convergence check.
+    fn clear(&mut self) {
+        self.collecting.store(false, Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for CollectingFlagGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.collecting.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// A bounded memory account with a runtime-adjustable limit.
 ///
 /// Cloning shares the same underlying budget.
@@ -95,12 +127,19 @@ pub struct Account {
 impl Account {
     /// Creates a bounded account. Accounts are always bounded: "unlimited" is
     /// expressed by passing the parent budget as the limit.
+    ///
+    /// The limit saturates at `granularity.permits_to_bytes(u32::MAX)` (4 TiB
+    /// at 1 KB granularity, further capped by `Semaphore::MAX_PERMITS` where
+    /// smaller): larger values are stored as that maximum. Admission checks
+    /// compare request bytes against the saturated target, so oversized
+    /// requests fail instead of being silently clamped.
     pub fn new(
         name: impl Into<String>,
         category: Category,
         limit_bytes: u64,
         granularity: PermitGranularity,
     ) -> Self {
+        // Saturates: the conversion clamps to the max permit count.
         let limit_permits = granularity.bytes_to_permits(limit_bytes);
         Self {
             inner: Arc::new(AccountInner {
@@ -126,6 +165,12 @@ impl Account {
         self.inner.category
     }
 
+    /// Permit granularity of this account, for adapter layers that need to
+    /// reconcile byte-level remainders against whole-permit accounting.
+    pub fn granularity(&self) -> PermitGranularity {
+        self.inner.granularity
+    }
+
     /// Desired limit in bytes (set instantly by `set_limit_bytes`).
     pub fn target_limit_bytes(&self) -> u64 {
         self.inner
@@ -142,7 +187,11 @@ impl Account {
     /// Bytes currently granted to guards.
     ///
     /// Derived as `effective - available`; while the shrink collector holds a
-    /// chunk the chunk transiently counts as used.
+    /// chunk the chunk transiently counts as used. The two reads are not
+    /// atomic with respect to limit changes: a concurrent `set_limit_bytes`
+    /// or collector step may transiently over-report usage, bounded by the
+    /// in-flight delta. Mutation orderings are chosen so the transient error
+    /// is towards over-reporting — the safe direction for admission checks.
     pub fn used_bytes(&self) -> u64 {
         let effective = self.inner.effective_permits.load(Ordering::Acquire);
         let available = self
@@ -158,19 +207,30 @@ impl Account {
     /// Grow takes effect instantly (waiters wake). Shrink harvests idle
     /// capacity instantly and leaves the remainder to [Self::collect_shrink];
     /// granted memory is never revoked.
+    ///
+    /// Like [Self::new], the limit saturates at
+    /// `granularity.permits_to_bytes(u32::MAX)`: larger values are stored as
+    /// that maximum.
     pub fn set_limit_bytes(&self, bytes: u64) -> u64 {
+        // Saturates: the conversion clamps to the max permit count.
         let new_target = self.inner.bytes_to_permits(bytes);
         let _guard = self.inner.control.lock().unwrap();
         let effective = self.inner.effective_permits.load(Ordering::Acquire);
-        self.inner.target_permits.store(new_target, Ordering::Release);
+        self.inner
+            .target_permits
+            .store(new_target, Ordering::Release);
 
         if new_target >= effective {
             let delta = new_target - effective;
             if delta > 0 {
-                self.inner.semaphore.add_permits(delta as usize);
+                // Publish the higher effective limit before crediting the
+                // semaphore: a concurrent `used_bytes` then transiently
+                // over-reports (bounded by `delta`) instead of
+                // under-reporting granted memory.
                 self.inner
                     .effective_permits
                     .store(new_target, Ordering::Release);
+                self.inner.semaphore.add_permits(delta as usize);
             }
             0
         } else {
@@ -184,25 +244,44 @@ impl Account {
         }
     }
 
-    /// Drives an in-progress shrink until `effective == target` or the target
-    /// is raised. Idempotent; concurrent calls collapse into one collector.
+    /// Drives an in-progress shrink until the account has converged
+    /// (`effective <= target`). Never revokes granted memory: capacity is
+    /// acquired in chunks through the semaphore's FIFO queue, competing
+    /// fairly with normal waiters.
     ///
-    /// Collection acquires capacity in chunks through the semaphore's FIFO
-    /// queue — it competes fairly with normal waiters and never revokes
-    /// granted memory.
+    /// Concurrency contract:
+    /// - Idempotent: calling on a converged account is a cheap no-op.
+    /// - Single-flight: while one call collects, concurrent calls return
+    ///   immediately without waiting for convergence.
+    /// - No stranded deficit: the single-flight flag is cleared in the same
+    ///   `control` critical section that confirms convergence, and
+    ///   `set_limit_bytes` mutates the target only under that lock — so a
+    ///   new deficit is always seen either by the still-running collector or
+    ///   by the next call, which then wins the flag.
+    /// - Cancellation-safe: if the future is dropped at an await point (e.g.
+    ///   under `tokio::time::timeout`), [CollectingFlagGuard] releases the
+    ///   flag and the next call resumes collection.
     pub async fn collect_shrink(&self) {
         if self.inner.collecting.swap(true, Ordering::AcqRel) {
             return;
         }
+        let mut flag_guard = CollectingFlagGuard {
+            collecting: &self.inner.collecting,
+            armed: true,
+        };
 
         loop {
-            // Harvest idle capacity and size the next chunk.
+            // Harvest idle capacity and size the next chunk. Convergence and
+            // the flag clear happen in one critical section: a concurrent
+            // shrink of the target can never slip between them and strand
+            // its deficit behind a still-set flag.
             let chunk = {
                 let _guard = self.inner.control.lock().unwrap();
                 let target = self.inner.target_permits.load(Ordering::Acquire);
                 let effective = self.inner.effective_permits.load(Ordering::Acquire);
                 if effective <= target {
-                    break;
+                    flag_guard.clear();
+                    return;
                 }
                 let deficit = effective - target;
                 let forgotten = self.inner.semaphore.forget_permits(deficit as usize) as u32;
@@ -211,20 +290,20 @@ impl Account {
                     .effective_permits
                     .store(now_effective, Ordering::Release);
                 if now_effective <= target {
-                    break;
+                    flag_guard.clear();
+                    return;
                 }
                 (now_effective - target).min(SHRINK_CHUNK_MAX_PERMITS)
             };
 
-            // Queue for the chunk like any other waiter (FIFO).
-            let Ok(mut permit) = self
-                .inner
-                .semaphore
-                .clone()
-                .acquire_many_owned(chunk)
-                .await
+            // Queue for the chunk like any other waiter (FIFO). If the
+            // future is dropped while waiting here, the drop backstop
+            // releases the single-flight flag.
+            let Ok(mut permit) = self.inner.semaphore.clone().acquire_many_owned(chunk).await
             else {
-                break;
+                // Semaphore closed: no progress is possible; the drop
+                // backstop releases the flag.
+                return;
             };
 
             let _guard = self.inner.control.lock().unwrap();
@@ -247,16 +326,19 @@ impl Account {
                 .effective_permits
                 .store(effective - forget_n, Ordering::Release);
         }
-
-        self.inner.collecting.store(false, Ordering::Release);
     }
 
-    fn ensure_within_target(&self, permits: u32, bytes: u64) -> Result<()> {
+    /// Checks a request against the target limit, comparing in bytes before
+    /// any permit-conversion clamping: a request larger than the (possibly
+    /// saturated) target must fail loudly instead of being silently clamped
+    /// to the maximum permit count.
+    fn ensure_within_target(&self, bytes: u64) -> Result<()> {
+        let target_bytes = self.target_limit_bytes();
         ensure!(
-            permits <= self.inner.target_permits.load(Ordering::Acquire),
+            bytes <= target_bytes,
             MemoryLimitExceededSnafu {
                 requested_bytes: bytes,
-                limit_bytes: self.target_limit_bytes(),
+                limit_bytes: target_bytes,
             }
         );
         Ok(())
@@ -264,8 +346,8 @@ impl Account {
 
     /// Acquires memory, waiting until enough capacity is available.
     pub async fn acquire(&self, bytes: u64) -> Result<AccountGuard> {
+        self.ensure_within_target(bytes)?;
         let permits = self.inner.bytes_to_permits(bytes);
-        self.ensure_within_target(permits, bytes)?;
         let permit = self
             .inner
             .semaphore
@@ -281,16 +363,12 @@ impl Account {
 
     /// Tries to acquire memory without waiting.
     pub fn try_acquire(&self, bytes: u64) -> Option<AccountGuard> {
-        let permits = self.inner.bytes_to_permits(bytes);
-        if permits > self.inner.target_permits.load(Ordering::Acquire) {
+        // Compare in bytes, like `ensure_within_target`.
+        if bytes > self.target_limit_bytes() {
             return None;
         }
-        match self
-            .inner
-            .semaphore
-            .clone()
-            .try_acquire_many_owned(permits)
-        {
+        let permits = self.inner.bytes_to_permits(bytes);
+        match self.inner.semaphore.clone().try_acquire_many_owned(permits) {
             Ok(permit) => Some(AccountGuard {
                 inner: self.inner.clone(),
                 permit,
@@ -337,17 +415,22 @@ pub struct AccountGuard {
 impl AccountGuard {
     /// Bytes granted to this guard.
     pub fn granted_bytes(&self) -> u64 {
-        self.inner.permits_to_bytes(self.permit.num_permits() as u32)
+        self.inner
+            .permits_to_bytes(self.permit.num_permits() as u32)
     }
 
     /// Synchronously grows this guard. Returns false if capacity or the
-    /// target limit does not allow it.
+    /// target limit does not allow it. The limit check compares bytes, so a
+    /// request beyond the (possibly saturated) target fails instead of being
+    /// clamped.
     pub fn try_grow(&mut self, bytes: u64) -> bool {
-        let permits = self.inner.bytes_to_permits(bytes);
-        let total = self.permit.num_permits() as u32 + permits;
-        if total > self.inner.target_permits.load(Ordering::Acquire) {
+        let target_bytes = self
+            .inner
+            .permits_to_bytes(self.inner.target_permits.load(Ordering::Acquire));
+        if self.granted_bytes().saturating_add(bytes) > target_bytes {
             return false;
         }
+        let permits = self.inner.bytes_to_permits(bytes);
         match self.inner.semaphore.clone().try_acquire_many_owned(permits) {
             Ok(extra) => {
                 self.permit.merge(extra);
@@ -357,19 +440,20 @@ impl AccountGuard {
         }
     }
 
-    /// Grows this guard, waiting until capacity is available.
+    /// Grows this guard, waiting until capacity is available. The limit
+    /// check compares bytes, like [Self::try_grow].
     pub async fn grow(&mut self, bytes: u64) -> Result<()> {
-        let permits = self.inner.bytes_to_permits(bytes);
-        let total = self.permit.num_permits() as u64 + permits as u64;
+        let target_bytes = self
+            .inner
+            .permits_to_bytes(self.inner.target_permits.load(Ordering::Acquire));
         ensure!(
-            total <= self.inner.target_permits.load(Ordering::Acquire) as u64,
+            self.granted_bytes().saturating_add(bytes) <= target_bytes,
             MemoryLimitExceededSnafu {
                 requested_bytes: bytes,
-                limit_bytes: self
-                    .inner
-                    .permits_to_bytes(self.inner.target_permits.load(Ordering::Acquire)),
+                limit_bytes: target_bytes,
             }
         );
+        let permits = self.inner.bytes_to_permits(bytes);
         let extra = self
             .inner
             .semaphore
@@ -381,13 +465,15 @@ impl AccountGuard {
         Ok(())
     }
 
-    /// Returns part of the granted capacity. Returns the bytes actually
-    /// released (clamped to the granted amount).
+    /// Returns part of the granted capacity, releasing whole permits only:
+    /// `bytes` is rounded DOWN to the permit granularity, so a request below
+    /// one permit releases nothing and returns 0. Returns the bytes actually
+    /// released (also clamped to the granted amount); any sub-permit
+    /// remainder stays granted and is the caller's (e.g. a pool adapter's)
+    /// responsibility to track.
     pub fn shrink(&mut self, bytes: u64) -> u64 {
-        let permits = self
-            .inner
-            .bytes_to_permits(bytes)
-            .min(self.permit.num_permits() as u32);
+        let whole_permits = bytes / self.inner.granularity.bytes();
+        let permits = whole_permits.min(self.permit.num_permits() as u64) as u32;
         if permits == 0 {
             return 0;
         }
@@ -396,12 +482,22 @@ impl AccountGuard {
                 drop(returned);
                 self.inner.permits_to_bytes(permits)
             }
-            None => 0,
+            None => {
+                // Unreachable: `permits` is clamped to `num_permits` above,
+                // and `split` only refuses requests beyond the held amount.
+                debug_assert!(false, "split refused a request clamped to num_permits");
+                0
+            }
         }
     }
 }
 
 /// Point-in-time view of an account, for the future system table.
+///
+/// Fields are sampled independently, without a common lock: a snapshot taken
+/// while a limit change or the shrink collector is in flight may be
+/// internally inconsistent (e.g. `used_bytes` derived from a newer effective
+/// limit than the one captured in `effective_limit_bytes`).
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
     pub name: String,
@@ -606,8 +702,10 @@ mod tests {
         assert!(sync_guard.try_grow(6 * KB));
         assert_eq!(acc.used_bytes(), 10 * KB);
 
-        // Partial shrink returns capacity to the shared budget.
-        assert_eq!(sync_guard.shrink(3 * KB), 3 * KB);
+        // Partial shrink returns capacity to the shared budget. Sub-permit
+        // amounts round down: the remainder stays granted.
+        assert_eq!(sync_guard.shrink(KB - 1), 0);
+        assert_eq!(sync_guard.shrink(3 * KB + 512), 3 * KB);
         assert_eq!(acc.used_bytes(), 7 * KB);
         assert!(acc.try_acquire(3 * KB).is_some());
     }
@@ -637,9 +735,10 @@ mod tests {
             let target = if round % 2 == 0 { 6 } else { 12 };
             acc.set_limit_bytes(target * KB);
             acc.collect_shrink().await;
+            // This task is the only `collect_shrink` caller, so the call
+            // above won the single-flight flag and must have converged.
+            assert_eq!(acc.effective_limit_bytes(), target * KB);
             tokio::time::sleep(Duration::from_millis(5)).await;
-            // Invariant: usage never exceeds the embodied capacity.
-            assert!(acc.used_bytes() <= acc.effective_limit_bytes());
         }
 
         for task in tasks {
@@ -652,9 +751,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_collect_shrink_single_flight_converges() {
+        let acc = account(8);
+        let mut held = acc.acquire(8 * KB).await.unwrap();
+        assert_eq!(acc.set_limit_bytes(4 * KB), 4 * KB);
+
+        // The collector blocks on its first chunk: all capacity is granted.
+        let collector = {
+            let acc = acc.clone();
+            tokio::spawn(async move { acc.collect_shrink().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!collector.is_finished());
+
+        // A concurrent call early-returns (single-flight) without waiting
+        // for convergence.
+        acc.collect_shrink().await;
+        assert_eq!(acc.effective_limit_bytes(), 8 * KB);
+
+        // Retarget below the in-flight target: the running collector must
+        // observe the new target and converge to it.
+        assert_eq!(acc.set_limit_bytes(2 * KB), 6 * KB);
+        assert_eq!(held.shrink(6 * KB), 6 * KB);
+        collector.await.unwrap();
+        assert_eq!(acc.effective_limit_bytes(), 2 * KB);
+        assert_eq!(acc.used_bytes(), 2 * KB);
+
+        // The flag was released on convergence: a fresh call wins it and
+        // collects a new deficit instead of early-returning.
+        assert_eq!(acc.set_limit_bytes(KB), KB);
+        assert_eq!(held.shrink(KB), KB);
+        acc.collect_shrink().await;
+        assert_eq!(acc.effective_limit_bytes(), KB);
+        assert_eq!(acc.used_bytes(), KB);
+        drop(held);
+        assert_eq!(acc.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_collect_shrink_releases_single_flight_flag() {
+        let acc = account(8);
+        let held = acc.acquire(8 * KB).await.unwrap();
+        assert_eq!(acc.set_limit_bytes(4 * KB), 4 * KB);
+
+        // Cancel the collector while it waits for its chunk: the future is
+        // dropped at the acquire await point.
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), acc.collect_shrink()).await;
+        assert!(cancelled.is_err());
+        assert_eq!(acc.effective_limit_bytes(), 8 * KB);
+
+        // The drop backstop released the flag: a later call must win it and
+        // converge once capacity frees up.
+        drop(held);
+        acc.collect_shrink().await;
+        assert_eq!(acc.effective_limit_bytes(), 4 * KB);
+        assert_eq!(acc.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_request_fails_instead_of_clamping() {
+        // The limit saturates at u32::MAX permits (4 TiB at KB granularity).
+        let acc = Account::new(
+            "sat",
+            Category::Query,
+            u64::MAX,
+            PermitGranularity::Kilobyte,
+        );
+        assert_eq!(acc.granularity(), PermitGranularity::Kilobyte);
+        let max_bytes = PermitGranularity::Kilobyte.permits_to_bytes(u32::MAX);
+        assert_eq!(acc.target_limit_bytes(), max_bytes);
+
+        // Requests beyond the saturated target fail loudly instead of being
+        // clamped to the maximum permit count by the byte conversion.
+        assert!(acc.acquire(max_bytes + KB).await.is_err());
+        assert!(acc.try_acquire(max_bytes + KB).is_none());
+
+        let mut guard = acc.acquire(KB).await.unwrap();
+        assert!(!guard.try_grow(max_bytes));
+        assert!(guard.grow(max_bytes).await.is_err());
+    }
+
+    #[tokio::test]
     async fn ledger_snapshot_aggregates() {
         let ledger = MemoryLedger::new(100 * KB);
-        let a = ledger.register("query/engine", Category::Query, 50 * KB, PermitGranularity::Kilobyte);
+        let a = ledger.register(
+            "query/engine",
+            Category::Query,
+            50 * KB,
+            PermitGranularity::Kilobyte,
+        );
         let b = ledger.register(
             "ingest/request_bytes",
             Category::Ingest,
@@ -674,7 +859,7 @@ mod tests {
 
     /// Micro-benchmark of the sync face vs a raw atomic counter (stand-in for
     /// `GreedyMemoryPool`'s accounting). Run with:
-    /// `cargo nextest run -p common-memory-manager bench_sync_face -- --ignored`
+    /// `cargo nextest run -p common-memory-manager bench_sync_face --run-ignored all`
     #[test]
     #[ignore]
     #[allow(clippy::print_stdout)]
