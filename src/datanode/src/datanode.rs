@@ -62,8 +62,9 @@ use tokio::sync::Notify;
 use crate::config::{DatanodeOptions, RegionEngineConfig, StorageConfig};
 use crate::error::{
     self, BuildDatanodeSnafu, BuildMetricEngineSnafu, BuildMitoEngineSnafu, CreateDirSnafu,
-    DataFusionSnafu, GetMetadataSnafu, MissingCacheSnafu, MissingNodeIdSnafu, OpenLogStoreSnafu,
-    Result, ShutdownInstanceSnafu, ShutdownServerSnafu, StartServerSnafu,
+    DataFusionSnafu, GetMetadataSnafu, MissingCacheSnafu, MissingNodeIdSnafu,
+    ObjectStoreWalNotStandaloneSnafu, ObjectStoreWalNotWiredSnafu, OpenLogStoreSnafu, Result,
+    ShutdownInstanceSnafu, ShutdownServerSnafu, StartServerSnafu,
 };
 use crate::event_listener::{
     NoopRegionServerEventListener, RegionServerEventListenerRef, RegionServerEventReceiver,
@@ -262,6 +263,10 @@ impl DatanodeBuilder {
         // Otherwise the region server is self-controlled, meaning no heartbeat and immediately
         // writable upon open.
         let controlled_by_metasrv = meta_client.is_some();
+        ensure!(
+            !(controlled_by_metasrv && matches!(self.opts.wal, DatanodeWalConfig::ObjectStore(_))),
+            ObjectStoreWalNotStandaloneSnafu
+        );
 
         // build and initialize region server
         let (region_event_listener, region_event_receiver) = if controlled_by_metasrv {
@@ -651,6 +656,7 @@ impl DatanodeBuilder {
 
                 builder.try_build().await.context(BuildMitoEngineSnafu)?
             }
+            DatanodeWalConfig::ObjectStore(_) => return ObjectStoreWalNotWiredSnafu.fail(),
         };
         Ok(mito_engine)
     }
