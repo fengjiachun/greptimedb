@@ -1,0 +1,339 @@
+// Copyright 2023 Greptime Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! In-memory index over the footers of the objects of one WAL prefix.
+
+use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
+
+use snafu::ensure;
+use store_api::storage::RegionId;
+
+use crate::error::{CorruptedWalObjectSnafu, InvalidWalEntryRangeSnafu, Result};
+use crate::object_store_wal::format::FooterEntry;
+
+/// Indexes objects by sequence and, per region, the objects that hold entries
+/// of that region.
+#[derive(Debug, Default)]
+pub(super) struct ObjectCatalog {
+    objects: BTreeMap<u64, Vec<FooterEntry>>,
+    regions: BTreeMap<RegionId, BTreeMap<u64, FooterEntry>>,
+}
+
+impl ObjectCatalog {
+    /// Indexes the footer of the object `object_seq`. Objects may be inserted
+    /// in any order, which lets recovery index them as it discovers them.
+    /// Inserting the same footer again is a no-op.
+    pub(super) fn insert_object(
+        &mut self,
+        object_seq: u64,
+        mut footer: Vec<FooterEntry>,
+    ) -> Result<()> {
+        ensure!(
+            !footer.is_empty(),
+            CorruptedWalObjectSnafu {
+                reason: format!("object {object_seq} has an empty footer"),
+            }
+        );
+
+        footer.sort_unstable_by_key(|entry| entry.region_id);
+        for entries in footer.windows(2) {
+            ensure!(
+                entries[0].region_id != entries[1].region_id,
+                CorruptedWalObjectSnafu {
+                    reason: format!(
+                        "object {object_seq} has duplicate footer entries for region {}",
+                        entries[0].region_id
+                    ),
+                }
+            );
+        }
+        for entry in &footer {
+            ensure!(
+                entry.entry_count > 0 && entry.min_entry_id <= entry.max_entry_id,
+                CorruptedWalObjectSnafu {
+                    reason: format!(
+                        "object {object_seq} has invalid entry range {}..={} with {} entries for region {}",
+                        entry.min_entry_id, entry.max_entry_id, entry.entry_count, entry.region_id
+                    ),
+                }
+            );
+        }
+
+        if let Some(existing) = self.objects.get(&object_seq) {
+            ensure!(
+                existing == &footer,
+                CorruptedWalObjectSnafu {
+                    reason: format!("object {object_seq} was indexed with different metadata"),
+                }
+            );
+            return Ok(());
+        }
+
+        // Validate every region before mutating either index so insertion is atomic.
+        for entry in &footer {
+            let Some(region_objects) = self.regions.get(&entry.region_id) else {
+                continue;
+            };
+            if let Some((&previous_seq, previous)) = region_objects.range(..object_seq).next_back()
+            {
+                ensure!(
+                    previous.max_entry_id < entry.min_entry_id,
+                    CorruptedWalObjectSnafu {
+                        reason: out_of_order(
+                            entry.region_id,
+                            previous_seq,
+                            previous.max_entry_id,
+                            object_seq,
+                            entry.min_entry_id
+                        ),
+                    }
+                );
+            }
+            if let Some((&next_seq, next)) = region_objects
+                .range((Excluded(object_seq), Unbounded))
+                .next()
+            {
+                ensure!(
+                    entry.max_entry_id < next.min_entry_id,
+                    CorruptedWalObjectSnafu {
+                        reason: out_of_order(
+                            entry.region_id,
+                            object_seq,
+                            entry.max_entry_id,
+                            next_seq,
+                            next.min_entry_id
+                        ),
+                    }
+                );
+            }
+        }
+
+        for entry in &footer {
+            self.regions
+                .entry(entry.region_id)
+                .or_default()
+                .insert(object_seq, entry.clone());
+        }
+        self.objects.insert(object_seq, footer);
+        Ok(())
+    }
+
+    /// Returns the objects that hold entries of `region_id` overlapping
+    /// `start_entry_id..=end_entry_id`, ordered by object sequence.
+    pub(super) fn objects_for_entry_range(
+        &self,
+        region_id: RegionId,
+        start_entry_id: u64,
+        end_entry_id: u64,
+    ) -> Result<Vec<(u64, &FooterEntry)>> {
+        ensure!(
+            start_entry_id <= end_entry_id,
+            InvalidWalEntryRangeSnafu {
+                region_id,
+                start_entry_id,
+                end_entry_id,
+            }
+        );
+
+        let Some(objects) = self.regions.get(&region_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(objects
+            .iter()
+            .filter(|(_, entry)| {
+                entry.max_entry_id >= start_entry_id && entry.min_entry_id <= end_entry_id
+            })
+            .map(|(&object_seq, entry)| (object_seq, entry))
+            .collect())
+    }
+
+    /// Returns the largest entry id indexed for `region_id`.
+    pub(super) fn region_max_entry_id(&self, region_id: RegionId) -> Option<u64> {
+        self.regions
+            .get(&region_id)?
+            .last_key_value()
+            .map(|(_, entry)| entry.max_entry_id)
+    }
+
+    /// Iterates over the indexed objects ordered by object sequence.
+    pub(super) fn objects_in_order(&self) -> impl Iterator<Item = (u64, &[FooterEntry])> + '_ {
+        self.objects
+            .iter()
+            .map(|(&object_seq, footer)| (object_seq, footer.as_slice()))
+    }
+}
+
+fn out_of_order(
+    region_id: RegionId,
+    lower_object_seq: u64,
+    lower_max_entry_id: u64,
+    upper_object_seq: u64,
+    upper_min_entry_id: u64,
+) -> String {
+    format!(
+        "entry ranges of region {region_id} are not strictly increasing, object {lower_object_seq} ends at {lower_max_entry_id}, object {upper_object_seq} starts at {upper_min_entry_id}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+
+    #[test]
+    fn test_catalog_indexes_objects_and_queries_ranges() {
+        let region_one = RegionId::new(1, 1);
+        let region_two = RegionId::new(2, 1);
+        let mut catalog = ObjectCatalog::default();
+
+        // Recovery may discover objects out of order.
+        catalog
+            .insert_object(
+                2,
+                vec![
+                    footer_entry(region_one, 4, 6),
+                    footer_entry(region_two, 8, 9),
+                ],
+            )
+            .unwrap();
+        catalog
+            .insert_object(1, vec![footer_entry(region_one, 1, 3)])
+            .unwrap();
+        catalog
+            .insert_object(4, vec![footer_entry(region_one, 10, 12)])
+            .unwrap();
+
+        assert_eq!(Some(12), catalog.region_max_entry_id(region_one));
+        assert_eq!(Some(9), catalog.region_max_entry_id(region_two));
+        assert_eq!(None, catalog.region_max_entry_id(RegionId::new(3, 1)));
+
+        let objects = catalog.objects_for_entry_range(region_one, 3, 10).unwrap();
+        assert_eq!(vec![1, 2, 4], object_seqs(&objects));
+        assert_eq!(
+            vec![1, 2, 4],
+            catalog
+                .objects_in_order()
+                .map(|(object_seq, _)| object_seq)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_catalog_duplicate_object_is_idempotent() {
+        let region_id = RegionId::new(1, 1);
+        let mut catalog = ObjectCatalog::default();
+        let first = footer_entry(region_id, 1, 2);
+        let second = footer_entry(RegionId::new(2, 1), 4, 5);
+
+        catalog
+            .insert_object(1, vec![first.clone(), second.clone()])
+            .unwrap();
+        catalog
+            .insert_object(1, vec![second, first.clone()])
+            .unwrap();
+
+        let mut conflicting = first;
+        conflicting.segment_offset += 1;
+        assert_corrupted(
+            catalog.insert_object(1, vec![conflicting]),
+            "object 1 was indexed with different metadata",
+        );
+        assert_eq!(1, catalog.objects_in_order().count());
+    }
+
+    #[test]
+    fn test_catalog_rejects_overlapping_or_reversed_region_ranges() {
+        let region_id = RegionId::new(1, 1);
+        let mut catalog = ObjectCatalog::default();
+        catalog
+            .insert_object(2, vec![footer_entry(region_id, 10, 20)])
+            .unwrap();
+
+        assert_corrupted(
+            catalog.insert_object(3, vec![footer_entry(region_id, 20, 30)]),
+            "are not strictly increasing",
+        );
+        assert_corrupted(
+            catalog.insert_object(3, vec![footer_entry(region_id, 5, 9)]),
+            "are not strictly increasing",
+        );
+        assert_corrupted(
+            catalog.insert_object(1, vec![footer_entry(region_id, 15, 19)]),
+            "are not strictly increasing",
+        );
+        assert_eq!(1, catalog.objects_in_order().count());
+    }
+
+    #[test]
+    fn test_catalog_rejects_duplicate_region_and_invalid_ranges() {
+        let region_id = RegionId::new(1, 1);
+        let mut catalog = ObjectCatalog::default();
+        assert_corrupted(
+            catalog.insert_object(
+                1,
+                vec![footer_entry(region_id, 1, 1), footer_entry(region_id, 2, 2)],
+            ),
+            "duplicate footer entries",
+        );
+        assert_corrupted(
+            catalog.insert_object(1, vec![]),
+            "object 1 has an empty footer",
+        );
+
+        let mut invalid = footer_entry(region_id, 2, 1);
+        invalid.entry_count = 0;
+        assert_corrupted(
+            catalog.insert_object(1, vec![invalid]),
+            "has invalid entry range 2..=1",
+        );
+
+        let error = catalog
+            .objects_for_entry_range(region_id, 2, 1)
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidWalEntryRange { start_entry_id, end_entry_id, .. } if start_entry_id == 2 && end_entry_id == 1),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    fn footer_entry(region_id: RegionId, min_entry_id: u64, max_entry_id: u64) -> FooterEntry {
+        FooterEntry {
+            region_id,
+            min_entry_id,
+            max_entry_id,
+            entry_count: max_entry_id
+                .checked_sub(min_entry_id)
+                .and_then(|count| count.checked_add(1))
+                .unwrap_or(0) as u32,
+            segment_offset: min_entry_id * 100,
+            segment_len: 100,
+            segment_crc32: min_entry_id as u32,
+        }
+    }
+
+    fn object_seqs(objects: &[(u64, &FooterEntry)]) -> Vec<u64> {
+        objects.iter().map(|(object_seq, _)| *object_seq).collect()
+    }
+
+    fn assert_corrupted(result: Result<()>, expected_reason: &str) {
+        match result {
+            Err(Error::CorruptedWalObject { reason, .. }) => assert!(
+                reason.contains(expected_reason),
+                "expected reason to contain {expected_reason:?}, actual {reason:?}"
+            ),
+            other => panic!("expected a corrupted object error, actual {other:?}"),
+        }
+    }
+}
