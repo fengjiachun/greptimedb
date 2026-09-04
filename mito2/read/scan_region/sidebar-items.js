@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Scanner"],"fn":["build_scan_fingerprint","exact_sequence_range","file_in_range","pre_filter_mode"],"struct":["FileLevelPruningStats","PredicateGroup","ScanFingerprintBundle","ScanInput","ScanRegion","StreamContext"]};
