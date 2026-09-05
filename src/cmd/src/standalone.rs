@@ -85,7 +85,7 @@ use crate::{App, create_resource_limit_metrics, error, log_versions, maybe_activ
 pub const APP_NAME: &str = "greptime-standalone";
 
 /// Builds the WAL provider that allocates region WAL options in standalone mode.
-async fn build_standalone_wal_provider(
+pub async fn build_standalone_wal_provider(
     wal: &DatanodeWalConfig,
     kv_backend: KvBackendRef,
 ) -> Result<WalProvider> {

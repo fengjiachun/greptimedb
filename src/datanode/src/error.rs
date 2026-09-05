@@ -299,14 +299,29 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Object store WAL is not wired into the datanode yet"))]
-    ObjectStoreWalNotWired {
+    #[snafu(display("Object store WAL is only supported in standalone mode"))]
+    ObjectStoreWalNotStandalone {
         #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Object store WAL is only supported in standalone mode"))]
-    ObjectStoreWalNotStandalone {
+    #[snafu(display("Invalid object store WAL config, {} = {:?}: {}", field, value, reason))]
+    InvalidObjectStoreWalConfig {
+        field: &'static str,
+        value: String,
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Unknown object store WAL storage provider {:?}, configured providers: {:?}",
+        name,
+        configured
+    ))]
+    UnknownWalStorageProvider {
+        name: String,
+        configured: Vec<String>,
         #[snafu(implicit)]
         location: Location,
     },
@@ -484,6 +499,8 @@ impl ErrorExt for Error {
             | ParseAddr { .. }
             | TomlFormat { .. }
             | ObjectStoreWalNotStandalone { .. }
+            | InvalidObjectStoreWalConfig { .. }
+            | UnknownWalStorageProvider { .. }
             | BuildDatanode { .. } => StatusCode::InvalidArguments,
 
             PayloadNotExist { .. }
@@ -508,9 +525,7 @@ impl ErrorExt for Error {
 
             OpenLogStore { source, .. } => source.status_code(),
             MetaClientInit { source, .. } => source.status_code(),
-            UnsupportedOutput { .. } | NotYetImplemented { .. } | ObjectStoreWalNotWired { .. } => {
-                StatusCode::Unsupported
-            }
+            UnsupportedOutput { .. } | NotYetImplemented { .. } => StatusCode::Unsupported,
             HandleRegionRequest { source, .. }
             | GetRegionMetadata { source, .. }
             | HandleBatchOpenRequest { source, .. }
