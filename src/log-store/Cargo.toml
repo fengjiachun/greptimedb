@@ -11,6 +11,9 @@ protoc-rust.workspace = true
 [lints]
 workspace = true
 
+[features]
+testing = []
+
 [dependencies]
 async-stream.workspace = true
 async-trait.workspace = true
@@ -44,6 +47,7 @@ serde_json.workspace = true
 snafu.workspace = true
 store-api.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 common-meta = { workspace = true, features = ["testing"] }
@@ -53,4 +57,3 @@ itertools.workspace = true
 object-store = { workspace = true, features = ["services-memory"] }
 rand.workspace = true
 rskafka = { workspace = true, features = ["unstable-fuzzing"] }
-uuid.workspace = true
