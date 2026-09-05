@@ -505,7 +505,7 @@ impl Actor {
         let last_entry_ids = match self.open_batch.admit(entries) {
             Ok(last_entry_ids) => last_entry_ids,
             Err(error) => {
-                let error = set_terminal(&self.terminal_error, error);
+                let error = self.fail_permanently(error);
                 let _ = response.send(Err(shared(&error)));
                 return;
             }
@@ -537,7 +537,10 @@ impl Actor {
         let entries = self.open_batch.seal();
         let encoded = match encode_batch(object_seq, self.writer_instance, entries) {
             Ok(encoded) => encoded,
-            Err(error) => return self.fail_permanently(error),
+            Err(error) => {
+                self.fail_permanently(error);
+                return;
+            }
         };
         match self.io.put_if_absent(object_seq, encoded.bytes).await {
             Ok(_) => {}
@@ -560,7 +563,10 @@ impl Actor {
                 }
                 return;
             }
-            Err(error) => return self.fail_permanently(error),
+            Err(error) => {
+                self.fail_permanently(error);
+                return;
+            }
         }
 
         let indexed = self
@@ -569,7 +575,8 @@ impl Actor {
             .unwrap_or_else(PoisonError::into_inner)
             .insert_object(object_seq, encoded.footer);
         if let Err(error) = indexed {
-            return self.fail_permanently(error);
+            self.fail_permanently(error);
+            return;
         }
         for pending in self.pending.drain(..) {
             let _ = pending.response.send(Ok(AppendBatchResponse {
@@ -611,16 +618,23 @@ impl Actor {
         }
     }
 
-    /// Records `error` as terminal and fails the waiters with it, unless the
-    /// store was stopped meanwhile: their entries never became durable, so
-    /// they learn that the store is stopped like every other such waiter.
-    fn fail_permanently(&mut self, error: Error) {
+    /// Records `error` as terminal, drops the open batch and fails every
+    /// waiter with the recorded error, unless the store was stopped meanwhile:
+    /// their entries never became durable, so they learn that the store is
+    /// stopped like every other such waiter. Returns the recorded error.
+    fn fail_permanently(&mut self, error: Error) -> Arc<Error> {
         let error = set_terminal(&self.terminal_error, error);
+        let durable_entry_ids = {
+            let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+            durable_entry_ids(&catalog)
+        };
+        self.open_batch.reset(durable_entry_ids);
         if self.is_stopped() {
             self.fail_pending(|| ObjectStoreWalStoppedSnafu.build());
         } else {
             self.fail_pending(|| shared(&error));
         }
+        error
     }
 }
 
@@ -1483,9 +1497,23 @@ mod tests {
         .unwrap();
         io.put_if_absent(0, encoded.bytes).await.unwrap();
 
-        let store = open(object_store, &eager()).await;
+        let store = open(object_store, &manual()).await;
         assert_eq!(u64::MAX, latest(&store, region_id));
-        let error = append(&store, region_id, "next").await.unwrap_err();
+        // An append admitted earlier fails right away too, not at the next tick.
+        let admitted = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region(2), "other").await })
+        };
+        store.wait_for_admitted_appends(1).await.unwrap();
+        let error = timeout(WAIT, append(&store, region_id, "next"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(unwrap_shared(&error), Error::WalEntryIdExhausted { .. }),
+            "unexpected error: {error:?}"
+        );
+        let error = timeout(WAIT, admitted).await.unwrap().unwrap().unwrap_err();
         assert!(
             matches!(unwrap_shared(&error), Error::WalEntryIdExhausted { .. }),
             "unexpected error: {error:?}"
