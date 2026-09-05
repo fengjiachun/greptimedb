@@ -282,22 +282,27 @@ impl LogStore for ObjectStoreLogStore {
     ) -> Result<SendableEntryStream<'static, Entry, Error>> {
         self.check_terminal()?;
         let region_id = self.region_of(provider)?;
-        let start_entry_id = self
+        let obsolete = self
             .obsolete_entry_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&region_id)
-            .map_or(entry_id, |obsolete| {
-                entry_id.max(obsolete.saturating_add(1))
-            });
+            .copied();
+        let start_entry_id =
+            entry_id.max(obsolete.map_or(0, |obsolete| obsolete.saturating_add(1)));
         let objects = {
             let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
             match catalog.region_max_entry_id(region_id) {
-                Some(max_entry_id) if start_entry_id <= max_entry_id => catalog
-                    .objects_for_entry_range(region_id, start_entry_id, max_entry_id)?
-                    .into_iter()
-                    .map(|(object_seq, entry)| (object_seq, entry.clone()))
-                    .collect::<Vec<_>>(),
+                // A watermark at the maximum id hides everything.
+                Some(max_entry_id)
+                    if start_entry_id <= max_entry_id && obsolete != Some(EntryId::MAX) =>
+                {
+                    catalog
+                        .objects_for_entry_range(region_id, start_entry_id, max_entry_id)?
+                        .into_iter()
+                        .map(|(object_seq, entry)| (object_seq, entry.clone()))
+                        .collect::<Vec<_>>()
+                }
                 _ => Vec::new(),
             }
         };
@@ -360,7 +365,14 @@ impl LogStore for ObjectStoreLogStore {
         entry_id: EntryId,
     ) -> Result<()> {
         self.check_terminal()?;
-        self.region_of(provider)?;
+        let provider_region = self.region_of(provider)?;
+        ensure!(
+            provider_region == region_id,
+            InvalidWalEntrySnafu {
+                region_id,
+                reason: format!("provider belongs to region {provider_region}"),
+            }
+        );
         self.obsolete_entry_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1234,6 +1246,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries(&[(3, "a3")]), read(&store, region_id, 1).await);
+        // The provider of another region cannot move this region's watermark.
+        let error = store
+            .obsolete(&provider(region(2)), region_id, 3)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidWalEntry { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(entries(&[(3, "a3")]), read(&store, region_id, 1).await);
 
         store
             .obsolete_all(&provider(region_id), region_id)
@@ -1241,6 +1263,21 @@ mod tests {
             .unwrap();
         assert!(read(&store, region_id, 1).await.is_empty());
         assert_eq!(3, latest(&store, region_id));
+
+        // Even the maximum entry id is hidden after obsoleting everything.
+        let object_store = memory_store();
+        put_object_with_max_entry_id(&object_store, region_id).await;
+        let store = open(object_store, &manual()).await;
+        assert_eq!(
+            entries(&[(u64::MAX, "last")]),
+            read(&store, region_id, 0).await
+        );
+        store
+            .obsolete_all(&provider(region_id), region_id)
+            .await
+            .unwrap();
+        assert!(read(&store, region_id, 0).await.is_empty());
+        assert_eq!(u64::MAX, latest(&store, region_id));
     }
 
     #[tokio::test]
@@ -1478,11 +1515,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_store_exhausted_entry_id_poisons_without_panicking() {
-        let object_store = memory_store();
-        let region_id = region(1);
-        let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
+    /// Writes object 0 holding one entry of `region_id` with the maximum id.
+    async fn put_object_with_max_entry_id(object_store: &ObjectStore, region_id: RegionId) {
         let encoded = encode_object(
             Header {
                 object_seq: 0,
@@ -1495,7 +1529,19 @@ mod tests {
             }],
         )
         .unwrap();
-        io.put_if_absent(0, encoded.bytes).await.unwrap();
+        ObjectStoreIo::new(object_store.clone(), PREFIX)
+            .unwrap()
+            .put_if_absent(0, encoded.bytes)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_store_exhausted_entry_id_poisons_without_panicking() {
+        let object_store = memory_store();
+        let region_id = region(1);
+        put_object_with_max_entry_id(&object_store, region_id).await;
+        let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
 
         let store = open(object_store, &manual()).await;
         assert_eq!(u64::MAX, latest(&store, region_id));
