@@ -462,6 +462,12 @@ impl ScanbenchCommand {
                 println!("{} Using Kafka WAL", "✓".green());
                 components.build(log_store).await?
             }
+            DatanodeWalConfig::ObjectStore(_) if self.enable_wal => {
+                return Err(error::IllegalConfigSnafu {
+                    msg: "object store WAL is not wired into scanbench yet; disable WAL or use another provider".to_string(),
+                }
+                .build());
+            }
             _ => {
                 let log_store = Arc::new(NoopLogStore);
                 println!(
