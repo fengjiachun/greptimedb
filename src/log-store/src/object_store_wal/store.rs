@@ -68,7 +68,7 @@ pub struct ObjectStoreLogStore {
     /// conflicting object; every operation fails with it afterwards.
     terminal_error: TerminalError,
     /// Set by [`stop`](LogStore::stop) before the actor is told to exit.
-    stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
     command_tx: mpsc::Sender<Command>,
     #[cfg(any(test, feature = "testing"))]
     admitted_appends: watch::Receiver<usize>,
@@ -119,6 +119,7 @@ impl ObjectStoreLogStore {
         let (catalog, next_object_seq, durable_entry_ids) = recover(io.as_ref()).await?;
         let catalog = Arc::new(RwLock::new(catalog));
         let terminal_error = TerminalError::default();
+        let stopped = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
         #[cfg(any(test, feature = "testing"))]
         let (admitted_appends_tx, admitted_appends_rx) = watch::channel(0);
@@ -127,6 +128,7 @@ impl ObjectStoreLogStore {
             io: io.clone(),
             catalog: catalog.clone(),
             terminal_error: terminal_error.clone(),
+            stopped: stopped.clone(),
             command_rx,
             open_batch: OpenBatch::new(max_batch_bytes, durable_entry_ids),
             pending: Vec::new(),
@@ -144,7 +146,7 @@ impl ObjectStoreLogStore {
             catalog,
             obsolete_entry_ids: Mutex::new(HashMap::new()),
             terminal_error,
-            stopped: AtomicBool::new(false),
+            stopped,
             command_tx,
             #[cfg(any(test, feature = "testing"))]
             admitted_appends: admitted_appends_rx,
@@ -426,6 +428,7 @@ struct Actor {
     io: Arc<dyn WalObjectIo>,
     catalog: Arc<RwLock<ObjectCatalog>>,
     terminal_error: TerminalError,
+    stopped: Arc<AtomicBool>,
     command_rx: mpsc::Receiver<Command>,
     open_batch: OpenBatch,
     pending: Vec<PendingAppend>,
@@ -512,15 +515,21 @@ impl Actor {
             Ok(_) => {}
             // The object store did not confirm the object. Its sequence stays
             // free and the entry ids are handed out again, so a retry of the
-            // same entries writes the same object.
+            // same entries writes the same object. Waiters of a store that was
+            // stopped meanwhile learn that instead of the I/O error, like every
+            // other entry that never became durable.
             Err(error @ Error::WalObjectStore { .. }) => {
                 let durable_entry_ids = {
                     let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
                     durable_entry_ids(&catalog)
                 };
                 self.open_batch.reset(durable_entry_ids);
-                let error = Arc::new(error);
-                self.fail_pending(|| shared(&error));
+                if self.stopped.load(Ordering::Acquire) {
+                    self.fail_pending(|| ObjectStoreWalStoppedSnafu.build());
+                } else {
+                    let error = Arc::new(error);
+                    self.fail_pending(|| shared(&error));
+                }
                 return;
             }
             Err(error) => return self.fail_permanently(error),
@@ -1207,6 +1216,77 @@ mod tests {
         assert!(object_seqs(store.io.as_ref()).await.is_empty());
     }
 
+    /// Appends one entry, lets its flush block inside the conditional create,
+    /// stops the store while it is blocked, then lets the create proceed or
+    /// fail. Returns the store and the outcome of the append.
+    async fn stop_while_flush_is_blocked(
+        proceed: bool,
+    ) -> (
+        Arc<ObjectStoreLogStore>,
+        Arc<GatedIo>,
+        Result<AppendBatchResponse>,
+    ) {
+        let (io, mut gates) = GatedIo::new();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        let pending = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_id, "a1").await })
+        };
+        let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+
+        let stop = {
+            let store = store.clone();
+            tokio::spawn(async move { store.stop().await })
+        };
+        while !store.stopped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(!stop.is_finished());
+
+        gate.send(proceed).unwrap();
+        timeout(WAIT, stop).await.unwrap().unwrap().unwrap();
+        let result = timeout(WAIT, pending).await.unwrap().unwrap();
+        (store, io, result)
+    }
+
+    #[tokio::test]
+    async fn test_store_stop_during_failed_flush_reports_stopped() {
+        let (store, io, result) = stop_while_flush_is_blocked(false).await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(object_seqs(io.as_ref()).await.is_empty());
+
+        let error = append(&store, region(1), "a2").await.unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_stop_during_successful_flush_acknowledges_waiters() {
+        let (store, io, result) = stop_while_flush_is_blocked(true).await;
+        let region_id = region(1);
+        assert_eq!(
+            HashMap::from([(region_id, 1)]),
+            result.unwrap().last_entry_ids
+        );
+        assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+        assert_eq!(1, latest(&store, region_id));
+
+        let error = append(&store, region_id, "a2").await.unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_store_actor_exits_when_the_store_is_dropped() {
         let store = open(memory_store(), &manual()).await;
@@ -1276,27 +1356,70 @@ mod tests {
                 fail_after_next_put: AtomicBool::new(false),
             }
         }
+    }
 
-        fn injected<T>(&self, object_seq: u64) -> Result<T> {
-            Err(object_store::Error::new(ErrorKind::Unexpected, "injected failure").set_temporary())
-                .context(WalObjectStoreSnafu {
-                    operation: "write",
-                    path: self.inner.object_path(object_seq),
-                })
-        }
+    fn injected_failure<T>(path: String) -> Result<T> {
+        Err(object_store::Error::new(ErrorKind::Unexpected, "injected failure").set_temporary())
+            .context(WalObjectStoreSnafu {
+                operation: "write",
+                path,
+            })
     }
 
     #[async_trait::async_trait]
     impl WalObjectIo for FaultyIo {
         async fn put_if_absent(&self, object_seq: u64, content: Bytes) -> Result<PutResult> {
             if self.fail_next_put.swap(false, Ordering::Relaxed) {
-                return self.injected(object_seq);
+                return injected_failure(self.inner.object_path(object_seq));
             }
             let result = self.inner.put_if_absent(object_seq, content).await?;
             if self.fail_after_next_put.swap(false, Ordering::Relaxed) {
-                return self.injected(object_seq);
+                return injected_failure(self.inner.object_path(object_seq));
             }
             Ok(result)
+        }
+
+        async fn get(&self, object_seq: u64) -> Result<Bytes> {
+            self.inner.get(object_seq).await
+        }
+
+        async fn list(&self) -> Result<Vec<ListedObject>> {
+            self.inner.list().await
+        }
+
+        fn object_path(&self, object_seq: u64) -> String {
+            self.inner.object_path(object_seq)
+        }
+    }
+
+    /// Object access whose conditional creates block until the test decides
+    /// whether they proceed or fail with a transient error.
+    struct GatedIo {
+        inner: ObjectStoreIo,
+        gates: mpsc::UnboundedSender<oneshot::Sender<bool>>,
+    }
+
+    impl GatedIo {
+        fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<oneshot::Sender<bool>>) {
+            let (gates, gate_rx) = mpsc::unbounded_channel();
+            let io = Self {
+                inner: ObjectStoreIo::new(memory_store(), PREFIX).unwrap(),
+                gates,
+            };
+            (Arc::new(io), gate_rx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WalObjectIo for GatedIo {
+        async fn put_if_absent(&self, object_seq: u64, content: Bytes) -> Result<PutResult> {
+            let (gate, opened) = oneshot::channel();
+            self.gates.send(gate).unwrap();
+            if opened.await.unwrap() {
+                self.inner.put_if_absent(object_seq, content).await
+            } else {
+                injected_failure(self.inner.object_path(object_seq))
+            }
         }
 
         async fn get(&self, object_seq: u64) -> Result<Bytes> {
