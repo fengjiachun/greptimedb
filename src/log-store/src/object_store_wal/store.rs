@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -66,6 +67,8 @@ pub struct ObjectStoreLogStore {
     /// Set once the store hit an error it cannot recover from, such as a
     /// conflicting object; every operation fails with it afterwards.
     terminal_error: TerminalError,
+    /// Set by [`stop`](LogStore::stop) before the actor is told to exit.
+    stopped: AtomicBool,
     command_tx: mpsc::Sender<Command>,
     #[cfg(any(test, feature = "testing"))]
     admitted_appends: watch::Receiver<usize>,
@@ -141,6 +144,7 @@ impl ObjectStoreLogStore {
             catalog,
             obsolete_entry_ids: Mutex::new(HashMap::new()),
             terminal_error,
+            stopped: AtomicBool::new(false),
             command_tx,
             #[cfg(any(test, feature = "testing"))]
             admitted_appends: admitted_appends_rx,
@@ -207,6 +211,7 @@ impl LogStore for ObjectStoreLogStore {
     type Error = Error;
 
     async fn stop(&self) -> Result<()> {
+        self.stopped.store(true, Ordering::Release);
         let (response_tx, response_rx) = oneshot::channel();
         let sent = self
             .command_tx
@@ -222,6 +227,10 @@ impl LogStore for ObjectStoreLogStore {
     }
 
     async fn append_batch(&self, entries: Vec<Entry>) -> Result<AppendBatchResponse> {
+        ensure!(
+            !self.stopped.load(Ordering::Acquire),
+            ObjectStoreWalStoppedSnafu
+        );
         self.check_terminal()?;
         if entries.is_empty() {
             return Ok(AppendBatchResponse::default());
@@ -316,14 +325,17 @@ impl LogStore for ObjectStoreLogStore {
     }
 
     async fn create_namespace(&self, ns: &Provider) -> Result<()> {
+        self.check_terminal()?;
         self.region_of(ns).map(|_| ())
     }
 
     async fn delete_namespace(&self, ns: &Provider) -> Result<()> {
+        self.check_terminal()?;
         self.region_of(ns).map(|_| ())
     }
 
     async fn list_namespaces(&self) -> Result<Vec<Provider>> {
+        self.check_terminal()?;
         let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
         let regions = catalog
             .objects_in_order()
@@ -341,6 +353,7 @@ impl LogStore for ObjectStoreLogStore {
         region_id: RegionId,
         entry_id: EntryId,
     ) -> Result<()> {
+        self.check_terminal()?;
         self.region_of(provider)?;
         self.obsolete_entry_ids
             .lock()
@@ -362,6 +375,7 @@ impl LogStore for ObjectStoreLogStore {
         region_id: RegionId,
         provider: &Provider,
     ) -> Result<Entry> {
+        self.check_terminal()?;
         let provider_region = self.region_of(provider)?;
         ensure!(
             provider_region == region_id,
@@ -932,12 +946,13 @@ mod tests {
             .await
             .unwrap();
 
+        let retry = entry(&store, region_id, "a1");
         let error = append(&store, region_id, "a1").await.unwrap_err();
         assert!(
             matches!(unwrap_shared(&error), Error::WalObjectConflict { path, .. } if path == &io.object_path(0)),
             "unexpected error: {error:?}"
         );
-        let error = append(&store, region_id, "a1").await.unwrap_err();
+        let error = store.append_batch(vec![retry]).await.unwrap_err();
         assert!(
             matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
             "unexpected error: {error:?}"
@@ -953,6 +968,53 @@ mod tests {
                 if path == &io.object_path(0) && matches!(**source, Error::CorruptedWalObject { .. })),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_store_poisoned_by_conflict_rejects_every_operation() {
+        let object_store = memory_store();
+        let store = open(object_store.clone(), &eager()).await;
+        let region_id = region(1);
+        append(&store, region_id, "a1").await.unwrap();
+        let before = read(&store, region_id, 1).await;
+        assert_eq!(entries(&[(1, "a1")]), before);
+
+        let io = ObjectStoreIo::new(object_store, PREFIX).unwrap();
+        io.put_if_absent(1, Bytes::from_static(b"foreign"))
+            .await
+            .unwrap();
+        append(&store, region_id, "a2").await.unwrap_err();
+
+        let provider = provider(region_id);
+        let errors = [
+            store.create_namespace(&provider).await.unwrap_err(),
+            store.delete_namespace(&provider).await.unwrap_err(),
+            store.list_namespaces().await.unwrap_err(),
+            store
+                .entry(Vec::new(), 0, region_id, &provider)
+                .unwrap_err(),
+            store.obsolete(&provider, region_id, 1).await.unwrap_err(),
+            store.obsolete_all(&provider, region_id).await.unwrap_err(),
+            store.read(&provider, 1, None).await.err().unwrap(),
+            store.latest_entry_id(&provider).unwrap_err(),
+            store.append_batch(Vec::new()).await.unwrap_err(),
+        ];
+        for error in &errors {
+            assert!(
+                matches!(unwrap_shared(error), Error::WalObjectConflict { .. }),
+                "unexpected error: {error:?}"
+            );
+        }
+        // The rejected obsoletes did not move the watermark.
+        assert!(
+            store
+                .obsolete_entry_ids
+                .lock()
+                .unwrap()
+                .get(&region_id)
+                .is_none()
+        );
+        store.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -1127,6 +1189,11 @@ mod tests {
         store.stop().await.unwrap();
 
         let error = append(&store, region_id, "a2").await.unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+        let error = store.append_batch(Vec::new()).await.unwrap_err();
         assert!(
             matches!(error, Error::ObjectStoreWalStopped { .. }),
             "unexpected error: {error:?}"
