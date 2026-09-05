@@ -448,13 +448,19 @@ impl Actor {
 
         loop {
             tokio::select! {
-                _ = interval.tick() => self.flush_open_batch().await,
+                _ = interval.tick() => {
+                    if self.is_stopped() {
+                        self.discard_open_batch();
+                    } else {
+                        self.flush_open_batch().await;
+                    }
+                }
                 command = self.command_rx.recv() => match command {
                     Some(Command::Append { entries, response }) => {
                         self.handle_append(entries, response).await;
                     }
                     Some(Command::Stop { response }) => {
-                        self.fail_pending(|| ObjectStoreWalStoppedSnafu.build());
+                        self.discard_open_batch();
                         let _ = response.send(());
                         return;
                     }
@@ -477,6 +483,12 @@ impl Actor {
         entries: Vec<Entry>,
         response: oneshot::Sender<Result<AppendBatchResponse>>,
     ) {
+        // The append was queued before `stop` set the flag; nothing that is
+        // not durable yet gets admitted once it is set.
+        if self.is_stopped() {
+            let _ = response.send(Err(ObjectStoreWalStoppedSnafu.build()));
+            return;
+        }
         if let Some(error) = terminal(&self.terminal_error) {
             let _ = response.send(Err(shared(&error)));
             return;
@@ -524,7 +536,7 @@ impl Actor {
                     durable_entry_ids(&catalog)
                 };
                 self.open_batch.reset(durable_entry_ids);
-                if self.stopped.load(Ordering::Acquire) {
+                if self.is_stopped() {
                     self.fail_pending(|| ObjectStoreWalStoppedSnafu.build());
                 } else {
                     let error = Arc::new(error);
@@ -560,6 +572,21 @@ impl Actor {
                 );
             }
         }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Drops the entries of the open batch, which are not durable, and fails
+    /// their waiters with the stopped error.
+    fn discard_open_batch(&mut self) {
+        let durable_entry_ids = {
+            let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+            durable_entry_ids(&catalog)
+        };
+        self.open_batch.reset(durable_entry_ids);
+        self.fail_pending(|| ObjectStoreWalStoppedSnafu.build());
     }
 
     fn fail_pending(&mut self, error: impl Fn() -> Error) {
@@ -1267,6 +1294,58 @@ mod tests {
             matches!(error, Error::ObjectStoreWalStopped { .. }),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_store_stop_rejects_appends_queued_behind_a_flush() {
+        let (io, mut gates) = GatedIo::new();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        let first = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_id, "a1").await })
+        };
+        let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+
+        // The second append passes the public stopped check and queues behind
+        // the blocked flush.
+        let second = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_id, "a2").await })
+        };
+        while store.command_tx.capacity() == COMMAND_BUFFER {
+            tokio::task::yield_now().await;
+        }
+        let stop = {
+            let store = store.clone();
+            tokio::spawn(async move { store.stop().await })
+        };
+        while !store.stopped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        gate.send(true).unwrap();
+        timeout(WAIT, stop).await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            HashMap::from([(region_id, 1)]),
+            timeout(WAIT, first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .last_entry_ids
+        );
+        let error = timeout(WAIT, second).await.unwrap().unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+        // No second object was created, so no second create was attempted.
+        assert!(gates.try_recv().is_err());
+        assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+        assert_eq!(1, latest(&store, region_id));
     }
 
     #[tokio::test]
