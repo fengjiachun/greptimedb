@@ -794,6 +794,24 @@ mod tests {
     }
 
     #[test]
+    fn test_format_rejects_corrupted_trailer_checksums() {
+        let encoded = encode_object(header(), &records()).unwrap();
+        let trailer_start = encoded.bytes.len() - TRAILER_LEN;
+
+        // The object checksum the trailer stores, at footer offset, footer length
+        // and footer checksum.
+        let object_crc32_start = trailer_start + 8 + 8 + 4;
+        let mut bad_object_crc32 = encoded.bytes.to_vec();
+        bad_object_crc32[object_crc32_start] ^= 1;
+        assert_corrupted(decode_object(&bad_object_crc32), "object checksum mismatch");
+
+        let footer_crc32_start = trailer_start + 8 + 8;
+        let mut bad_footer_crc32 = encoded.bytes.to_vec();
+        bad_footer_crc32[footer_crc32_start] ^= 1;
+        assert_corrupted(decode_object(&bad_footer_crc32), "footer checksum mismatch");
+    }
+
+    #[test]
     fn test_format_rejects_empty_object() {
         assert_corrupted(encode_object(header(), &[]), "object has no records");
     }

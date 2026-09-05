@@ -337,6 +337,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("WAL object sequence is exhausted, last sequence: {}", last_object_seq))]
+    WalObjectSequenceExhausted {
+        last_object_seq: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("WAL object already exists with different content, path: {}", path))]
     WalObjectConflict {
         path: String,
@@ -400,7 +407,9 @@ impl ErrorExt for Error {
             | WaitDumpIndex { .. }
             | MetaLengthExceededLimit { .. } => StatusCode::Internal,
 
-            CorruptedWalObject { .. } | WalObjectConflict { .. } => StatusCode::Unexpected,
+            CorruptedWalObject { .. }
+            | WalObjectConflict { .. }
+            | WalObjectSequenceExhausted { .. } => StatusCode::Unexpected,
 
             // Object store related errors
             CreateWriter { .. }

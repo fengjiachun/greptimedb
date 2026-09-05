@@ -17,10 +17,12 @@
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Unbounded};
 
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 use store_api::storage::RegionId;
 
-use crate::error::{CorruptedWalObjectSnafu, InvalidWalEntryRangeSnafu, Result};
+use crate::error::{
+    CorruptedWalObjectSnafu, InvalidWalEntryRangeSnafu, Result, WalObjectSequenceExhaustedSnafu,
+};
 use crate::object_store_wal::format::FooterEntry;
 
 /// Indexes objects by sequence and, per region, the objects that hold entries
@@ -71,15 +73,15 @@ impl ObjectCatalog {
             );
         }
 
-        if let Some(existing) = self.objects.get(&object_seq) {
-            ensure!(
-                existing == &footer,
-                CorruptedWalObjectSnafu {
-                    reason: format!("object {object_seq} was indexed with different metadata"),
-                }
-            );
-            return Ok(());
-        }
+        // Object sequences are unique: recovery indexes every listed key once, and
+        // accepting a repeated insertion would hide a caller that lost track of it.
+        // Retrying an identical write stays an object store concern.
+        ensure!(
+            !self.objects.contains_key(&object_seq),
+            CorruptedWalObjectSnafu {
+                reason: format!("object {object_seq} is already indexed"),
+            }
+        );
 
         // Validate every region before mutating either index so insertion is atomic.
         for entry in &footer {
@@ -167,6 +169,20 @@ impl ObjectCatalog {
             .map(|(_, entry)| entry.max_entry_id)
     }
 
+    /// Returns the sequence to assign to the next object written after recovery.
+    ///
+    /// An empty catalog starts at zero, so the first object of a prefix always
+    /// takes sequence zero. Otherwise the sequence continues after the largest
+    /// indexed one, which recovery discovers regardless of insertion order.
+    pub(super) fn next_object_seq(&self) -> Result<u64> {
+        let Some((&last_object_seq, _)) = self.objects.last_key_value() else {
+            return Ok(0);
+        };
+        last_object_seq
+            .checked_add(1)
+            .context(WalObjectSequenceExhaustedSnafu { last_object_seq })
+    }
+
     /// Iterates over the indexed objects ordered by object sequence.
     pub(super) fn objects_in_order(&self) -> impl Iterator<Item = (u64, &[FooterEntry])> + '_ {
         self.objects
@@ -231,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_duplicate_object_is_idempotent() {
+    fn test_catalog_rejects_duplicate_object_sequences() {
         let region_id = RegionId::new(1, 1);
         let mut catalog = ObjectCatalog::default();
         let first = footer_entry(region_id, 1, 2);
@@ -240,17 +256,52 @@ mod tests {
         catalog
             .insert_object(1, vec![first.clone(), second.clone()])
             .unwrap();
-        catalog
-            .insert_object(1, vec![second, first.clone()])
-            .unwrap();
+
+        // An identical footer is rejected just like a conflicting one.
+        assert_corrupted(
+            catalog.insert_object(1, vec![second, first.clone()]),
+            "object 1 is already indexed",
+        );
 
         let mut conflicting = first;
         conflicting.segment_offset += 1;
         assert_corrupted(
             catalog.insert_object(1, vec![conflicting]),
-            "object 1 was indexed with different metadata",
+            "object 1 is already indexed",
         );
         assert_eq!(1, catalog.objects_in_order().count());
+    }
+
+    #[test]
+    fn test_catalog_resumes_object_sequence_after_recovery() {
+        let region_id = RegionId::new(1, 1);
+        let mut catalog = ObjectCatalog::default();
+        assert_eq!(0, catalog.next_object_seq().unwrap());
+
+        // Recovery may discover objects out of order.
+        catalog
+            .insert_object(4, vec![footer_entry(region_id, 10, 12)])
+            .unwrap();
+        catalog
+            .insert_object(1, vec![footer_entry(region_id, 1, 3)])
+            .unwrap();
+
+        assert_eq!(5, catalog.next_object_seq().unwrap());
+    }
+
+    #[test]
+    fn test_catalog_rejects_exhausted_object_sequence() {
+        let region_id = RegionId::new(1, 1);
+        let mut catalog = ObjectCatalog::default();
+        catalog
+            .insert_object(u64::MAX, vec![footer_entry(region_id, 1, 2)])
+            .unwrap();
+
+        let error = catalog.next_object_seq().unwrap_err();
+        assert!(
+            error.to_string().contains("object sequence is exhausted"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
