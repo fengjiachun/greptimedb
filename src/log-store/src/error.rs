@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::sync::Arc;
 
 use common_error::ext::{ErrorExt, RetryHint, retry_hint_from_io_error};
 use common_error::status_code::StatusCode;
@@ -360,6 +361,48 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Invalid WAL object, path: {}", path))]
+    InvalidWalObject {
+        path: String,
+        #[snafu(source(from(Error, Box::new)))]
+        source: Box<Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Object store WAL prefix mismatch, expected: {}, actual: {}",
+        expected,
+        actual
+    ))]
+    MismatchedWalPrefix {
+        expected: String,
+        actual: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid WAL entry for region {}, {}", region_id, reason))]
+    InvalidWalEntry {
+        region_id: RegionId,
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Object store WAL log store is stopped"))]
+    ObjectStoreWalStopped {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Object store WAL operation failed"))]
+    ObjectStoreWal {
+        source: Arc<Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -392,7 +435,9 @@ impl ErrorExt for Error {
             | MissingValue { .. }
             | OverrideCompactedEntry { .. }
             | InvalidWalObjectStore { .. }
-            | InvalidWalEntryRange { .. } => StatusCode::InvalidArguments,
+            | InvalidWalEntryRange { .. }
+            | MismatchedWalPrefix { .. }
+            | InvalidWalEntry { .. } => StatusCode::InvalidArguments,
             StartWalTask { .. }
             | StopWalTask { .. }
             | IllegalState { .. }
@@ -405,7 +450,10 @@ impl ErrorExt for Error {
             | OrderedBatchProducerStopped { .. }
             | WaitProduceResultReceiver { .. }
             | WaitDumpIndex { .. }
-            | MetaLengthExceededLimit { .. } => StatusCode::Internal,
+            | MetaLengthExceededLimit { .. }
+            | ObjectStoreWalStopped { .. } => StatusCode::Internal,
+            InvalidWalObject { source, .. } => source.status_code(),
+            ObjectStoreWal { source, .. } => source.status_code(),
 
             CorruptedWalObject { .. }
             | WalObjectConflict { .. }
@@ -446,6 +494,7 @@ impl ErrorExt for Error {
             | WriteIndex { error, .. }
             | ReadIndex { error, .. }
             | WalObjectStore { error, .. } => retry_hint_from_opendal_error(error),
+            ObjectStoreWal { source, .. } => source.retry_hint(),
             Io { error, .. } => retry_hint_from_io_error(error),
             FetchEntry { .. } | RaftEngine { .. } | AddEntryLogBatch { .. } => RetryHint::Retryable,
             ProduceRecord { error, .. } => match error {

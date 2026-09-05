@@ -129,7 +129,7 @@ impl ObjectStoreIo {
         Ok(objects)
     }
 
-    fn object_path(&self, object_seq: u64) -> String {
+    pub(super) fn object_path(&self, object_seq: u64) -> String {
         format!(
             "{}{object_seq:0OBJECT_SEQ_WIDTH$}{OBJECT_SUFFIX}",
             self.object_prefix

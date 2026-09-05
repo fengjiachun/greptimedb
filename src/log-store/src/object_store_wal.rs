@@ -37,10 +37,10 @@
 //! sequence is a conflict. Recovery replays objects in sequence order to
 //! rebuild the object catalog index, which rejects a sequence it already holds.
 
-// The log store that consumes these primitives lands separately, so nothing
-// outside the unit tests references them yet.
-#![allow(dead_code)]
-
+mod batch;
 mod catalog;
 mod format;
 mod io;
+mod store;
+
+pub use store::ObjectStoreLogStore;
