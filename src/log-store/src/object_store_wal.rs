@@ -30,10 +30,12 @@
 //! carries the CRC32 of the footer and of the whole object, so a reader locates
 //! the footer by reading the fixed-length trailer at the end of the object.
 //!
-//! Object sequences are dense and monotonic within one prefix. An object is
-//! created conditionally, which makes a retry of the same sequence either a
-//! no-op or a conflict, and recovery replays objects in sequence order to
-//! rebuild the object catalog index.
+//! Object sequences increase monotonically within one prefix and may leave
+//! gaps, so recovery continues after the largest sequence it indexed. An object
+//! is created conditionally: rewriting a sequence with the content it already
+//! holds is a no-op at the object store, while different content under a taken
+//! sequence is a conflict. Recovery replays objects in sequence order to
+//! rebuild the object catalog index, which rejects a sequence it already holds.
 
 // The log store that consumes these primitives lands separately, so nothing
 // outside the unit tests references them yet.

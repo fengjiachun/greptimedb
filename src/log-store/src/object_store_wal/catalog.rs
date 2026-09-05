@@ -36,7 +36,8 @@ pub(super) struct ObjectCatalog {
 impl ObjectCatalog {
     /// Indexes the footer of the object `object_seq`. Objects may be inserted
     /// in any order, which lets recovery index them as it discovers them.
-    /// Inserting the same footer again is a no-op.
+    /// Inserting a sequence that is already indexed is rejected, whether or not
+    /// the footer matches the indexed one.
     pub(super) fn insert_object(
         &mut self,
         object_seq: u64,
