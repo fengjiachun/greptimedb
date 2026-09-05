@@ -835,17 +835,25 @@ mod tests {
 
     use cache::build_datanode_cache_registry;
     use common_base::Plugins;
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use common_meta::cache::LayeredCacheRegistryBuilder;
     use common_meta::key::RegionRoleSet;
     use common_meta::key::datanode_table::DatanodeTableManager;
     use common_meta::kv_backend::KvBackendRef;
     use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_test_util::temp_dir::create_temp_dir;
+    use common_wal::config::DatanodeWalConfig;
+    use common_wal::config::object_store::ObjectStoreWalConfig;
+    use meta_client::MetaClientRef;
+    use meta_client::client::MetaClientBuilder;
     use mito2::engine::MITO_ENGINE_NAME;
     use store_api::region_request::RegionRequest;
     use store_api::storage::RegionId;
 
     use crate::config::DatanodeOptions;
     use crate::datanode::DatanodeBuilder;
+    use crate::error::Error;
     use crate::tests::{MockRegionEngine, mock_region_server};
 
     async fn setup_table_datanode(kv: &KvBackendRef) {
@@ -913,5 +921,68 @@ mod tests {
             mock_region_handler.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         );
+    }
+
+    async fn build_datanode_with_object_store_wal(
+        data_home: &str,
+        meta_client: Option<MetaClientRef>,
+    ) -> Error {
+        let kv_backend = Arc::new(MemoryKvBackend::new());
+        let layered_cache_registry = Arc::new(
+            LayeredCacheRegistryBuilder::default()
+                .add_cache_registry(build_datanode_cache_registry(kv_backend.clone()))
+                .build(),
+        );
+        let mut opts = DatanodeOptions {
+            node_id: Some(0),
+            wal: DatanodeWalConfig::ObjectStore(ObjectStoreWalConfig::default()),
+            ..Default::default()
+        };
+        opts.storage.data_home = data_home.to_string();
+
+        let mut builder = DatanodeBuilder::new(opts, Plugins::default(), kv_backend);
+        builder.with_cache_registry(layered_cache_registry);
+        if let Some(meta_client) = meta_client {
+            builder.with_meta_client(meta_client);
+        }
+        match builder.build().await {
+            Ok(_) => panic!("object store WAL config must be rejected"),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_rejects_object_store_wal_with_meta_client() {
+        let data_home = create_temp_dir("object-store-wal-meta-client");
+        let meta_client = Arc::new(MetaClientBuilder::datanode_default_options(0).build());
+
+        let err = build_datanode_with_object_store_wal(
+            data_home.path().to_str().unwrap(),
+            Some(meta_client),
+        )
+        .await;
+
+        assert_matches!(err, Error::ObjectStoreWalNotStandalone { .. });
+        assert_eq!(StatusCode::InvalidArguments, err.status_code());
+        // The builder stops before it creates any storage or log store.
+        assert!(
+            std::fs::read_dir(data_home.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_rejects_object_store_wal_until_wired() {
+        let data_home = create_temp_dir("object-store-wal-not-wired");
+
+        let err =
+            build_datanode_with_object_store_wal(data_home.path().to_str().unwrap(), None).await;
+
+        assert_matches!(err, Error::ObjectStoreWalNotWired { .. });
+        assert_eq!(StatusCode::Unsupported, err.status_code());
+        // No Raft Engine log store is created as a fallback.
+        assert!(!data_home.path().join("wal").exists());
     }
 }

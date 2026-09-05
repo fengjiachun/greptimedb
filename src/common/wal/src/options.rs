@@ -95,7 +95,6 @@ mod tests {
         let decoded: WalOptions = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, wal_options);
 
-        // Test serde object store wal options.
         let wal_options = WalOptions::ObjectStore(ObjectStoreWalOptions::new("wal".to_string()));
         let encoded = serde_json::to_string(&wal_options).unwrap();
         let expected = r#"{"wal.provider":"object_store","wal.object_store.prefix":"wal"}"#;
