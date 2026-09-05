@@ -51,6 +51,8 @@ pub mod listener;
 #[cfg(test)]
 mod merge_mode_test;
 #[cfg(test)]
+mod object_store_wal_test;
+#[cfg(test)]
 mod open_test;
 #[cfg(test)]
 mod parallel_test;
@@ -770,7 +772,7 @@ fn prepare_batch_open_requests(
                     .or_default()
                     .push((region_id, request));
             }
-            WalOptions::RaftEngine | WalOptions::Noop => {
+            WalOptions::RaftEngine | WalOptions::Noop | WalOptions::ObjectStore(_) => {
                 remaining_regions.push((region_id, request));
             }
         }

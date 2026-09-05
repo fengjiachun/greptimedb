@@ -115,7 +115,8 @@ impl<S: LogStore> Wal<S> {
             Provider::RaftEngine(_) => Box::new(LogStoreEntryReader::new(
                 LogStoreRawEntryReader::new(self.store.clone()),
             )),
-            Provider::Kafka(_) => {
+            // Entries of many regions share one namespace, so the reader filters by region.
+            Provider::Kafka(_) | Provider::ObjectStore(_) => {
                 let reader = if let Some(location_id) = location_id {
                     LogStoreRawEntryReader::new(self.store.clone())
                         .with_wal_index(WalIndex::new(region_id, location_id))
@@ -252,9 +253,11 @@ mod tests {
     use futures::TryStreamExt;
     use log_store::raft_engine::log_store::RaftEngineLogStore;
     use log_store::test_util::log_store_util;
+    use prost::Message;
     use store_api::storage::SequenceNumber;
 
     use super::*;
+    use crate::test_util::SharedNamespaceLogStore;
 
     struct WalEnv {
         _wal_dir: TempDir,
@@ -472,6 +475,50 @@ mod tests {
         let stream = wal.scan(id1, 5, &ns1).unwrap();
         let actual: Vec<_> = stream.try_collect().await.unwrap();
         assert!(actual.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_object_store_provider_scan_is_region_isolated() {
+        let region_id = RegionId::new(1, 1);
+        let other_region_id = RegionId::new(1, 2);
+        let provider = Provider::object_store_provider(region_id, "wal".to_string());
+        let other_provider = Provider::object_store_provider(other_region_id, "wal".to_string());
+        let store = Arc::new(SharedNamespaceLogStore::default());
+        let wal = Wal::new(store.clone());
+
+        let wal_entry = WalEntry {
+            mutations: vec![new_mutation(OpType::Put, 1, &[("k1", 1)])],
+            bulk_entries: vec![],
+        };
+        let data = wal_entry.encode_to_vec();
+        store
+            .append_batch(vec![
+                store.entry(data.clone(), 0, region_id, &provider).unwrap(),
+                store
+                    .entry(data, 0, other_region_id, &other_provider)
+                    .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let entries = wal
+            .scan(region_id, 0, &provider)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(vec![(1, wal_entry)], entries);
+
+        // The reader forwards the WAL index of the region to the store.
+        wal.wal_entry_reader(&provider, region_id, Some(42))
+            .read(&provider, 0)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let index = store.read_indexes().last().unwrap().unwrap();
+        assert_eq!(region_id, index.region_id);
+        assert_eq!(42, index.location_id);
     }
 
     #[tokio::test]

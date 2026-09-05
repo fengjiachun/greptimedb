@@ -24,8 +24,8 @@ pub mod wal_util;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use api::greptime_proto::v1;
 use api::helper::ColumnDataTypeWrapper;
@@ -47,6 +47,7 @@ use datatypes::arrow::array::{TimestampMillisecondArray, UInt8Array, UInt64Array
 use datatypes::extension::json::{Json2ExtensionType, JsonExtensionType};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::ColumnSchema;
+use futures::stream;
 use log_store::kafka::log_store::KafkaLogStore;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use log_store::test_util::log_store_util;
@@ -61,7 +62,9 @@ use rskafka::client::partition::{Compression, UnknownTopicHandling};
 use rskafka::client::{Client, ClientBuilder};
 use rskafka::record::Record;
 use rstest_reuse::template;
-use store_api::logstore::LogStore;
+use store_api::logstore::entry::{Entry, NaiveEntry};
+use store_api::logstore::provider::Provider;
+use store_api::logstore::{AppendBatchResponse, EntryId, LogStore, SendableEntryStream, WalIndex};
 use store_api::metadata::{ColumnMetadata, RegionMetadataRef};
 use store_api::region_engine::{RegionEngine, RegionRole};
 use store_api::region_request::{
@@ -349,6 +352,161 @@ pub(crate) enum LogStoreImpl {
     Kafka(Arc<KafkaLogStore>),
 }
 
+/// A log store that keeps the entries of every region under one namespace in memory and
+/// assigns entry ids in append order like a remote WAL. Reads return the entries of all
+/// regions, so the caller must filter by region. It records the providers it is called with.
+#[derive(Debug, Default)]
+pub struct SharedNamespaceLogStore {
+    state: Mutex<SharedNamespaceState>,
+}
+
+#[derive(Debug, Default)]
+struct SharedNamespaceState {
+    latest_entry_id: EntryId,
+    entries: Vec<Entry>,
+    read_providers: Vec<Provider>,
+    read_indexes: Vec<Option<WalIndex>>,
+    obsoleted: Vec<(Provider, RegionId, EntryId)>,
+    obsoleted_all: Vec<(Provider, RegionId)>,
+}
+
+impl SharedNamespaceLogStore {
+    /// Returns the region id of every stored entry.
+    pub fn region_ids(&self) -> Vec<RegionId> {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.region_id())
+            .collect()
+    }
+
+    /// Returns the providers passed to `read`.
+    pub fn read_providers(&self) -> Vec<Provider> {
+        self.state.lock().unwrap().read_providers.clone()
+    }
+
+    /// Returns the WAL indexes passed to `read`.
+    pub fn read_indexes(&self) -> Vec<Option<WalIndex>> {
+        self.state.lock().unwrap().read_indexes.clone()
+    }
+
+    /// Returns the arguments passed to `obsolete`.
+    pub fn obsoleted(&self) -> Vec<(Provider, RegionId, EntryId)> {
+        self.state.lock().unwrap().obsoleted.clone()
+    }
+
+    /// Returns the arguments passed to `obsolete_all`.
+    pub fn obsoleted_all(&self) -> Vec<(Provider, RegionId)> {
+        self.state.lock().unwrap().obsoleted_all.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl LogStore for SharedNamespaceLogStore {
+    type Error = log_store::error::Error;
+
+    async fn stop(&self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn append_batch(
+        &self,
+        entries: Vec<Entry>,
+    ) -> std::result::Result<AppendBatchResponse, Self::Error> {
+        let mut state = self.state.lock().unwrap();
+        let mut last_entry_ids = HashMap::new();
+        for mut entry in entries {
+            state.latest_entry_id += 1;
+            let entry_id = state.latest_entry_id;
+            match &mut entry {
+                Entry::Naive(entry) => entry.entry_id = entry_id,
+                Entry::MultiplePart(entry) => entry.entry_id = entry_id,
+            }
+            last_entry_ids.insert(entry.region_id(), entry_id);
+            state.entries.push(entry);
+        }
+        Ok(AppendBatchResponse { last_entry_ids })
+    }
+
+    async fn read(
+        &self,
+        provider: &Provider,
+        entry_id: EntryId,
+        index: Option<WalIndex>,
+    ) -> std::result::Result<SendableEntryStream<'static, Entry, Self::Error>, Self::Error> {
+        let mut state = self.state.lock().unwrap();
+        state.read_providers.push(provider.clone());
+        state.read_indexes.push(index);
+        let entries = state
+            .entries
+            .iter()
+            .filter(|entry| entry.entry_id() >= entry_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(Box::pin(stream::iter(vec![Ok(entries)])))
+    }
+
+    async fn create_namespace(&self, _ns: &Provider) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn delete_namespace(&self, _ns: &Provider) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn list_namespaces(&self) -> std::result::Result<Vec<Provider>, Self::Error> {
+        Ok(vec![])
+    }
+
+    async fn obsolete(
+        &self,
+        provider: &Provider,
+        region_id: RegionId,
+        entry_id: EntryId,
+    ) -> std::result::Result<(), Self::Error> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .obsoleted
+            .push((provider.clone(), region_id, entry_id));
+        state
+            .entries
+            .retain(|entry| entry.region_id() != region_id || entry.entry_id() > entry_id);
+        Ok(())
+    }
+
+    async fn obsolete_all(
+        &self,
+        provider: &Provider,
+        region_id: RegionId,
+    ) -> std::result::Result<(), Self::Error> {
+        let mut state = self.state.lock().unwrap();
+        state.obsoleted_all.push((provider.clone(), region_id));
+        state.entries.retain(|entry| entry.region_id() != region_id);
+        Ok(())
+    }
+
+    fn entry(
+        &self,
+        data: Vec<u8>,
+        entry_id: EntryId,
+        region_id: RegionId,
+        provider: &Provider,
+    ) -> std::result::Result<Entry, Self::Error> {
+        Ok(Entry::Naive(NaiveEntry {
+            provider: provider.clone(),
+            region_id,
+            entry_id,
+            data,
+        }))
+    }
+
+    fn latest_entry_id(&self, _provider: &Provider) -> std::result::Result<EntryId, Self::Error> {
+        Ok(self.state.lock().unwrap().latest_entry_id)
+    }
+}
+
 /// Env to test mito engine.
 pub struct TestEnv {
     /// Path to store data.
@@ -490,6 +648,30 @@ impl TestEnv {
         self.object_store_manager = Some(object_store_manager.clone());
 
         self.new_mito_engine_with_plugins(config, plugins).await
+    }
+
+    /// Creates a new engine with specific config and log store under this env.
+    pub(crate) async fn create_engine_with_log_store<S: LogStore>(
+        &mut self,
+        config: MitoConfig,
+        log_store: Arc<S>,
+    ) -> MitoEngine {
+        let object_store_manager = Arc::new(self.create_object_store_manager());
+        self.object_store_manager = Some(object_store_manager.clone());
+
+        let data_home = self.data_home().display().to_string();
+        MitoEngine::new(
+            &data_home,
+            config,
+            log_store,
+            object_store_manager,
+            self.schema_metadata_manager.clone(),
+            self.file_ref_manager.clone(),
+            self.partition_expr_fetcher.clone(),
+            Plugins::new(),
+        )
+        .await
+        .unwrap()
     }
 
     /// Creates a new engine with specific config and existing logstore and object store manager.
