@@ -16,9 +16,12 @@
 
 use std::collections::HashMap;
 
+use snafu::OptionExt;
 use store_api::logstore::EntryId;
 use store_api::logstore::entry::Entry;
 use store_api::storage::RegionId;
+
+use crate::error::{Result, WalEntryIdExhaustedSnafu};
 
 /// Entries admitted since the last seal, together with the largest entry id
 /// handed out per region.
@@ -48,24 +51,30 @@ impl OpenBatch {
     }
 
     /// Admits `entries`, assigning each the next entry id of its region, and
-    /// returns the last id assigned to every region in `entries`.
-    pub(super) fn admit(&mut self, mut entries: Vec<Entry>) -> HashMap<RegionId, EntryId> {
+    /// returns the last id assigned to every region in `entries`. An
+    /// exhausted entry id admits nothing.
+    pub(super) fn admit(&mut self, mut entries: Vec<Entry>) -> Result<HashMap<RegionId, EntryId>> {
         let mut last_entry_ids = HashMap::new();
         for entry in &mut entries {
             let region_id = entry.region_id();
-            let entry_id = self
-                .accepted_entry_ids
+            let last_entry_id = last_entry_ids
                 .get(&region_id)
+                .or_else(|| self.accepted_entry_ids.get(&region_id))
                 .copied()
-                .unwrap_or(0)
-                + 1;
+                .unwrap_or(0);
+            let entry_id = last_entry_id
+                .checked_add(1)
+                .context(WalEntryIdExhaustedSnafu {
+                    region_id,
+                    last_entry_id,
+                })?;
             entry.set_entry_id(entry_id);
-            self.accepted_entry_ids.insert(region_id, entry_id);
             last_entry_ids.insert(region_id, entry_id);
-            self.estimated_bytes += entry.estimated_size();
         }
+        self.accepted_entry_ids.extend(&last_entry_ids);
+        self.estimated_bytes += entries.iter().map(Entry::estimated_size).sum::<usize>();
         self.entries.extend(entries);
-        last_entry_ids
+        Ok(last_entry_ids)
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -121,13 +130,17 @@ mod tests {
         let region_b = RegionId::new(1, 2);
         let mut batch = OpenBatch::new(usize::MAX, HashMap::from([(region_a, 5)]));
 
-        let first = batch.admit(vec![entry(region_a, 1), entry(region_b, 1)]);
+        let first = batch
+            .admit(vec![entry(region_a, 1), entry(region_b, 1)])
+            .unwrap();
         assert_eq!(HashMap::from([(region_a, 6), (region_b, 1)]), first);
-        let second = batch.admit(vec![
-            entry(region_b, 1),
-            entry(region_a, 1),
-            entry(region_b, 1),
-        ]);
+        let second = batch
+            .admit(vec![
+                entry(region_b, 1),
+                entry(region_a, 1),
+                entry(region_b, 1),
+            ])
+            .unwrap();
         assert_eq!(HashMap::from([(region_a, 7), (region_b, 3)]), second);
 
         assert_eq!(
@@ -143,7 +156,7 @@ mod tests {
         assert!(batch.is_empty());
         assert_eq!(
             HashMap::from([(region_a, 8)]),
-            batch.admit(vec![entry(region_a, 1)])
+            batch.admit(vec![entry(region_a, 1)]).unwrap()
         );
     }
 
@@ -156,9 +169,9 @@ mod tests {
         let mut batch = OpenBatch::new(max_bytes, HashMap::new());
 
         assert!(!batch.should_seal());
-        batch.admit(vec![first]);
+        batch.admit(vec![first]).unwrap();
         assert!(!batch.should_seal());
-        batch.admit(vec![second]);
+        batch.admit(vec![second]).unwrap();
         assert!(batch.should_seal());
 
         assert_eq!(2, batch.seal().len());
@@ -172,13 +185,13 @@ mod tests {
 
         assert_eq!(
             HashMap::from([(region_id, 4)]),
-            batch.admit(vec![entry(region_id, 1)])
+            batch.admit(vec![entry(region_id, 1)]).unwrap()
         );
         batch.reset(HashMap::from([(region_id, 3)]));
         assert!(batch.is_empty());
         assert_eq!(
             HashMap::from([(region_id, 4)]),
-            batch.admit(vec![entry(region_id, 1)])
+            batch.admit(vec![entry(region_id, 1)]).unwrap()
         );
     }
 }

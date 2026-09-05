@@ -345,6 +345,18 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "WAL entry id of region {} is exhausted, last entry id: {}",
+        region_id,
+        last_entry_id
+    ))]
+    WalEntryIdExhausted {
+        region_id: RegionId,
+        last_entry_id: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("WAL object already exists with different content, path: {}", path))]
     WalObjectConflict {
         path: String,
@@ -457,7 +469,8 @@ impl ErrorExt for Error {
 
             CorruptedWalObject { .. }
             | WalObjectConflict { .. }
-            | WalObjectSequenceExhausted { .. } => StatusCode::Unexpected,
+            | WalObjectSequenceExhausted { .. }
+            | WalEntryIdExhausted { .. } => StatusCode::Unexpected,
 
             // Object store related errors
             CreateWriter { .. }

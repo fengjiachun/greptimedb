@@ -502,7 +502,14 @@ impl Actor {
             let _ = response.send(Err(shared(&error)));
             return;
         }
-        let last_entry_ids = self.open_batch.admit(entries);
+        let last_entry_ids = match self.open_batch.admit(entries) {
+            Ok(last_entry_ids) => last_entry_ids,
+            Err(error) => {
+                let error = set_terminal(&self.terminal_error, error);
+                let _ = response.send(Err(shared(&error)));
+                return;
+            }
+        };
         self.pending.push(PendingAppend {
             last_entry_ids,
             response,
@@ -604,9 +611,16 @@ impl Actor {
         }
     }
 
+    /// Records `error` as terminal and fails the waiters with it, unless the
+    /// store was stopped meanwhile: their entries never became durable, so
+    /// they learn that the store is stopped like every other such waiter.
     fn fail_permanently(&mut self, error: Error) {
         let error = set_terminal(&self.terminal_error, error);
-        self.fail_pending(|| shared(&error));
+        if self.is_stopped() {
+            self.fail_pending(|| ObjectStoreWalStoppedSnafu.build());
+        } else {
+            self.fail_pending(|| shared(&error));
+        }
     }
 }
 
@@ -1404,6 +1418,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_stop_during_conflicting_flush_reports_stopped_and_poisons() {
+        let object_store = memory_store();
+        let (io, mut gates) = GatedIo::over(object_store.clone());
+        let store = ObjectStoreLogStore::open(io, &eager()).await.unwrap();
+        let region_id = region(1);
+        let pending = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_id, "a1").await })
+        };
+        let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+        let stop = {
+            let store = store.clone();
+            tokio::spawn(async move { store.stop().await })
+        };
+        while !store.stopped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        // The sequence is taken by different content before the create runs.
+        ObjectStoreIo::new(object_store, PREFIX)
+            .unwrap()
+            .put_if_absent(0, Bytes::from_static(b"foreign"))
+            .await
+            .unwrap();
+
+        gate.send(true).unwrap();
+        timeout(WAIT, stop).await.unwrap().unwrap().unwrap();
+        let error = timeout(WAIT, pending).await.unwrap().unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+        for error in [
+            store.latest_entry_id(&provider(region_id)).unwrap_err(),
+            store
+                .read(&provider(region_id), 1, None)
+                .await
+                .err()
+                .unwrap(),
+        ] {
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
+                "unexpected error: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_exhausted_entry_id_poisons_without_panicking() {
+        let object_store = memory_store();
+        let region_id = region(1);
+        let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
+        let encoded = encode_object(
+            Header {
+                object_seq: 0,
+                writer_instance: [0; 16],
+            },
+            &[Record {
+                region_id,
+                entry_id: u64::MAX,
+                payload: Bytes::from_static(b"last"),
+            }],
+        )
+        .unwrap();
+        io.put_if_absent(0, encoded.bytes).await.unwrap();
+
+        let store = open(object_store, &eager()).await;
+        assert_eq!(u64::MAX, latest(&store, region_id));
+        let error = append(&store, region_id, "next").await.unwrap_err();
+        assert!(
+            matches!(unwrap_shared(&error), Error::WalEntryIdExhausted { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(store.latest_entry_id(&provider(region_id)).is_err());
+        assert_eq!(vec![0], object_seqs(&io).await);
+        store.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_store_stop_during_successful_flush_acknowledges_waiters() {
         let (store, io, result) = stop_while_flush_is_blocked(true).await;
         let region_id = region(1);
@@ -1535,9 +1627,15 @@ mod tests {
 
     impl GatedIo {
         fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<oneshot::Sender<bool>>) {
+            Self::over(memory_store())
+        }
+
+        fn over(
+            object_store: ObjectStore,
+        ) -> (Arc<Self>, mpsc::UnboundedReceiver<oneshot::Sender<bool>>) {
             let (gates, gate_rx) = mpsc::unbounded_channel();
             let io = Self {
-                inner: ObjectStoreIo::new(memory_store(), PREFIX).unwrap(),
+                inner: ObjectStoreIo::new(object_store, PREFIX).unwrap(),
                 gates,
             };
             (Arc::new(io), gate_rx)
