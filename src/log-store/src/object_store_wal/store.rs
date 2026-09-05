@@ -196,6 +196,10 @@ impl ObjectStoreLogStore {
 
     /// Seals and persists the open batch regardless of its size and age.
     pub async fn seal_open_batch(&self) -> Result<()> {
+        ensure!(
+            !self.stopped.load(Ordering::Acquire),
+            ObjectStoreWalStoppedSnafu
+        );
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Seal {
@@ -466,9 +470,14 @@ impl Actor {
                     }
                     #[cfg(any(test, feature = "testing"))]
                     Some(Command::Seal { response }) => {
-                        self.flush_open_batch().await;
-                        let result = terminal(&self.terminal_error)
-                            .map_or(Ok(()), |error| Err(shared(&error)));
+                        let result = if self.is_stopped() {
+                            self.discard_open_batch();
+                            Err(ObjectStoreWalStoppedSnafu.build())
+                        } else {
+                            self.flush_open_batch().await;
+                            terminal(&self.terminal_error)
+                                .map_or(Ok(()), |error| Err(shared(&error)))
+                        };
                         let _ = response.send(result);
                     }
                     // Every sender is gone: the store was dropped without `stop`.
@@ -1346,6 +1355,52 @@ mod tests {
         assert!(gates.try_recv().is_err());
         assert_eq!(vec![0], object_seqs(io.as_ref()).await);
         assert_eq!(1, latest(&store, region_id));
+    }
+
+    #[tokio::test]
+    async fn test_store_seal_after_stop_reports_stopped() {
+        let store = open(memory_store(), &manual()).await;
+        store.stop().await.unwrap();
+        let error = store.seal_open_batch().await.unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(object_seqs(store.io.as_ref()).await.is_empty());
+
+        // A seal queued behind a blocked flush before `stop` is refused too.
+        let (io, mut gates) = GatedIo::new();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let first = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region(1), "a1").await })
+        };
+        let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+        let seal = {
+            let store = store.clone();
+            tokio::spawn(async move { store.seal_open_batch().await })
+        };
+        while store.command_tx.capacity() == COMMAND_BUFFER {
+            tokio::task::yield_now().await;
+        }
+        let stop = {
+            let store = store.clone();
+            tokio::spawn(async move { store.stop().await })
+        };
+        while !store.stopped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        gate.send(true).unwrap();
+        timeout(WAIT, stop).await.unwrap().unwrap().unwrap();
+        timeout(WAIT, first).await.unwrap().unwrap().unwrap();
+        let error = timeout(WAIT, seal).await.unwrap().unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(vec![0], object_seqs(io.as_ref()).await);
     }
 
     #[tokio::test]
