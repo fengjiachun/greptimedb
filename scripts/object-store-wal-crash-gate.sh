@@ -45,10 +45,12 @@
 # acknowledged is a write that was in flight at the kill (the last attempt of
 # a writer). Nothing is cleaned between cycles, so replay accumulates.
 #
-# PASS means every cycle passed and the manifest carries every required
-# field; anything else is FAIL with a non-zero exit status. The run directory
-# is printed and kept in both cases; the objects of a passed run are removed
-# from the bucket, those of a failed run are kept as evidence.
+# PASS means every cycle passed, the manifest carries every required field,
+# and the objects of the run were removed from the bucket and the removal
+# was verified; anything else is FAIL with a non-zero exit status and a
+# final manifest, however the run ended. The run directory is printed and
+# kept in both cases; the objects of a failed run stay in the bucket as
+# evidence.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${0}")" >/dev/null 2>&1 && pwd)
@@ -79,32 +81,23 @@ ATTEMPTED="${RUN_DIR}/attempted.log"
 SERVER_PID=""
 WRITER_PIDS=""
 RESULT=FAIL
+MANIFEST_PRINTED=no
 STORE_ROOT=""
 BINARY_COMMIT=""
 BINARY_SHA256=""
 MISSING=()
 
+# The original stdout and stderr, so the manifest and the log reach the
+# caller even when the EXIT handler runs inside a redirected command.
+exec 3>&1 4>&2
+
 log() {
-  echo "[object-store-wal-crash-gate] $*" >&2
+  echo "[object-store-wal-crash-gate] $*" >&4
 }
 
 now_ms() {
   python3 -c 'import time; print(int(time.time() * 1000))'
 }
-
-cleanup() {
-  if [ -n "${WRITER_PIDS}" ]; then
-    # shellcheck disable=SC2086
-    kill -KILL ${WRITER_PIDS} 2>/dev/null || true
-  fi
-  if [ -n "${SERVER_PID}" ] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    log "killing the leftover server ${SERVER_PID}"
-    kill -KILL "${SERVER_PID}" 2>/dev/null || true
-    wait "${SERVER_PID}" 2>/dev/null || true
-  fi
-  log "run directory: ${RUN_DIR}"
-}
-trap cleanup EXIT
 
 mkdir -p "${RUN_DIR}"
 : > "${MANIFEST}"
@@ -113,6 +106,7 @@ mkdir -p "${RUN_DIR}"
 
 # Prints the manifest: the run identity, then every field collected so far.
 print_manifest() {
+  MANIFEST_PRINTED=yes
   # The image is the one the container runs, which can differ from what the
   # tag resolves to when an older container is reused.
   local image_id="" digests=""
@@ -133,16 +127,64 @@ print_manifest() {
       echo "missing: ${field}"
     done
     echo "result: ${RESULT}"
-  } | tee "${RUN_DIR}/manifest-final.txt"
+  } | tee "${RUN_DIR}/manifest-final.txt" >&3
 }
 
-# Fails the run right away; the manifest keeps what was collected so far.
+# Fails the run right away with the reason in the manifest; the EXIT handler
+# prints it.
 fail() {
   log "FAIL: $*"
   echo "fail: $*" >> "${MANIFEST}"
-  print_manifest
   exit 1
 }
+
+# Runs on every exit: stops whatever is still running, and prints the final
+# manifest as FAIL when the run ended before it was printed, so a command
+# that failed under `set -e` still leaves a verdict.
+# shellcheck disable=SC2329
+cleanup() {
+  local status=$?
+  set +e
+  if [ -n "${WRITER_PIDS}" ]; then
+    # shellcheck disable=SC2086
+    kill -KILL ${WRITER_PIDS} 2>/dev/null
+  fi
+  if [ -n "${SERVER_PID}" ] && kill -0 "${SERVER_PID}" 2>/dev/null; then
+    log "killing the leftover server ${SERVER_PID}"
+    kill -KILL "${SERVER_PID}" 2>/dev/null
+    wait "${SERVER_PID}" 2>/dev/null
+  fi
+  if [ "${MANIFEST_PRINTED}" = no ]; then
+    RESULT=FAIL
+    echo "fail: exited with status ${status} before the manifest was complete" >> "${MANIFEST}"
+    print_manifest
+    log "run directory: ${RUN_DIR}"
+    exit 1
+  fi
+  log "run directory: ${RUN_DIR}"
+}
+trap cleanup EXIT
+
+# The knobs are checked before anything is started, so a bad value fails
+# with a manifest instead of an empty run or an arithmetic error.
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+is_non_negative_number() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+is_positive_integer "${CYCLES}" || fail "CYCLES must be a positive integer, got '${CYCLES}'"
+is_positive_integer "${WRITERS}" || fail "WRITERS must be a positive integer, got '${WRITERS}'"
+is_non_negative_number "${KILL_MIN_SECS}" ||
+  fail "KILL_MIN_SECS must be a non-negative number, got '${KILL_MIN_SECS}'"
+is_non_negative_number "${KILL_MAX_SECS}" ||
+  fail "KILL_MAX_SECS must be a non-negative number, got '${KILL_MAX_SECS}'"
+if ! python3 -c "import sys; sys.exit(0 if ${KILL_MAX_SECS} >= ${KILL_MIN_SECS} else 1)"; then
+  fail "KILL_MAX_SECS (${KILL_MAX_SECS}) must not be below KILL_MIN_SECS (${KILL_MIN_SECS})"
+fi
+is_positive_integer "${GREPTIME_PORT_BASE}" ||
+  fail "GREPTIME_PORT_BASE must be a positive integer, got '${GREPTIME_PORT_BASE}'"
+
 
 if curl -sf "http://${HTTP_ADDR}/health" >/dev/null 2>&1; then
   fail "something already answers on http://${HTTP_ADDR}; set GREPTIME_PORT_BASE"
@@ -392,7 +434,7 @@ for cycle in $(seq 1 "${CYCLES}"); do
     WRITER_PIDS="${WRITER_PIDS} $!"
   done
 
-  delay_ms=$((KILL_MIN_SECS * 1000 + RANDOM % ((KILL_MAX_SECS - KILL_MIN_SECS) * 1000 + 1)))
+  delay_ms=$(python3 -c "import random; print(random.randint(int(${KILL_MIN_SECS} * 1000), int(${KILL_MAX_SECS} * 1000)))")
   log "cycle ${cycle}: writing from sequence ${NEXT_SEQ}, SIGKILL in ${delay_ms}ms"
   sleep "$(python3 -c "print(${delay_ms} / 1000)")"
   kill -KILL "${SERVER_PID}"
@@ -424,10 +466,11 @@ for cycle in $(seq 1 "${CYCLES}"); do
 
   start_server "${cycle}"
   record "${cycle}" "restart_wall_ms=${START_WALL_MS}"
-  # The region open time covers the WAL replay of the restart.
-  opened=$(grep -oE 'Opened [0-9]+ regions in [^[:space:]]+' "${SERVER_LOG}" | head -1 || true)
-  [ -n "${opened}" ] && record "${cycle}" "replay: ${opened}"
+  # The replay of every region is reported by the engine; the region open
+  # time of the datanode covers all of them.
   grep -oE 'Replay WAL for region: .*' "${SERVER_LOG}" | sed -E "s/^/cycle=${cycle} replay: /" >> "${MANIFEST}" || true
+  grep -oE 'Opened [0-9]+ regions in [^[:space:]]+' "${SERVER_LOG}" | head -1 |
+    sed -E "s/^/cycle=${cycle} open: /" >> "${MANIFEST}" || true
   verify "${cycle}"
   record "${cycle}" "wal_$(wal_objects)"
   log "cycle ${cycle}: $(grep -E "^cycle=${cycle} found=" "${MANIFEST}")"
@@ -447,19 +490,28 @@ require_line() {
 for cycle in $(seq 1 "${CYCLES}"); do
   require_line "cycle ${cycle} acked" "^cycle=${cycle} kill_delay_ms=[0-9]+ acked=[0-9]+$"
   require_line "cycle ${cycle} restart wall time" "^cycle=${cycle} restart_wall_ms=[0-9]+$"
-  require_line "cycle ${cycle} replay timing" "^cycle=${cycle} replay: Opened [0-9]+ regions in "
+  require_line "cycle ${cycle} replay" "^cycle=${cycle} replay: Replay WAL for region: .* rows recovered: [0-9]+, replay from entry id: [0-9]+, last entry id: [0-9]+, .*elapsed: "
+  require_line "cycle ${cycle} region open time" "^cycle=${cycle} open: Opened [0-9]+ regions in "
   require_line "cycle ${cycle} rows found" "^cycle=${cycle} found=[0-9]+ cumulative_acked=[0-9]+ unacked_survivors=[0-9]+ survivors=\\["
   require_line "cycle ${cycle} WAL objects" "^cycle=${cycle} wal_objects=[0-9]+ bytes=[0-9]+$"
 done
 [ -n "${BINARY_COMMIT}" ] || MISSING+=("binary commit")
 
+# The objects of a passed run are removed, and the removal is verified
+# before PASS is declared; a failed run keeps them as evidence.
 if [ "${#MISSING[@]}" -eq 0 ] && ! grep -qE '^(cycle=[0-9]+ violation|fail):' "${MANIFEST}"; then
-  RESULT=PASS
+  mc_run "mc rm --recursive --force local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
+  if REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
+    echo "cleanup: root ${STORE_ROOT} removed and verified empty" >> "${MANIFEST}"
+    RESULT=PASS
+  else
+    echo "${REMAINING}" >&2
+    echo "fail: root ${STORE_ROOT} still holds objects after cleanup" >> "${MANIFEST}"
+  fi
 fi
 print_manifest
 
 if [ "${RESULT}" = PASS ]; then
-  mc_run "mc rm --recursive --force local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
   exit 0
 fi
 exit 1
