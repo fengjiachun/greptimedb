@@ -40,13 +40,12 @@ use common_meta::procedure_executor::LocalProcedureExecutor;
 use common_meta::region_keeper::MemoryRegionKeeper;
 use common_meta::region_registry::LeaderRegionRegistry;
 use common_meta::sequence::SequenceBuilder;
-use common_meta::wal_provider::build_wal_provider;
 use common_procedure::ProcedureManagerRef;
 use common_procedure::local::EventRecorderHandle;
 use common_procedure::options::ProcedureConfig;
 use common_telemetry::logging::SlowQueryOptions;
 use common_test_util::find_workspace_path;
-use common_wal::config::{DatanodeWalConfig, MetasrvWalConfig};
+use common_wal::config::DatanodeWalConfig;
 use datanode::datanode::DatanodeBuilder;
 use flow::{FlownodeBuilder, FrontendClient, GrpcQueryHandlerWithBoxedError};
 use frontend::frontend::Frontend;
@@ -80,7 +79,6 @@ impl GreptimeDbStandalone {
 pub struct GreptimeDbStandaloneBuilder {
     instance_name: String,
     datanode_wal_config: DatanodeWalConfig,
-    metasrv_wal_config: MetasrvWalConfig,
     store_providers: Option<Vec<StorageType>>,
     default_store: Option<StorageType>,
     plugin: Option<Plugins>,
@@ -97,7 +95,6 @@ impl GreptimeDbStandaloneBuilder {
             plugin: None,
             default_store: None,
             datanode_wal_config: DatanodeWalConfig::default(),
-            metasrv_wal_config: MetasrvWalConfig::default(),
             // Enable slow query log with 1s threshold by default for integration tests.
             slow_query_options: SlowQueryOptions {
                 enable: true,
@@ -159,12 +156,6 @@ impl GreptimeDbStandaloneBuilder {
     #[must_use]
     pub fn with_datanode_wal_config(mut self, datanode_wal_config: DatanodeWalConfig) -> Self {
         self.datanode_wal_config = datanode_wal_config;
-        self
-    }
-
-    #[must_use]
-    pub fn with_metasrv_wal_config(mut self, metasrv_wal_config: MetasrvWalConfig) -> Self {
-        self.metasrv_wal_config = metasrv_wal_config;
         self
     }
 
@@ -244,10 +235,10 @@ impl GreptimeDbStandaloneBuilder {
                 .step(10)
                 .build(),
         );
-        let kafka_options = opts.wal.clone().try_into().unwrap();
-        let wal_provider = build_wal_provider(&kafka_options, kv_backend.clone())
-            .await
-            .unwrap();
+        let wal_provider =
+            cmd::standalone::build_standalone_wal_provider(&opts.wal, kv_backend.clone())
+                .await
+                .unwrap();
         let wal_provider = Arc::new(wal_provider);
         let table_metadata_allocator = Arc::new(TableMetadataAllocator::new(
             table_id_allocator,
@@ -378,7 +369,7 @@ impl GreptimeDbStandaloneBuilder {
             storage: opts.storage,
             procedure: procedure_config,
             metadata_store: kv_backend_config,
-            wal: self.metasrv_wal_config.clone().into(),
+            wal: opts.wal,
             grpc: GrpcOptions::default().with_server_addr("127.0.0.1:4001"),
             slow_query: self.slow_query_options.clone(),
             event_recorder: self.event_recorder_options.clone(),
