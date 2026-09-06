@@ -122,12 +122,12 @@ This keeps two properties at once. Comparing `entry_id >> 20` with an object seq
 | Situation | Sequence | Waiters of the batch | Store |
 | --- | --- | --- | --- |
 | create succeeds, or identical retry | advances | acknowledged | healthy |
-| transient I/O error | unchanged | fail; entry ids roll back to the durable watermark so a retry writes the same object | healthy |
+| transient I/O error | unchanged | fail; entry ids roll back to the durable watermark, so the next batch takes the same sequence number | healthy |
 | conflicting object | unchanged | fail | poisoned |
 | encoding or catalog error | unchanged | fail | poisoned |
 | create succeeds at the last representable sequence | cannot advance | acknowledged | poisoned: no later batch can be allocated a sequence, every later append fails |
 
-A store cannot be constructed on a prefix whose largest object already carries the maximum sequence. A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are not retried inside the store. They surface through Mito to the caller of the write, which sees the request fail; any retry is the caller's decision, and the identical-retry rule above makes such a retry safe if the object turned out to be durable after all. A store-level retry would only hide the latency.
+A store cannot be constructed on a prefix whose largest object already carries the maximum sequence. A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are not retried inside the store. They surface through Mito to the caller of the write, which sees the request fail. Neither the store nor Mito keeps the failed batch, so a retry is a new write by the caller, grouped with whatever else is admitted at that time. Such a retry is not idempotent at the request level. If the failed create had in fact succeeded and only its response was lost, the next batch takes the same sequence number with different content, its conditional create conflicts, and the store poisons itself; the identical-content rule accepts only a byte-identical whole batch at that sequence, which is what the store's own retry of the same open batch produces, not a caller's retry. Reading back the object at the failed sequence before reusing it would close this gap and is listed under *Future work*. A store-level retry of the batch itself would only hide the latency.
 
 **Stopping.** `stop` is idempotent and awaits the actor. A create that is already in flight runs to completion and, if it succeeds, acknowledges its now-durable entries; entries that never became durable receive a stopped error, including a batch whose in-flight create fails after stop began. Once stop has begun, queued appends are not admitted and no timer or seal triggered flush starts. Appends after stop, including empty ones, fail with the stopped error.
 
@@ -235,8 +235,9 @@ Distributed mode is out of scope, but several decisions were taken so that the c
 3. Segment-level corruption skipping with region marking and metrics.
 4. Garbage collection of objects whose every region has been flushed past them, driven by the watermarks Mito re-establishes on open.
 5. Metrics for flush latency, object count and size, replay duration; a fault matrix for network errors, unwritable buckets and missing objects.
-6. A cost and latency comparison against Raft Engine with `sync_write = true`, to calibrate `flush_interval`, `max_batch_bytes` and the default acknowledgement mode.
-7. Distributed mode, which needs metasrv-side allocation, per-datanode prefixes and a metasrv-issued generation in the object header.
+6. After a transient create failure, read back the object at the failed sequence before reusing the sequence number, so that a create that succeeded without a response is indexed instead of conflicting with the next batch.
+7. A cost and latency comparison against Raft Engine with `sync_write = true`, to calibrate `flush_interval`, `max_batch_bytes` and the default acknowledgement mode.
+8. Distributed mode, which needs metasrv-side allocation, per-datanode prefixes and a metasrv-issued generation in the object header.
 
 # Unresolved questions
 
