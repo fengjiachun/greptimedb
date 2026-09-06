@@ -13,14 +13,21 @@
 // limitations under the License.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
+use common_procedure::options::ProcedureConfig;
 use common_query::Output;
+use common_telemetry::info;
 use common_wal::config::DatanodeWalConfig;
 use common_wal::config::object_store::ObjectStoreWalConfig;
 use frontend::instance::Instance;
+use object_store::ObjectStore;
+use object_store::config::ObjectStoreConfig;
+use object_store::services::S3;
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::QueryContext;
-use tests_integration::standalone::GreptimeDbStandaloneBuilder;
+use tests_integration::standalone::{GreptimeDbStandalone, GreptimeDbStandaloneBuilder};
+use tests_integration::test_util::StorageType;
 
 async fn execute_sql(instance: &Instance, sql: &str) -> Output {
     SqlQueryHandler::do_query(instance, sql, QueryContext::arc())
@@ -97,4 +104,180 @@ async fn test_standalone_object_store_wal_round_trip() {
     execute_sql(frontend, "ADMIN FLUSH_TABLE('cpu')").await;
     let rows = execute_sql(frontend, query).await.data.pretty_print().await;
     assert_eq!(expected, rows);
+}
+
+/// WAL objects under the prefix of the default S3 store of `opts`.
+struct WalObjects {
+    store: ObjectStore,
+    path: String,
+}
+
+impl WalObjects {
+    fn new(config: &ObjectStoreConfig, prefix: &str) -> Self {
+        let ObjectStoreConfig::S3(s3) = config else {
+            panic!("expected the S3 store, actual {config:?}");
+        };
+        let store = ObjectStore::new(S3::from(&s3.connection)).unwrap().finish();
+        Self {
+            store,
+            path: format!("{prefix}/objects/"),
+        }
+    }
+
+    /// Returns the object count and their total size in bytes.
+    async fn count_and_bytes(&self) -> (usize, u64) {
+        let entries = self
+            .store
+            .list_with(&self.path)
+            .recursive(true)
+            .await
+            .unwrap();
+        let mut count = 0;
+        let mut bytes = 0;
+        for entry in entries {
+            if entry.metadata().is_dir() {
+                continue;
+            }
+            count += 1;
+            bytes += self
+                .store
+                .stat(entry.path())
+                .await
+                .unwrap()
+                .content_length();
+        }
+        (count, bytes)
+    }
+
+    /// Logs the objects of a phase for the driver script to collect.
+    async fn record(&self, phase: &str) -> (usize, u64) {
+        let (count, bytes) = self.count_and_bytes().await;
+        info!("object_store_wal phase={phase} objects={count} bytes={bytes}");
+        (count, bytes)
+    }
+}
+
+/// Builds the instance again on the metadata, data home and object store of
+/// the dropped one, like a process restart, and returns how long it took.
+async fn restart(
+    builder: &GreptimeDbStandaloneBuilder,
+    standalone: GreptimeDbStandalone,
+) -> (GreptimeDbStandalone, Duration) {
+    let GreptimeDbStandalone {
+        frontend,
+        opts,
+        guard,
+        kv_backend,
+        procedure_manager,
+        event_recorder_handle,
+    } = standalone;
+    drop(frontend);
+    drop(procedure_manager);
+    drop(event_recorder_handle);
+
+    let (procedure_manager, event_recorder_handle) =
+        standalone::build_procedure_manager(kv_backend.clone(), ProcedureConfig::default());
+    let start = Instant::now();
+    let standalone = builder
+        .build_with(
+            kv_backend,
+            guard,
+            opts,
+            procedure_manager,
+            event_recorder_handle,
+            true,
+        )
+        .await;
+    (standalone, start.elapsed())
+}
+
+/// Runs against the S3 bucket of the `GT_S3_*` environment variables, so it
+/// is skipped unless they are set.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_standalone_object_store_wal_survives_restarts_on_s3() {
+    if !StorageType::S3.test_on() {
+        return;
+    }
+    common_telemetry::init_default_ut_logging();
+
+    const PREFIX: &str = "cluster-a/wal";
+    const BATCHES: usize = 5;
+    const ROWS_PER_BATCH: usize = 4;
+
+    let wal_config = ObjectStoreWalConfig {
+        prefix: PREFIX.to_string(),
+        ..Default::default()
+    };
+    let builder = GreptimeDbStandaloneBuilder::new("object_store_wal_s3")
+        .with_default_store_type(StorageType::S3)
+        .with_datanode_wal_config(DatanodeWalConfig::ObjectStore(wal_config));
+    let standalone = builder.build().await;
+    let wal_objects = WalObjects::new(&standalone.opts.storage.store, PREFIX);
+    assert_eq!((0, 0), wal_objects.record("before-writes").await);
+
+    execute_sql(
+        standalone.fe_instance(),
+        r#"
+        CREATE TABLE cpu (
+            hostname STRING PRIMARY KEY,
+            usage_user DOUBLE,
+            ts TIMESTAMP TIME INDEX
+        )
+        "#,
+    )
+    .await;
+    // Every insert is acknowledged once its entries are durable, so the
+    // batches land in separate WAL objects.
+    for batch in 0..BATCHES {
+        let values = (0..ROWS_PER_BATCH)
+            .map(|row| {
+                let i = batch * ROWS_PER_BATCH + row;
+                format!(
+                    "('host_{i}', {i}.0, {})",
+                    1_686_567_600_000 + i as i64 * 1000
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        execute_sql(
+            standalone.fe_instance(),
+            &format!("INSERT INTO cpu VALUES {values}"),
+        )
+        .await;
+    }
+    let query = "SELECT hostname, usage_user, ts FROM cpu ORDER BY ts";
+    let expected = execute_sql(standalone.fe_instance(), query)
+        .await
+        .data
+        .pretty_print()
+        .await;
+    assert_eq!(BATCHES * ROWS_PER_BATCH + 4, expected.lines().count());
+    let (objects, _) = wal_objects.record("after-writes").await;
+    assert!(objects >= 2, "expected several WAL objects, got {objects}");
+
+    // Nothing was flushed, so the rows come back from the WAL alone.
+    let (standalone, elapsed) = restart(&builder, standalone).await;
+    info!("object_store_wal restart=1 wall_ms={}", elapsed.as_millis());
+    let rows = execute_sql(standalone.fe_instance(), query)
+        .await
+        .data
+        .pretty_print()
+        .await;
+    assert_eq!(expected, rows);
+    let (replayed_objects, _) = wal_objects.record("after-restart-1").await;
+    assert_eq!(objects, replayed_objects);
+
+    execute_sql(standalone.fe_instance(), "ADMIN FLUSH_TABLE('cpu')").await;
+    wal_objects.record("after-flush").await;
+
+    // The flushed rows come back from the SST and nothing is replayed twice.
+    let (standalone, elapsed) = restart(&builder, standalone).await;
+    info!("object_store_wal restart=2 wall_ms={}", elapsed.as_millis());
+    let rows = execute_sql(standalone.fe_instance(), query)
+        .await
+        .data
+        .pretty_print()
+        .await;
+    assert_eq!(expected, rows);
+    wal_objects.record("after-restart-2").await;
 }
