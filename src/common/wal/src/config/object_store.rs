@@ -29,7 +29,7 @@ pub struct ObjectStoreWalConfig {
     /// Interval of flushing buffered entries to the object store.
     #[serde(with = "humantime_serde")]
     pub flush_interval: Duration,
-    /// The max size of a single batch object.
+    /// The max size of a single batch object, defaults to 8MiB.
     pub max_batch_bytes: ReadableSize,
 }
 
@@ -39,7 +39,7 @@ impl Default for ObjectStoreWalConfig {
             storage_provider: String::new(),
             prefix: "wal".to_string(),
             flush_interval: Duration::from_secs(1),
-            max_batch_bytes: ReadableSize::mb(1),
+            max_batch_bytes: ReadableSize::mb(8),
         }
     }
 }
