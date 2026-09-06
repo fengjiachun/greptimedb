@@ -18,7 +18,7 @@ GreptimeDB already stores data files in object storage. The WAL is the last comp
 - Raft Engine ties the node to a persistent volume. Losing the volume loses unflushed writes; moving the node means moving the volume.
 - Kafka is an operational dependency of its own, with topics, retention and a broker fleet to size, and it is disproportionate for a single node.
 
-Object storage is already provisioned, already durable across zones, and already the place the rest of the data lives. An object store WAL lets a standalone node run with no local state that must survive a restart: on a new machine, point it at the same bucket and prefix and it replays. The cost is write latency: a write waits for its batch to seal, for earlier uploads to finish, and for one PUT. That is acceptable for the ingestion patterns GreptimeDB targets when writes are batched.
+Object storage is already provisioned, already durable across zones, and already the place the rest of the data lives. An object store WAL takes the WAL out of the local state that must survive a restart: unflushed writes are no longer tied to a volume, and a node restarted against the same bucket and prefix replays them. It does not yet make a standalone node independent of local disk altogether, because standalone keeps its metadata in a local key-value store under the data home regardless of the WAL provider; moving that metadata off local disk is a separate change. The cost is write latency: a write waits for its batch to seal, for earlier uploads to finish, and for one PUT. That is acceptable for the ingestion patterns GreptimeDB targets when writes are batched.
 
 # Goals
 
@@ -32,7 +32,8 @@ Object storage is already provisioned, already durable across zones, and already
 
 - Distributed mode. The provider is rejected when a datanode is controlled by a metasrv; the metasrv side has no allocation logic for it yet.
 - Garbage collection of WAL objects, and persistence of per-region obsolete watermarks. Both are follow-ups; the design leaves room for them.
-- Matching Raft Engine's write latency. The provider trades latency for the absence of local durable state.
+- Matching Raft Engine's write latency. The provider trades latency for the absence of local durable WAL state.
+- Making standalone metadata independent of local disk. The metadata store is unchanged by this RFC.
 
 # Details
 
@@ -52,7 +53,7 @@ Two choices are deliberate:
 - The persisted `WalOptions` carry the prefix. On reopen the log store compares the persisted prefix with the process configuration and fails fast on a mismatch, so an operator who changes the prefix cannot silently point a region at an empty WAL. Changing the prefix of an existing region requires an explicit migration, which is out of scope here.
 - `Provider::ObjectStore` is classified as a remote WAL. Mito's remote-WAL branches (initial flushed entry id from `latest_entry_id`, `topic_latest_entry_id` after replay, region-scoped reads, no topic grouping on batch open) apply unchanged. This is a classification of replay semantics, not of physical location.
 
-`DatanodeWalConfig::ObjectStore` cannot be converted into `MetasrvWalConfig`; that conversion failing is what rejects the provider in distributed mode. The standalone bootstrap matches the datanode WAL configuration before the metasrv conversion and constructs `WalProvider::ObjectStore` directly.
+A datanode that is configured with a metasrv client rejects the provider before any store is built: `DatanodeBuilder` returns an error stating that the object store WAL is standalone-only. Separately, `DatanodeWalConfig::ObjectStore` cannot be converted into `MetasrvWalConfig`, so a metasrv cannot be configured with it either. The standalone bootstrap matches the datanode WAL configuration before that conversion and constructs `WalProvider::ObjectStore` directly.
 
 ## Object format
 
@@ -98,10 +99,10 @@ Entry ids are assigned per region and are contiguous: when a batch admits entrie
 *Proposed*: entry ids become object-sequence-major. The high bits are the sequence number of the object that holds the entry, the low bits are the entry's position among that region's entries inside the object:
 
 ```text
-entry_id = object_seq << 20 | position_in_object   (position < 2^20, the batch seals earlier otherwise)
+entry_id = object_seq << 20 | position_in_object   (1 <= position < 2^20, the batch seals earlier otherwise)
 ```
 
-This keeps two properties at once. Comparing `entry_id >> 20` with an object sequence answers "is everything in this object flushed" without consulting any index, which is what garbage collection and a future cross-node takeover need. And every entry still has a unique, strictly increasing id, so a flush that lands between two appends of the same region that ended up in the same object records exactly which entries it covered; replay from `flushed_entry_id` can never skip an unflushed entry or repeat a flushed one. A region's ids then have gaps wherever other regions or other positions took the sequence, exactly as Kafka offsets do, and Mito already tolerates gaps. The proposal does not change the object layout. It changes the entry id values that are assigned, and those values are encoded in two places that must agree: in each record inside its segment and in the footer's entry id range for that segment. `latest_entry_id` stays region-scoped.
+Positions start at one, so entry id zero is never assigned: Mito treats zero as the watermark of a region that has no durable entry and replays from the next id, and the first object has sequence zero. This keeps two properties at once. Comparing `entry_id >> 20` with an object sequence answers "is everything in this object flushed" without consulting any index, which is what garbage collection and a future cross-node takeover need. And every entry still has a unique, strictly increasing id, so a flush that lands between two appends of the same region that ended up in the same object records exactly which entries it covered; replay from `flushed_entry_id` can never skip an unflushed entry or repeat a flushed one. A region's ids then have gaps wherever other regions or other positions took the sequence, exactly as Kafka offsets do, and Mito already tolerates gaps. The proposal does not change the object layout. It changes the entry id values that are assigned, and those values are encoded in two places that must agree: in each record inside its segment and in the footer's entry id range for that segment. `latest_entry_id` stays region-scoped.
 
 ## Log store
 
@@ -127,7 +128,7 @@ This keeps two properties at once. Comparing `entry_id >> 20` with an object seq
 | encoding or catalog error | unchanged | fail | poisoned |
 | create succeeds at the last representable sequence | cannot advance | acknowledged | poisoned: no later batch can be allocated a sequence, every later append fails |
 
-A store cannot be constructed on a prefix whose largest object already carries the maximum sequence. A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are not retried inside the store. They surface through Mito to the caller of the write, which sees the request fail. Neither the store nor Mito keeps the failed batch, so a retry is a new write by the caller, grouped with whatever else is admitted at that time. Such a retry is not idempotent at the request level. If the failed create had in fact succeeded and only its response was lost, the next batch takes the same sequence number with different content, its conditional create conflicts, and the store poisons itself; the identical-content rule accepts only a byte-identical whole batch at that sequence, which is what the store's own retry of the same open batch produces, not a caller's retry. Reading back the object at the failed sequence before reusing it would close this gap and is listed under *Future work*. A store-level retry of the batch itself would only hide the latency.
+A store cannot be constructed on a prefix whose largest object already carries the maximum sequence. A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are not retried inside the store, but a failed create is reconciled once: the store immediately reads the key back, accepts the batch if the object exists with identical bytes, rejects it as a conflict if the bytes differ, and reports the transient error only when the key is absent or that read fails too. So a lost response alone does not fail the append. When the append does fail, neither the store nor Mito keeps the batch: it surfaces through Mito to the caller of the write, and a retry is a new write by the caller, grouped with whatever else is admitted at that time, which may or may not reproduce the same bytes. Such a retry is therefore not idempotent at the request level. If the create had in fact succeeded and both its response and the read-back were lost, the next batch takes the same sequence number with different content, its conditional create conflicts, and the store poisons itself. Reconciling the sequence again before it is reused, after the initial read-back failed, would close this gap and is listed under *Future work*. Retrying the batch itself inside the store would only hide the latency.
 
 **Stopping.** `stop` is idempotent and awaits the actor. A create that is already in flight runs to completion and, if it succeeds, acknowledges its now-durable entries; entries that never became durable receive a stopped error, including a batch whose in-flight create fails after stop began. Once stop has begun, queued appends are not admitted and no timer or seal triggered flush starts. Appends after stop, including empty ones, fail with the stopped error.
 
@@ -193,7 +194,7 @@ The implementation was accepted on the following evidence, all of it reproducibl
 
 - Deterministic recovery tests on a real `ObjectStoreLogStore` over an in-memory object store: two regions sharing a prefix with only one flushed, an abrupt drop after an object is durable but before any flush, a prefix mismatch on reopen, reopening on an empty prefix, and two consecutive restarts with writes and a flush between them. Each asserts the concrete flushed, replayed, manifest and latest entry ids and row-level scan equality.
 - A standalone round trip against MinIO: five write batches produce five objects; a restart without flushing replays 20 rows from entry 1; after a flush a second restart replays nothing; rows are identical after each restart; restart wall time around 120 ms. The run is reproduced by `scripts/object-store-wal-minio.sh`, whose manifest fails if any measurement is missing.
-- Unit coverage of every corruption class, the catalog invariants, the conditional create outcomes, every row of the failure matrix, every stop path including in-flight creates that succeed, fail transiently or conflict after stop began, and sequence exhaustion.
+- Unit coverage of every corruption class, the catalog invariants, the conditional create outcomes, the transient, conflicting, encoding and catalog rows of the failure matrix, every stop path including in-flight creates that succeed, fail transiently or conflict after stop began, per-region entry id exhaustion, and the catalog refusing a next sequence past the maximum. The last row of the failure matrix, a successful create at the last representable object sequence followed by poisoning, is described from the code and is not exercised by a test.
 
 A process-level crash gate (concurrent writers, SIGKILL at a random point of a window, restart on the same bucket, repeated cycles with replay accumulating) is delivered as a separate change with its own script and manifest. Its results are not part of the evidence above and are reported with that change.
 
@@ -235,7 +236,7 @@ Distributed mode is out of scope, but several decisions were taken so that the c
 3. Segment-level corruption skipping with region marking and metrics.
 4. Garbage collection of objects whose every region has been flushed past them, driven by the watermarks Mito re-establishes on open.
 5. Metrics for flush latency, object count and size, replay duration; a fault matrix for network errors, unwritable buckets and missing objects.
-6. After a transient create failure, read back the object at the failed sequence before reusing the sequence number, so that a create that succeeded without a response is indexed instead of conflicting with the next batch.
+6. After a transient create failure whose immediate read-back also failed, reconcile the sequence number before reusing it, so that a create that succeeded without a response is indexed instead of conflicting with the next batch.
 7. A cost and latency comparison against Raft Engine with `sync_write = true`, to calibrate `flush_interval`, `max_batch_bytes` and the default acknowledgement mode.
 8. Distributed mode, which needs metasrv-side allocation, per-datanode prefixes and a metasrv-issued generation in the object header.
 
