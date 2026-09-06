@@ -85,6 +85,9 @@ MANIFEST_PRINTED=no
 STORE_ROOT=""
 BINARY_COMMIT=""
 BINARY_SHA256=""
+CHECKED_OUT_COMMIT=""
+MINIO_IMAGE_ID=""
+MINIO_IMAGE_DIGESTS=""
 MISSING=()
 
 # The original stdout and stderr, so the manifest and the log reach the
@@ -105,21 +108,15 @@ mkdir -p "${RUN_DIR}"
 : > "${ATTEMPTED}"
 
 # Prints the manifest: the run identity, then every field collected so far.
+# It renders only values collected earlier and never runs a command that
+# can fail, so it works from the EXIT handler at any point of the run.
 print_manifest() {
-  MANIFEST_PRINTED=yes
-  # The image is the one the container runs, which can differ from what the
-  # tag resolves to when an older container is reused.
-  local image_id="" digests=""
-  if docker ps -a --format '{{.Names}}' | grep -qx "${MINIO_CONTAINER}"; then
-    image_id=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}")
-    digests=$(docker inspect --format '{{join .RepoDigests ","}}' "${image_id}")
-  fi
   {
     echo
     echo "== object store WAL crash gate manifest =="
-    echo "base commit: $(git -C "${ROOT_DIR}" rev-parse HEAD)"
+    echo "base commit: ${CHECKED_OUT_COMMIT:-unknown}"
     echo "binary: ${GREPTIME_BIN:-not built} commit ${BINARY_COMMIT:-unknown} sha256 ${BINARY_SHA256:-unknown}"
-    echo "minio image: ${image_id:-unknown} (${digests:-no repo digest}) in container ${MINIO_CONTAINER}"
+    echo "minio image: ${MINIO_IMAGE_ID:-unknown} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
     echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT:-unknown} wal prefix ${WAL_PREFIX} at http://127.0.0.1:${MINIO_PORT}"
     echo "cycles: ${CYCLES} writers: ${WRITERS} kill window: ${KILL_MIN_SECS}s to ${KILL_MAX_SECS}s"
     cat "${MANIFEST}"
@@ -127,7 +124,26 @@ print_manifest() {
       echo "missing: ${field}"
     done
     echo "result: ${RESULT}"
-  } | tee "${RUN_DIR}/manifest-final.txt" >&3
+  } | tee "${RUN_DIR}/manifest-final.txt" >&3 && MANIFEST_PRINTED=yes
+}
+
+# Collects the identity of the run: the checked-out commit and the image of
+# the running MinIO container, which can differ from what the tag resolves
+# to when an older container is reused. Every step is checked, and a
+# missing value fails the run.
+collect_identity() {
+  local commit image_id digests
+  commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) && [ -n "${commit}" ] ||
+    fail "cannot read the checked-out commit"
+  docker ps --format '{{.Names}}' | grep -qx "${MINIO_CONTAINER}" ||
+    fail "container ${MINIO_CONTAINER} is not running"
+  image_id=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}") && [ -n "${image_id}" ] ||
+    fail "cannot read the image of container ${MINIO_CONTAINER}"
+  digests=$(docker inspect --format '{{join .RepoDigests ","}}' "${image_id}") ||
+    fail "cannot read the digests of image ${image_id}"
+  CHECKED_OUT_COMMIT="${commit}"
+  MINIO_IMAGE_ID="${image_id}"
+  MINIO_IMAGE_DIGESTS="${digests}"
 }
 
 # Fails the run right away with the reason in the manifest; the EXIT handler
@@ -164,6 +180,9 @@ cleanup() {
   log "run directory: ${RUN_DIR}"
 }
 trap cleanup EXIT
+# Read once early so a manifest printed before the checked collection still
+# names the commit; the checked collection runs before the verdict.
+CHECKED_OUT_COMMIT=$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)
 
 # The knobs are checked before anything is started, so a bad value fails
 # with a manifest instead of an empty run or an arithmetic error.
@@ -212,6 +231,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
+collect_identity
 
 # Runs a MinIO client command in the network namespace of the server, so it
 # reaches it without host networking.
@@ -260,8 +280,10 @@ if [ -z "${GREPTIME_BIN:-}" ]; then
   GREPTIME_BIN="${ROOT_DIR}/target/debug/greptime"
 fi
 [ -x "${GREPTIME_BIN}" ] || fail "${GREPTIME_BIN} is not executable"
-BINARY_COMMIT=$("${GREPTIME_BIN}" --version | sed -nE 's/^commit: *//p' | head -1)
-BINARY_SHA256=$(shasum -a 256 "${GREPTIME_BIN}" | cut -d' ' -f1)
+BINARY_COMMIT=$("${GREPTIME_BIN}" --version | sed -nE 's/^commit: *//p' | head -1) &&
+  [ -n "${BINARY_COMMIT}" ] || fail "cannot read the commit of ${GREPTIME_BIN}"
+BINARY_SHA256=$(shasum -a 256 "${GREPTIME_BIN}" | cut -d' ' -f1) &&
+  [ -n "${BINARY_SHA256}" ] || fail "cannot hash ${GREPTIME_BIN}"
 
 CONFIG="${RUN_DIR}/standalone.toml"
 DATA_HOME="${RUN_DIR}/data"
@@ -439,8 +461,15 @@ for cycle in $(seq 1 "${CYCLES}"); do
   sleep "$(python3 -c "print(${delay_ms} / 1000)")"
   kill -KILL "${SERVER_PID}"
   wait "${SERVER_PID}" 2>/dev/null || true
-  # shellcheck disable=SC2086
-  wait ${WRITER_PIDS}
+  # A writer exits zero only through its loop; anything else means its
+  # acked and failed files cannot be trusted.
+  index=0
+  for pid in ${WRITER_PIDS}; do
+    if ! wait "${pid}"; then
+      fail "cycle ${cycle}: writer ${index} (pid ${pid}) exited unexpectedly"
+    fi
+    index=$((index + 1))
+  done
   WRITER_PIDS=""
 
   cycle_acked=0
@@ -472,7 +501,8 @@ for cycle in $(seq 1 "${CYCLES}"); do
   grep -oE 'Opened [0-9]+ regions in [^[:space:]]+' "${SERVER_LOG}" | head -1 |
     sed -E "s/^/cycle=${cycle} open: /" >> "${MANIFEST}" || true
   verify "${cycle}"
-  record "${cycle}" "wal_$(wal_objects)"
+  objects=$(wal_objects) || fail "cycle ${cycle}: listing the WAL objects failed"
+  record "${cycle}" "wal_${objects}"
   log "cycle ${cycle}: $(grep -E "^cycle=${cycle} found=" "${MANIFEST}")"
 done
 
@@ -496,6 +526,8 @@ for cycle in $(seq 1 "${CYCLES}"); do
   require_line "cycle ${cycle} WAL objects" "^cycle=${cycle} wal_objects=[0-9]+ bytes=[0-9]+$"
 done
 [ -n "${BINARY_COMMIT}" ] || MISSING+=("binary commit")
+[ -n "${BINARY_SHA256}" ] || MISSING+=("binary sha256")
+collect_identity
 
 # The objects of a passed run are removed, and the removal is verified
 # before PASS is declared; a failed run keeps them as evidence.
