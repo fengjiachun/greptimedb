@@ -30,6 +30,9 @@
 #   KILL_MIN_SECS, KILL_MAX_SECS
 #                   the kill fires after a random delay in this window once
 #                   the writers started, default 2 and 6
+#   KILL_WINDOW_MAX_MS
+#                   upper bound of the sampling window around the kill,
+#                   default 100; see below
 #   GREPTIME_PORT_BASE
 #                   HTTP port of the server; gRPC, MySQL and PostgreSQL take
 #                   the next three ports, default 24000
@@ -46,14 +49,23 @@
 # is present twice, and every present sequence number that was not
 # acknowledged is a write that was in flight at the kill: the last attempt
 # of a writer, whose connection dropped no earlier than the kill. A dropped
-# connection before the kill, an acknowledgement after it, or a kill that
-# found no writer still running fails the cycle. Nothing is cleaned between
-# cycles, so replay accumulates.
+# connection before the kill or a kill that found no writer still running
+# fails the cycle. Nothing is cleaned between cycles, so replay accumulates.
+#
+# The in-flight verdict is lenient inside the sampling window around the
+# kill: the controller stamps the clock just before it sends SIGKILL and
+# again just after the signal was sent, and a dropped connection that ended
+# at or after the first stamp counts as in flight. The width of that window
+# is written to the manifest and must stay under KILL_WINDOW_MAX_MS. This
+# is the known precision boundary of the script.
 #
 # PASS means every cycle passed, the manifest carries every required field,
 # and the objects of the run were removed from the bucket and the removal
 # was verified; anything else is FAIL with a non-zero exit status and a
-# final manifest, however the run ended. The run directory is printed and
+# final manifest, however the run ended. The manifest is written in two
+# parts: the verdict part, with every field and a `verdict:` line, is
+# persisted while the objects are still in the bucket, and the `cleanup:`
+# and `result:` lines follow the removal. The run directory is printed and
 # kept in both cases; the objects of a failed run stay in the bucket as
 # evidence.
 set -euo pipefail
@@ -73,21 +85,25 @@ CYCLES="${CYCLES:-5}"
 WRITERS="${WRITERS:-8}"
 KILL_MIN_SECS="${KILL_MIN_SECS:-2}"
 KILL_MAX_SECS="${KILL_MAX_SECS:-6}"
+KILL_WINDOW_MAX_MS="${KILL_WINDOW_MAX_MS:-100}"
 GREPTIME_PORT_BASE="${GREPTIME_PORT_BASE:-24000}"
-RUN_DIR="${RUN_DIR:-$(mktemp -d -t object-store-wal-crash-gate.XXXXXX)}"
+RUN_DIR="${RUN_DIR:-}"
 WAL_PREFIX="wal"
 READY_TIMEOUT_SECS=300
 
 HTTP_ADDR="127.0.0.1:${GREPTIME_PORT_BASE}"
 SQL_URL="http://${HTTP_ADDR}/v1/sql"
-MANIFEST="${RUN_DIR}/manifest.txt"
-FINAL_MANIFEST="${RUN_DIR}/manifest-final.txt"
-ACKED="${RUN_DIR}/acked.log"
-ATTEMPTED="${RUN_DIR}/attempted.log"
+# The evidence files are named only once the run directory was accepted;
+# nothing is written to a directory before that.
+MANIFEST=""
+FINAL_MANIFEST=""
+ACKED=""
+ATTEMPTED=""
 SERVER_PID=""
 WRITER_PIDS=""
-RESULT=FAIL
-MANIFEST_PRINTED=no
+VERDICT=FAIL
+VERDICT_PERSISTED=no
+RESULT_APPENDED=no
 FINAL_MANIFEST_OPEN=no
 OBJECTS_REMOVED=no
 UNRECORDED=""
@@ -111,18 +127,33 @@ now_ms() {
   python3 -c 'import time; print(int(time.time() * 1000))'
 }
 
-# The writers and the kill are stamped from this one clock.
+# The writers and the kill markers are stamped from this one clock.
 now_ns() {
   python3 -c 'import time; print(time.time_ns())'
 }
 
-# Prints the manifest to the caller and to the final manifest file: the run
-# identity, then every field collected so far. It renders only values
-# collected earlier and never runs a command that can fail, so it works
-# from the EXIT handler at any point of the run, before the run directory
-# exists included. The manifest counts as printed only once both copies
-# were written.
-print_manifest() {
+# Writes text to the final manifest file through an external process whose
+# stdout is that file for its whole life, so a failed write cannot leak the
+# text into the shell's own stdout buffer.
+write_final() {
+  printf '%s\n' "$1" | cat >&5
+}
+
+# Writes one trailing manifest line to the caller and, once it is open, to
+# the final manifest file.
+append_line() {
+  printf '%s\n' "$1" >&3 || return 1
+  if [ "${FINAL_MANIFEST_OPEN}" = yes ]; then
+    write_final "$1" || return 1
+  fi
+}
+
+# Writes the verdict part of the manifest: the run identity, every field
+# collected so far, and the verdict. It renders only values collected
+# earlier and never runs a command that can fail, so it works from the EXIT
+# handler at any point of the run, before a run directory exists included.
+# The verdict counts as persisted only once both copies were written.
+print_verdict() {
   local text
   text=$(
     echo "== object store WAL crash gate manifest =="
@@ -131,37 +162,36 @@ print_manifest() {
     echo "minio image: ${MINIO_IMAGE_ID:-unknown} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
     echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT:-unknown} wal prefix ${WAL_PREFIX} at http://127.0.0.1:${MINIO_PORT}"
     echo "cycles: ${CYCLES} writers: ${WRITERS} kill window: ${KILL_MIN_SECS}s to ${KILL_MAX_SECS}s"
-    [ -f "${MANIFEST}" ] && cat "${MANIFEST}"
+    [ -n "${MANIFEST}" ] && [ -f "${MANIFEST}" ] && cat "${MANIFEST}"
     [ -n "${UNRECORDED}" ] && printf '%s' "${UNRECORDED}"
     for field in ${MISSING[@]+"${MISSING[@]}"}; do
       echo "missing: ${field}"
     done
-    if [ "${RESULT}" != PASS ] && [ "${OBJECTS_REMOVED}" = yes ]; then
-      echo "objects: removed from the bucket after the PASS verdict, before the manifest could be written"
-    fi
-    echo "result: ${RESULT}"
+    echo "verdict: ${VERDICT}"
   )
   printf '\n%s\n' "${text}" >&3 || return 1
   if [ "${FINAL_MANIFEST_OPEN}" = yes ]; then
-    printf '%s\n' "${text}" >&5 || return 1
+    write_final "${text}" || return 1
   fi
-  MANIFEST_PRINTED=yes
+  VERDICT_PERSISTED=yes
 }
 
 # Fails the run right away with the reason in the manifest; the EXIT handler
-# prints it. A reason that cannot be recorded in the run directory is kept
-# in memory and printed with the manifest.
+# prints it. Until the run directory was accepted, and whenever the reason
+# cannot be recorded there, it is kept in memory and printed with the
+# manifest, so a rejected directory is never written to.
 fail() {
   log "FAIL: $*"
-  if ! echo "fail: $*" 2>/dev/null >> "${MANIFEST}"; then
+  if [ -z "${MANIFEST}" ] || ! echo "fail: $*" 2>/dev/null >> "${MANIFEST}"; then
     UNRECORDED="${UNRECORDED}fail: $*"$'\n'
   fi
   exit 1
 }
 
-# Runs on every exit: stops whatever is still running, and prints the final
-# manifest as FAIL when the run ended before it was printed, so a command
-# that failed under `set -e` still leaves a verdict.
+# Runs on every exit: stops whatever is still running, and completes the
+# manifest as FAIL when the run ended before it was complete, so a command
+# that failed under `set -e` still leaves a verdict. The objects are still
+# in the bucket unless the manifest says they were removed.
 # shellcheck disable=SC2329
 cleanup() {
   local status=$?
@@ -175,14 +205,22 @@ cleanup() {
     kill -KILL "${SERVER_PID}" 2>/dev/null
     wait "${SERVER_PID}" 2>/dev/null
   fi
-  if [ "${MANIFEST_PRINTED}" = no ]; then
-    RESULT=FAIL
-    UNRECORDED="${UNRECORDED}fail: exited with status ${status} before the manifest was complete"$'\n'
-    print_manifest
-    log "run directory: ${RUN_DIR}"
+  if [ "${VERDICT_PERSISTED}" = no ]; then
+    VERDICT=FAIL
+    UNRECORDED="${UNRECORDED}fail: exited with status ${status} before the verdict was complete"$'\n'
+    print_verdict
+  fi
+  if [ "${RESULT_APPENDED}" = no ]; then
+    if [ "${OBJECTS_REMOVED}" = yes ]; then
+      append_line "objects: removed from the bucket and verified empty after the verdict"
+    else
+      append_line "objects: kept in the bucket under root ${STORE_ROOT:-unknown}"
+    fi
+    append_line "result: FAIL"
+    log "run directory: ${RUN_DIR:-none}"
     exit 1
   fi
-  log "run directory: ${RUN_DIR}"
+  log "run directory: ${RUN_DIR:-none}"
 }
 # Installed before anything that can fail, the run directory included.
 trap cleanup EXIT
@@ -207,18 +245,28 @@ is_non_negative_number "${KILL_MAX_SECS}" ||
 if ! python3 -c "import sys; sys.exit(0 if ${KILL_MAX_SECS} >= ${KILL_MIN_SECS} else 1)"; then
   fail "KILL_MAX_SECS (${KILL_MAX_SECS}) must not be below KILL_MIN_SECS (${KILL_MIN_SECS})"
 fi
+is_positive_integer "${KILL_WINDOW_MAX_MS}" ||
+  fail "KILL_WINDOW_MAX_MS must be a positive integer, got '${KILL_WINDOW_MAX_MS}'"
 is_positive_integer "${GREPTIME_PORT_BASE}" ||
   fail "GREPTIME_PORT_BASE must be a positive integer, got '${GREPTIME_PORT_BASE}'"
 
-# The run directory holds the evidence of exactly one run, so it must be
-# new or empty, and the final manifest file is opened now and kept open, so
-# a directory that cannot take the manifest fails before anything runs.
-if [ -e "${RUN_DIR}" ]; then
+# The run directory holds the evidence of exactly one run, so a given one
+# must be new or empty and is not touched before that is known. The final
+# manifest file is opened now and kept open, so a directory that cannot
+# take the manifest fails before anything runs.
+if [ -z "${RUN_DIR}" ]; then
+  RUN_DIR=$(mktemp -d -t object-store-wal-crash-gate.XXXXXX) ||
+    fail "cannot create a temporary run directory"
+elif [ -e "${RUN_DIR}" ]; then
   if ! [ -d "${RUN_DIR}" ] || [ -n "$(ls -A "${RUN_DIR}" 2>/dev/null || echo occupied)" ]; then
     fail "RUN_DIR ${RUN_DIR} exists and is not an empty directory"
   fi
 fi
 mkdir -p "${RUN_DIR}" || fail "cannot create RUN_DIR ${RUN_DIR}"
+MANIFEST="${RUN_DIR}/manifest.txt"
+FINAL_MANIFEST="${RUN_DIR}/manifest-final.txt"
+ACKED="${RUN_DIR}/acked.log"
+ATTEMPTED="${RUN_DIR}/attempted.log"
 : > "${FINAL_MANIFEST}" || fail "cannot write ${FINAL_MANIFEST}"
 exec 5>>"${FINAL_MANIFEST}"
 FINAL_MANIFEST_OPEN=yes
@@ -392,7 +440,7 @@ sql() {
 # stripe has at most one attempted but unacknowledged sequence number: the
 # write that was in flight at the kill. Every request is recorded with its
 # status code and the time it ended, and the exit of the writer with its
-# time, so the kill time can be compared against them.
+# time, so the kill markers can be compared against them.
 writer() {
   local cycle=$1 index=$2 seq=$3
   local dir="${RUN_DIR}/cycle-${cycle}"
@@ -412,22 +460,29 @@ writer() {
   now_ns > "${dir}/exit-${index}.log"
 }
 
-# Checks the requests of a cycle against the kill time: a dropped
-# connection counts as a write in flight at the kill only when it ended no
-# earlier than the kill, an earlier one is a transport failure, any other
-# status is a rejected insert, no acknowledgement may follow the kill, and
-# at least one writer must have been running at the kill. Prints the counts
+# Checks the requests of a cycle against the kill markers: a dropped
+# connection counts as a write in flight at the kill when it ended at or
+# after the marker taken before the signal, an earlier one is a transport
+# failure, any other status is a rejected insert, at least one writer must
+# have been running at the kill, and the window between the two markers
+# must stay under the bound. An acknowledged request is never judged by its
+# time; the restart oracle decides whether it was durable. Prints the counts
 # for the manifest and fails the run on the first violation.
 check_kill() {
-  local cycle=$1 kill_ns=$2
-  python3 - "${cycle}" "${kill_ns}" "${WRITERS}" "${RUN_DIR}/cycle-${cycle}" <<'EOF' >> "${MANIFEST}" || fail "cycle ${cycle}: the writes around the kill are not consistent, see ${RUN_DIR}/cycle-${cycle}"
+  local cycle=$1 before_ns=$2 after_ns=$3
+  python3 - "${cycle}" "${before_ns}" "${after_ns}" "${KILL_WINDOW_MAX_MS}" "${WRITERS}" "${RUN_DIR}/cycle-${cycle}" <<'EOF' >> "${MANIFEST}" || fail "cycle ${cycle}: the writes around the kill are not consistent, see ${RUN_DIR}/cycle-${cycle}"
 import os
 import sys
 
-cycle_no, kill_ns, writers, cycle_dir = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+cycle_no = sys.argv[1]
+before_ns, after_ns, window_max_ms, writers = (int(value) for value in sys.argv[2:6])
+cycle_dir = sys.argv[6]
 errors = []
 in_flight = 0
 running_at_kill = 0
+window_ns = after_ns - before_ns
+if window_ns > window_max_ms * 1_000_000:
+    errors.append(f"kill marker not tight: window {window_ns}ns exceeds {window_max_ms}ms")
 for index in range(writers):
     requests_path = os.path.join(cycle_dir, f"requests-{index}.log")
     exit_path = os.path.join(cycle_dir, f"exit-{index}.log")
@@ -435,7 +490,7 @@ for index in range(writers):
         errors.append(f"writer {index} left no exit time")
         continue
     exit_ns = int(open(exit_path).read())
-    if exit_ns >= kill_ns:
+    if exit_ns >= before_ns:
         running_at_kill += 1
     requests = []
     if os.path.exists(requests_path):
@@ -445,11 +500,10 @@ for index in range(writers):
                 requests.append((int(seq), code, int(end_ns)))
     for seq, code, end_ns in requests:
         if code == "200":
-            if end_ns > kill_ns:
-                errors.append(f"writer {index}: sequence {seq} acknowledged {end_ns - kill_ns}ns after the kill")
-        elif code == "000":
-            if end_ns < kill_ns:
-                errors.append(f"writer {index}: sequence {seq} lost its connection {kill_ns - end_ns}ns before the kill")
+            continue
+        if code == "000":
+            if end_ns < before_ns:
+                errors.append(f"writer {index}: sequence {seq} lost its connection {before_ns - end_ns}ns before the kill")
             else:
                 in_flight += 1
         else:
@@ -459,7 +513,10 @@ if running_at_kill == 0:
 
 for error in errors:
     print(f"cycle={cycle_no} kill violation: {error}")
-print(f"cycle={cycle_no} kill_ns={kill_ns} in_flight={in_flight} writers_at_kill={running_at_kill}")
+print(
+    f"cycle={cycle_no} kill_before_ns={before_ns} kill_after_ns={after_ns} "
+    f"kill_window_ns={window_ns} in_flight={in_flight} writers_at_kill={running_at_kill}"
+)
 sys.exit(1 if errors else 0)
 EOF
 }
@@ -553,10 +610,11 @@ for cycle in $(seq 1 "${CYCLES}"); do
   delay_ms=$(python3 -c "import random; print(random.randint(int(${KILL_MIN_SECS} * 1000), int(${KILL_MAX_SECS} * 1000)))")
   log "cycle ${cycle}: writing from sequence ${NEXT_SEQ}, SIGKILL in ${delay_ms}ms"
   sleep "$(python3 -c "print(${delay_ms} / 1000)")"
-  # Stamped just before the signal, so a request that ends in between counts
-  # as in flight rather than as a failure before the kill.
-  kill_ns=$(now_ns)
+  # The two markers bound the moment of the kill; the window between them
+  # is the precision of the in-flight verdict and goes into the manifest.
+  kill_before_ns=$(now_ns)
   kill -KILL "${SERVER_PID}"
+  kill_after_ns=$(now_ns)
   wait "${SERVER_PID}" 2>/dev/null || true
   # A writer exits zero only through its loop; anything else means its
   # acked and failed files cannot be trusted.
@@ -568,7 +626,7 @@ for cycle in $(seq 1 "${CYCLES}"); do
     index=$((index + 1))
   done
   WRITER_PIDS=""
-  check_kill "${cycle}" "${kill_ns}"
+  check_kill "${cycle}" "${kill_before_ns}" "${kill_after_ns}"
 
   cycle_acked=0
   for index in $(seq 0 $((WRITERS - 1))); do
@@ -609,7 +667,7 @@ require_line() {
   fi
 }
 for cycle in $(seq 1 "${CYCLES}"); do
-  require_line "cycle ${cycle} kill" "^cycle=${cycle} kill_ns=[0-9]+ in_flight=[0-9]+ writers_at_kill=[1-9][0-9]*$"
+  require_line "cycle ${cycle} kill" "^cycle=${cycle} kill_before_ns=[0-9]+ kill_after_ns=[0-9]+ kill_window_ns=[0-9]+ in_flight=[0-9]+ writers_at_kill=[1-9][0-9]*$"
   require_line "cycle ${cycle} acked" "^cycle=${cycle} kill_delay_ms=[0-9]+ acked=[0-9]+$"
   require_line "cycle ${cycle} restart wall time" "^cycle=${cycle} restart_wall_ms=[0-9]+$"
   require_line "cycle ${cycle} replay" "^cycle=${cycle} replay: Replay WAL for region: .* rows recovered: [0-9]+, replay from entry id: [0-9]+, last entry id: [0-9]+, .*elapsed: "
@@ -621,25 +679,29 @@ done
 [ -n "${BINARY_SHA256}" ] || MISSING+=("binary sha256")
 collect_identity
 
-# The objects of a passed run are removed, and the removal is verified
-# before PASS is declared; a failed run keeps them as evidence. The final
-# manifest file was opened at the start, so the only way its write can
-# still fail is the disk itself, and then the manifest says the objects
-# were already removed.
+# The verdict part is persisted while the objects are still in the bucket:
+# `verdict: PASS` states that every durability check passed. Only then are
+# the objects removed, and the removal is verified before `result: PASS` is
+# appended. Every failure before the removal keeps the objects.
 if [ "${#MISSING[@]}" -eq 0 ] && ! grep -qE '^(cycle=[0-9]+ (kill )?violation|fail):' "${MANIFEST}"; then
-  mc_run "mc rm --recursive --force local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
-  if REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
-    OBJECTS_REMOVED=yes
-    echo "cleanup: root ${STORE_ROOT} removed and verified empty" >> "${MANIFEST}"
-    RESULT=PASS
-  else
-    echo "${REMAINING}" >&2
-    echo "fail: root ${STORE_ROOT} still holds objects after cleanup" >> "${MANIFEST}"
-  fi
+  VERDICT=PASS
 fi
-print_manifest
-
-if [ "${RESULT}" = PASS ]; then
+print_verdict
+if [ "${VERDICT}" != PASS ]; then
+  append_line "result: FAIL"
+  RESULT_APPENDED=yes
+  exit 1
+fi
+mc_run "mc rm --recursive --force local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
+if REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
+  OBJECTS_REMOVED=yes
+  append_line "cleanup: root ${STORE_ROOT} removed and verified empty"
+  append_line "result: PASS"
+  RESULT_APPENDED=yes
   exit 0
 fi
+echo "${REMAINING}" >&2
+append_line "cleanup: root ${STORE_ROOT} still holds objects"
+append_line "result: FAIL"
+RESULT_APPENDED=yes
 exit 1
