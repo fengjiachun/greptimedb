@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Copyright 2023 Greptime Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Runs the object store WAL restart test of `tests-integration` against a
+# MinIO server started in Docker and prints a manifest of the run.
+#
+# The script reuses a running MinIO container, empties the bucket before the
+# test, and exports the `GT_S3_*` environment the S3-backed tests expect.
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${0}")" >/dev/null 2>&1 && pwd)
+ROOT_DIR=$(dirname "${SCRIPT_DIR}")
+
+MINIO_IMAGE="${MINIO_IMAGE:-minio/minio}"
+MC_IMAGE="${MC_IMAGE:-minio/mc}"
+MINIO_CONTAINER="${MINIO_CONTAINER:-greptimedb-object-store-wal-minio}"
+MINIO_PORT="${MINIO_PORT:-9000}"
+MINIO_BUCKET="${MINIO_BUCKET:-greptime-object-store-wal}"
+MINIO_ACCESS_KEY_ID="${MINIO_ACCESS_KEY_ID:-superpower_ci_user}"
+MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-superpower_password}"
+MINIO_REGION="${MINIO_REGION:-us-west-2}"
+TEST_NAME="test_standalone_object_store_wal_survives_restarts_on_s3"
+LOG_FILE="${LOG_FILE:-$(mktemp -t object-store-wal-minio.XXXXXX)}"
+
+log() {
+  echo "[object-store-wal-minio] $*" >&2
+}
+
+if ! docker ps --format '{{.Names}}' | grep -qx "${MINIO_CONTAINER}"; then
+  if docker ps -a --format '{{.Names}}' | grep -qx "${MINIO_CONTAINER}"; then
+    log "starting the existing container ${MINIO_CONTAINER}"
+    docker start "${MINIO_CONTAINER}" >/dev/null
+  else
+    log "creating container ${MINIO_CONTAINER} from ${MINIO_IMAGE}"
+    docker run -d --name "${MINIO_CONTAINER}" \
+      -p "${MINIO_PORT}:9000" \
+      -e "MINIO_ROOT_USER=${MINIO_ACCESS_KEY_ID}" \
+      -e "MINIO_ROOT_PASSWORD=${MINIO_ACCESS_KEY}" \
+      "${MINIO_IMAGE}" server /data >/dev/null
+  fi
+fi
+
+log "waiting for MinIO on port ${MINIO_PORT}"
+for _ in $(seq 1 60); do
+  if curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
+
+# The client runs in the network namespace of the server, so it reaches it
+# without host networking.
+log "creating bucket ${MINIO_BUCKET} and removing its objects"
+docker run --rm --network "container:${MINIO_CONTAINER}" --entrypoint sh "${MC_IMAGE}" -c "
+  mc alias set local http://127.0.0.1:9000 '${MINIO_ACCESS_KEY_ID}' '${MINIO_ACCESS_KEY}' >/dev/null &&
+  mc mb --ignore-existing local/${MINIO_BUCKET} >/dev/null &&
+  (mc rm --recursive --force local/${MINIO_BUCKET} >/dev/null 2>&1 || true)
+"
+
+export GT_S3_BUCKET="${MINIO_BUCKET}"
+export GT_S3_ACCESS_KEY_ID="${MINIO_ACCESS_KEY_ID}"
+export GT_S3_ACCESS_KEY="${MINIO_ACCESS_KEY}"
+export GT_S3_REGION="${MINIO_REGION}"
+export GT_S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_PORT}"
+
+log "running ${TEST_NAME}, log in ${LOG_FILE}"
+cd "${ROOT_DIR}"
+set +e
+cargo nextest run -p tests-integration --test main \
+  -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
+STATUS=${PIPESTATUS[0]}
+set -e
+
+if [ "${STATUS}" -eq 0 ]; then
+  RESULT=PASS
+else
+  RESULT=FAIL
+fi
+
+echo
+echo "== object store WAL MinIO manifest =="
+echo "base commit: $(git -C "${ROOT_DIR}" rev-parse HEAD)"
+echo "minio image: ${MINIO_IMAGE} ($(docker inspect --format '{{.Id}}' "${MINIO_IMAGE}"))"
+echo "bucket: ${MINIO_BUCKET} at ${GT_S3_ENDPOINT_URL}"
+grep -E 'object_store_wal (phase|restart)=' "${LOG_FILE}" | sed -E 's/.*object_store_wal //' || true
+grep -E 'Opened [0-9]+ regions in' "${LOG_FILE}" | sed -E 's/.*(Opened [0-9]+ regions in [^ ]+).*/replay: \1/' || true
+echo "result: ${RESULT}"
+exit "${STATUS}"
