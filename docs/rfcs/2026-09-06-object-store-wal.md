@@ -115,7 +115,7 @@ This keeps two properties at once. Comparing `entry_id >> 20` with an object seq
 
 **Acknowledgement.** `append_batch` returns only after the object holding the entries is durable and indexed, so callers never see an entry id for an entry that is not durable. This is the only mode implemented.
 
-*Proposed*: an `ack_mode` option. `durable` keeps the behaviour above and stays the default, because a write-ahead log is expected to mean durability on return. `enqueued` returns from `append_batch` as soon as the entries are admitted, with their entry ids already assigned, and uploads the object in the background. In that mode the recovery point objective is the unpersisted backlog, bounded by `max_unpersisted_bytes` and `max_unpersisted_age`: when either bound is reached, admission stalls until an upload completes, so nothing is dropped and the backlog cannot grow without limit. Its failure contract differs from the durable one: a permanent upload failure can no longer be reported to a caller that has already returned, so it poisons the store, and `stop` uploads the remaining backlog before returning. Whether `enqueued` should become the default is decided on the crash-gate and benchmark results rather than assumed.
+*Proposed*: an `ack_mode` option. `durable` keeps the behaviour above and stays the default, because a write-ahead log is expected to mean durability on return. `enqueued` returns from `append_batch` as soon as the entries are admitted, with their entry ids already assigned, and uploads the object in the background. In that mode the recovery point objective is the unpersisted backlog. `max_unpersisted_bytes` and `max_unpersisted_age` are admission thresholds: when the backlog reaches either, new appends stall until an upload completes, so nothing is dropped and the backlog cannot grow without limit. They are not a hard bound on what a crash can lose: during an outage the writes already acknowledged stay in memory for as long as the outage lasts, however old they get, and a crash in that window loses them. Its failure contract differs from the durable one: a permanent upload failure can no longer be reported to a caller that has already returned, so it poisons the store, and `stop` uploads the remaining backlog before returning. Whether `enqueued` should become the default is decided on the crash-gate and benchmark results rather than assumed.
 
 **Failure matrix.**
 
@@ -127,7 +127,7 @@ This keeps two properties at once. Comparing `entry_id >> 20` with an object seq
 | encoding or catalog error | unchanged | fail | poisoned |
 | create succeeds at the last representable sequence | cannot advance | acknowledged | poisoned: no later batch can be allocated a sequence, every later append fails |
 
-A store cannot be constructed on a prefix whose largest object already carries the maximum sequence. A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are surfaced to the caller rather than retried inside the store: the engine already owns write retries, and a store-level retry would only hide the latency.
+A store cannot be constructed on a prefix whose largest object already carries the maximum sequence. A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are not retried inside the store. They surface through Mito to the caller of the write, which sees the request fail; any retry is the caller's decision, and the identical-retry rule above makes such a retry safe if the object turned out to be durable after all. A store-level retry would only hide the latency.
 
 **Stopping.** `stop` is idempotent and awaits the actor. A create that is already in flight runs to completion and, if it succeeds, acknowledges its now-durable entries; entries that never became durable receive a stopped error, including a batch whose in-flight create fails after stop began. Once stop has begun, queued appends are not admitted and no timer or seal triggered flush starts. Appends after stop, including empty ones, fail with the stopped error.
 
@@ -170,8 +170,9 @@ max_batch_bytes = "8MB"
 
 ```toml
 # "durable": append returns after the object is durable (the default).
-# "enqueued": append returns on admission; the unpersisted backlog is
-# bounded by the two limits below and admission stalls at the bound.
+# "enqueued": append returns on admission. New appends stall once the
+# unpersisted backlog reaches either threshold below; the thresholds do
+# not bound what a crash during an outage can lose.
 ack_mode = "durable"
 max_unpersisted_bytes = "64MB"
 max_unpersisted_age = "8s"
