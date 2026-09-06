@@ -17,10 +17,11 @@
 
 use bytes::Bytes;
 use object_store::ObjectStore;
-use snafu::{ResultExt, ensure};
+use snafu::{OptionExt, ResultExt, ensure};
 
 use crate::error::{
-    InvalidWalObjectStoreSnafu, Result, WalObjectConflictSnafu, WalObjectStoreSnafu,
+    CorruptedWalObjectSnafu, InvalidWalObjectStoreSnafu, Result, WalObjectConflictSnafu,
+    WalObjectStoreSnafu,
 };
 
 /// Width of the zero-padded object sequence in an object key, wide enough for
@@ -42,6 +43,8 @@ pub(super) enum PutResult {
 pub(super) struct ListedObject {
     pub(super) object_seq: u64,
     pub(super) path: String,
+    /// Length of the object in bytes, as reported by the listing.
+    pub(super) size: u64,
 }
 
 /// Reads and writes the WAL objects under one prefix.
@@ -104,6 +107,26 @@ impl ObjectStoreIo {
             })
     }
 
+    /// Reads `len` bytes of the object `object_seq` starting at `offset`. The
+    /// range must lie inside the object; one that reaches past its end fails.
+    pub(super) async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
+        let path = self.object_path(object_seq);
+        let end = offset
+            .checked_add(len)
+            .with_context(|| CorruptedWalObjectSnafu {
+                reason: format!("byte range {offset}..{len} overflows the object"),
+            })?;
+        self.store
+            .read_with(&path)
+            .range(offset..end)
+            .await
+            .map(|content| content.to_bytes())
+            .context(WalObjectStoreSnafu {
+                operation: "read",
+                path,
+            })
+    }
+
     /// Lists the objects under the prefix, ordered by object sequence. Keys
     /// that do not follow the object layout are ignored.
     pub(super) async fn list(&self) -> Result<Vec<ListedObject>> {
@@ -122,6 +145,7 @@ impl ObjectStoreIo {
                     .map(|object_seq| ListedObject {
                         object_seq,
                         path: entry.path().to_string(),
+                        size: entry.metadata().content_length(),
                     })
             })
             .collect::<Vec<_>>();
@@ -241,6 +265,39 @@ mod tests {
         let objects = io.list().await.unwrap();
         assert_eq!(vec![1, 2, 10], object_seqs(objects.clone()));
         assert_eq!(io.object_path(1), objects[0].path);
+        assert_eq!(
+            vec![1, 1, 2],
+            objects.iter().map(|object| object.size).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_io_get_range_reads_a_slice_inside_the_object() {
+        let io = memory_io();
+        io.put_if_absent(3, Bytes::from_static(b"0123456789"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Bytes::from_static(b"234"),
+            io.get_range(3, 2, 3).await.unwrap()
+        );
+        assert_eq!(
+            Bytes::from_static(b"89"),
+            io.get_range(3, 8, 2).await.unwrap()
+        );
+        for (object_seq, offset, len) in [(3, 8, 5), (3, 10, 1), (7, 0, 1)] {
+            let error = io.get_range(object_seq, offset, len).await.unwrap_err();
+            assert!(
+                matches!(error, Error::WalObjectStore { operation: "read", ref path, .. } if path == &io.object_path(object_seq)),
+                "unexpected error for range {offset}..{len} of object {object_seq}: {error:?}"
+            );
+        }
+        let error = io.get_range(3, u64::MAX, 1).await.unwrap_err();
+        assert!(
+            matches!(error, Error::CorruptedWalObject { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[tokio::test]

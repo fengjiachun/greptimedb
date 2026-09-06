@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -24,6 +25,7 @@ use std::time::Duration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use common_wal::config::object_store::ObjectStoreWalConfig;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use snafu::{IntoError, OptionExt, ResultExt, ensure};
 use store_api::logstore::entry::{Entry, NaiveEntry};
@@ -43,12 +45,20 @@ use crate::error::{
 use crate::object_store_wal::batch::OpenBatch;
 use crate::object_store_wal::catalog::ObjectCatalog;
 use crate::object_store_wal::format::{
-    EncodedObject, FooterEntry, Header, Record, decode_object, decode_segment, encode_object,
+    EncodedObject, FixedTrailer, FooterEntry, HEADER_LEN, Header, MIN_OBJECT_LEN, Record,
+    TRAILER_LEN, decode_footer, decode_header, decode_segment, decode_trailer, encode_object,
+    footer_range,
 };
 use crate::object_store_wal::io::{ListedObject, ObjectStoreIo, PutResult};
 
 const COMMAND_BUFFER: usize = 1024;
 const MIN_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+/// Number of objects whose footers recovery fetches at a time.
+const RECOVERY_CONCURRENCY: usize = 8;
+/// Bytes recovery reads from the end of an object in one request. The window
+/// holds the trailer and the footer of an object with up to about 1600
+/// regions, so a second request for the footer is rare.
+const RECOVERY_TAIL_WINDOW: usize = 64 * 1024;
 
 /// A [`LogStore`] that persists the entries of many regions as immutable
 /// objects under one prefix.
@@ -56,8 +66,8 @@ const MIN_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Appends are admitted into an open batch and acknowledged once the object
 /// holding them is durable. A background actor seals the batch when it reaches
 /// the size limit or the flush interval elapses, creates the object under the
-/// next sequence and indexes it in the catalog. Reads decode only the segment
-/// of the requested region from every object the catalog lists for it.
+/// next sequence and indexes it in the catalog. Reads fetch and decode only the
+/// segment of the requested region from every object the catalog lists for it.
 pub struct ObjectStoreLogStore {
     prefix: String,
     io: Arc<dyn WalObjectIo>,
@@ -311,8 +321,10 @@ impl LogStore for ObjectStoreLogStore {
         let provider = provider.clone();
         Ok(Box::pin(try_stream! {
             for (object_seq, footer_entry) in objects {
-                let bytes = io.get(object_seq).await?;
-                let records = decode_region_segment(&bytes, &footer_entry)
+                let bytes = io
+                    .get_range(object_seq, footer_entry.segment_offset, footer_entry.segment_len)
+                    .await?;
+                let records = decode_segment(&bytes, &footer_entry)
                     .with_context(|_| InvalidWalObjectSnafu {
                         path: io.object_path(object_seq),
                     })?;
@@ -694,49 +706,142 @@ fn encode_batch(
     )
 }
 
-/// Decodes the segment that `entry` locates inside the object `bytes`.
-fn decode_region_segment(bytes: &[u8], entry: &FooterEntry) -> Result<Vec<Record>> {
-    let segment = usize::try_from(entry.segment_offset)
-        .ok()
-        .zip(usize::try_from(entry.segment_len).ok())
-        .and_then(|(start, len)| start.checked_add(len).map(|end| start..end))
-        .and_then(|range| bytes.get(range))
-        .with_context(|| CorruptedWalObjectSnafu {
-            reason: format!(
-                "segment of region {} at offset {} with length {} is outside the object of {} bytes",
-                entry.region_id,
-                entry.segment_offset,
-                entry.segment_len,
-                bytes.len()
-            ),
-        })?;
-    decode_segment(segment, entry)
-}
-
 /// Rebuilds the catalog from the objects under the prefix and returns it with
 /// the next object sequence and the largest durable entry id per region.
+///
+/// Only the header, trailer and footer of every object are read and verified,
+/// so recovery costs a few small reads per object however large the objects
+/// are. Segments are not read; a segment checksum is verified by the read that
+/// decodes it. Footers are fetched for up to [`RECOVERY_CONCURRENCY`] objects
+/// at a time and indexed in sequence order, so the catalog checks the entry
+/// ranges of every object against its predecessors like a sequential replay.
 async fn recover(io: &dyn WalObjectIo) -> Result<(ObjectCatalog, u64, HashMap<RegionId, EntryId>)> {
+    let objects = io.list().await?;
     let mut catalog = ObjectCatalog::default();
-    for ListedObject { object_seq, path } in io.list().await? {
-        let bytes = io.get(object_seq).await?;
-        decode_object(&bytes)
-            .and_then(|decoded| {
-                ensure!(
-                    decoded.header.object_seq == object_seq,
-                    CorruptedWalObjectSnafu {
-                        reason: format!(
-                            "header sequence {} does not match key sequence {object_seq}",
-                            decoded.header.object_seq
-                        ),
-                    }
-                );
-                catalog.insert_object(object_seq, decoded.footer)
-            })
-            .with_context(|_| InvalidWalObjectSnafu { path })?;
+    for (object, footer) in fetch_footers(io, objects, RECOVERY_CONCURRENCY).await? {
+        catalog
+            .insert_object(object.object_seq, footer)
+            .with_context(|_| InvalidWalObjectSnafu { path: object.path })?;
     }
+    finish_recovery(catalog)
+}
+
+fn finish_recovery(
+    catalog: ObjectCatalog,
+) -> Result<(ObjectCatalog, u64, HashMap<RegionId, EntryId>)> {
     let next_object_seq = catalog.next_object_seq()?;
     let durable_entry_ids = durable_entry_ids(&catalog);
     Ok((catalog, next_object_seq, durable_entry_ids))
+}
+
+/// Fetches and verifies the footers of `objects`, up to `concurrency` objects
+/// at a time, and returns them ordered by object sequence whatever the order
+/// the fetches complete in. The first failure abandons the remaining fetches.
+async fn fetch_footers(
+    io: &dyn WalObjectIo,
+    objects: Vec<ListedObject>,
+    concurrency: usize,
+) -> Result<Vec<(ListedObject, Vec<FooterEntry>)>> {
+    let mut footers = futures::stream::iter(objects)
+        .map(|object| async move {
+            let footer = fetch_footer(io, &object).await?;
+            Ok((object, footer))
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    footers.sort_unstable_by_key(|(object, _)| object.object_seq);
+    Ok(footers)
+}
+
+/// Reads the header, trailer and footer of `object` and verifies them: the
+/// header must carry the sequence of the key, the trailer must be well formed
+/// and the footer must match the checksum the trailer holds.
+///
+/// A short object is read whole. Otherwise the header and a window at the end
+/// of the object are read concurrently, and the footer is read separately only
+/// when it starts before the window.
+async fn fetch_footer(io: &dyn WalObjectIo, object: &ListedObject) -> Result<Vec<FooterEntry>> {
+    let ListedObject {
+        object_seq, size, ..
+    } = *object;
+    let invalid = |source: Error| {
+        InvalidWalObjectSnafu {
+            path: object.path.clone(),
+        }
+        .into_error(source)
+    };
+    let object_len = usize::try_from(size)
+        .ok()
+        .filter(|len| *len >= MIN_OBJECT_LEN)
+        .with_context(|| CorruptedWalObjectSnafu {
+            reason: format!(
+                "truncated object, expected at least {MIN_OBJECT_LEN} bytes, actual {size}"
+            ),
+        })
+        .map_err(invalid)?;
+
+    let window = object_len.min(RECOVERY_TAIL_WINDOW);
+    let tail_start = object_len - window;
+    let (head, tail) = if tail_start == 0 {
+        let bytes = io.get(object_seq).await?;
+        (bytes.clone(), bytes)
+    } else {
+        futures::try_join!(
+            io.get_range(object_seq, 0, HEADER_LEN as u64),
+            io.get_range(object_seq, tail_start as u64, window as u64)
+        )?
+    };
+    if head.len() < HEADER_LEN || tail.len() != window {
+        return Err(invalid(
+            CorruptedWalObjectSnafu {
+                reason: format!(
+                    "object holds fewer bytes than the listed {size}, head {} bytes, tail {} bytes",
+                    head.len(),
+                    tail.len()
+                ),
+            }
+            .build(),
+        ));
+    }
+
+    let (trailer, footer_range) =
+        locate_footer(object_seq, object_len, &head, &tail).map_err(invalid)?;
+    let footer = if footer_range.start >= tail_start {
+        tail.slice(footer_range.start - tail_start..footer_range.end - tail_start)
+    } else {
+        io.get_range(
+            object_seq,
+            footer_range.start as u64,
+            footer_range.len() as u64,
+        )
+        .await?
+    };
+    decode_footer(&footer, trailer).map_err(invalid)
+}
+
+/// Verifies the header and trailer of the object `object_seq` of `object_len`
+/// bytes from its first bytes `head` and its last bytes `tail`, and returns
+/// the trailer with the range the footer occupies in the object.
+fn locate_footer(
+    object_seq: u64,
+    object_len: usize,
+    head: &[u8],
+    tail: &[u8],
+) -> Result<(FixedTrailer, Range<usize>)> {
+    let header = decode_header(head)?;
+    ensure!(
+        header.object_seq == object_seq,
+        CorruptedWalObjectSnafu {
+            reason: format!(
+                "header sequence {} does not match key sequence {object_seq}",
+                header.object_seq
+            ),
+        }
+    );
+    let trailer = decode_trailer(&tail[tail.len() - TRAILER_LEN..])?;
+    let footer_range = footer_range(trailer, object_len)?;
+    Ok((trailer, footer_range))
 }
 
 fn durable_entry_ids(catalog: &ObjectCatalog) -> HashMap<RegionId, EntryId> {
@@ -759,6 +864,8 @@ pub(crate) trait WalObjectIo: Send + Sync {
 
     async fn get(&self, object_seq: u64) -> Result<Bytes>;
 
+    async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes>;
+
     async fn list(&self) -> Result<Vec<ListedObject>>;
 
     fn object_path(&self, object_seq: u64) -> String;
@@ -774,6 +881,10 @@ impl WalObjectIo for ObjectStoreIo {
         ObjectStoreIo::get(self, object_seq).await
     }
 
+    async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
+        ObjectStoreIo::get_range(self, object_seq, offset, len).await
+    }
+
     async fn list(&self) -> Result<Vec<ListedObject>> {
         ObjectStoreIo::list(self).await
     }
@@ -785,17 +896,17 @@ impl WalObjectIo for ObjectStoreIo {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use common_base::readable_size::ReadableSize;
     use common_error::ext::{ErrorExt, RetryHint};
-    use futures::TryStreamExt;
     use object_store::ErrorKind;
     use object_store::services::Memory;
     use tokio::time::timeout;
 
     use super::*;
     use crate::error::WalObjectStoreSnafu;
+    use crate::object_store_wal::format::decode_object;
 
     const PREFIX: &str = "datanodes/1/epochs/2";
     const WAIT: Duration = Duration::from_secs(30);
@@ -1640,47 +1751,445 @@ mod tests {
         }
     }
 
+    /// Rebuilds the catalog the way recovery did before footers were fetched
+    /// on their own: every object is read and decoded in full.
+    async fn recover_by_decoding(
+        io: &dyn WalObjectIo,
+    ) -> Result<(ObjectCatalog, u64, HashMap<RegionId, EntryId>)> {
+        let mut catalog = ObjectCatalog::default();
+        for ListedObject {
+            object_seq, path, ..
+        } in io.list().await?
+        {
+            let bytes = io.get(object_seq).await?;
+            decode_object(&bytes)
+                .and_then(|decoded| {
+                    ensure!(
+                        decoded.header.object_seq == object_seq,
+                        CorruptedWalObjectSnafu {
+                            reason: format!(
+                                "header sequence {} does not match key sequence {object_seq}",
+                                decoded.header.object_seq
+                            ),
+                        }
+                    );
+                    catalog.insert_object(object_seq, decoded.footer)
+                })
+                .with_context(|_| InvalidWalObjectSnafu { path })?;
+        }
+        finish_recovery(catalog)
+    }
+
+    fn catalog_contents(catalog: &ObjectCatalog) -> Vec<(u64, Vec<FooterEntry>)> {
+        catalog
+            .objects_in_order()
+            .map(|(object_seq, footer)| (object_seq, footer.to_vec()))
+            .collect()
+    }
+
+    /// Writes `objects` objects, each holding one entry of most of the
+    /// regions `1..=regions`, with a different subset per object.
+    async fn populate(object_store: &ObjectStore, objects: usize, regions: u32) {
+        let store = open(object_store.clone(), &eager()).await;
+        for object in 0..objects {
+            let entries = (1..=regions)
+                .filter(|number| !(object + *number as usize).is_multiple_of(3))
+                .map(|number| entry(&store, region(number), &format!("o{object}-r{number}")))
+                .collect::<Vec<_>>();
+            store.append_batch(entries).await.unwrap();
+        }
+        store.stop().await.unwrap();
+    }
+
+    fn object_path(object_store: &ObjectStore, object_seq: u64) -> String {
+        ObjectStoreIo::new(object_store.clone(), PREFIX)
+            .unwrap()
+            .object_path(object_seq)
+    }
+
+    async fn corrupt_object(
+        object_store: &ObjectStore,
+        path: &str,
+        corrupt: impl FnOnce(&mut Vec<u8>),
+    ) {
+        let mut bytes = object_store.read(path).await.unwrap().to_vec();
+        corrupt(&mut bytes);
+        object_store.write(path, bytes).await.unwrap();
+    }
+
+    fn footer_of(bytes: &[u8]) -> (FixedTrailer, Vec<FooterEntry>) {
+        let trailer = decode_trailer(&bytes[bytes.len() - TRAILER_LEN..]).unwrap();
+        let footer =
+            decode_footer(&bytes[footer_range(trailer, bytes.len()).unwrap()], trailer).unwrap();
+        (trailer, footer)
+    }
+
+    fn assert_invalid_object(error: &Error, path: &str, reason: &str) {
+        match error {
+            Error::InvalidWalObject {
+                path: actual,
+                source,
+                ..
+            } => {
+                assert_eq!(path, actual);
+                match &**source {
+                    Error::CorruptedWalObject { reason: actual, .. } => assert!(
+                        actual.contains(reason),
+                        "expected reason to contain {reason:?}, actual {actual:?}"
+                    ),
+                    other => panic!("expected a corrupted object error, actual {other:?}"),
+                }
+            }
+            other => panic!("expected an invalid object error, actual {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_footer_recovery_matches_full_decode() {
+        let object_store = memory_store();
+        populate(&object_store, 40, 5).await;
+        let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
+
+        let (catalog, next_object_seq, durable) = recover(&io).await.unwrap();
+        let (expected_catalog, expected_next_object_seq, expected_durable) =
+            recover_by_decoding(&io).await.unwrap();
+
+        assert_eq!(40, catalog_contents(&catalog).len());
+        assert_eq!(
+            catalog_contents(&expected_catalog),
+            catalog_contents(&catalog)
+        );
+        assert_eq!(expected_next_object_seq, next_object_seq);
+        assert_eq!(40, next_object_seq);
+        assert_eq!(expected_durable, durable);
+        assert_eq!(5, durable.len());
+
+        let store = open(object_store, &eager()).await;
+        for number in 1..=5 {
+            let region_id = region(number);
+            assert_eq!(durable[&region_id], latest(&store, region_id));
+            assert_eq!(
+                durable[&region_id] as usize,
+                read(&store, region_id, 1).await.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_recovery_rejects_corrupted_trailer_version_and_footer() {
+        type Corrupt = fn(&mut Vec<u8>);
+        let cases: [(&str, Corrupt); 3] = [
+            ("invalid trailer magic", |bytes| {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+            }),
+            ("unsupported format version 2", |bytes| {
+                bytes[8..10].copy_from_slice(&2u16.to_be_bytes());
+            }),
+            ("footer checksum mismatch", |bytes| {
+                let (trailer, _) = footer_of(bytes);
+                bytes[trailer.footer_offset as usize] ^= 1;
+            }),
+        ];
+        for (reason, corrupt) in cases {
+            let object_store = memory_store();
+            populate(&object_store, 3, 2).await;
+            let path = object_path(&object_store, 1);
+            corrupt_object(&object_store, &path, corrupt).await;
+
+            let error = ObjectStoreLogStore::try_new(object_store, &eager())
+                .await
+                .unwrap_err();
+            assert_invalid_object(&error, &path, reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_recovery_rejects_header_sequence_mismatch() {
+        let object_store = memory_store();
+        let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
+        let encoded = encode_object(
+            Header {
+                object_seq: 0,
+                writer_instance: [0; 16],
+            },
+            &[Record {
+                region_id: region(1),
+                entry_id: 1,
+                payload: Bytes::from_static(b"a1"),
+            }],
+        )
+        .unwrap();
+        io.put_if_absent(5, encoded.bytes).await.unwrap();
+
+        let error = ObjectStoreLogStore::try_new(object_store, &eager())
+            .await
+            .unwrap_err();
+        assert_invalid_object(
+            &error,
+            &io.object_path(5),
+            "header sequence 0 does not match key sequence 5",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_corrupted_segment_fails_the_read_that_decodes_it() {
+        let object_store = memory_store();
+        let region_one = region(1);
+        let region_two = region(2);
+        let store = open(object_store.clone(), &eager()).await;
+        store
+            .append_batch(vec![
+                entry(&store, region_one, "a1"),
+                entry(&store, region_two, "b1"),
+            ])
+            .await
+            .unwrap();
+        append(&store, region_two, "b2").await.unwrap();
+        store.stop().await.unwrap();
+        let path = object_path(&object_store, 0);
+        corrupt_object(&object_store, &path, |bytes| {
+            let (_, footer) = footer_of(bytes);
+            let segment = &footer[1];
+            assert_eq!(region_two, segment.region_id);
+            bytes[(segment.segment_offset + segment.segment_len - 1) as usize] ^= 1;
+        })
+        .await;
+
+        // Recovery indexes the object; only the corrupted segment is unreadable.
+        let store = open(object_store, &eager()).await;
+        assert_eq!(1, latest(&store, region_one));
+        assert_eq!(2, latest(&store, region_two));
+        assert_eq!(entries(&[(1, "a1")]), read(&store, region_one, 1).await);
+        assert_eq!(entries(&[(2, "b2")]), read(&store, region_two, 2).await);
+        let error = store
+            .read(&provider(region_two), 1, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert_invalid_object(
+            &error,
+            &path,
+            &format!("segment of region {region_two} checksum mismatch"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_recovery_bounds_concurrency_and_orders_by_sequence() {
+        let object_store = memory_store();
+        populate(&object_store, 10, 3).await;
+        let (io, mut parked) = ParkedIo::over(object_store);
+        let objects = io.list().await.unwrap();
+
+        let mut fetch = {
+            let io = io.clone();
+            tokio::spawn(async move {
+                fetch_footers(io.as_ref(), objects, 3)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|(object, _)| object.object_seq)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut wave = Vec::new();
+        for _ in 0..3 {
+            wave.push(timeout(WAIT, parked.recv()).await.unwrap().unwrap());
+        }
+        assert_eq!(
+            vec![0, 1, 2],
+            wave.iter()
+                .map(|(object_seq, _)| *object_seq)
+                .collect::<Vec<_>>()
+        );
+        // A fourth fetch waits for one of the three to complete.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(parked.try_recv().is_err());
+
+        // Completing out of order admits the next object right away.
+        for (expected_next, (_, release)) in [3, 4, 5].into_iter().zip(wave.into_iter().rev()) {
+            release.send(()).unwrap();
+            let (object_seq, release) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+            assert_eq!(expected_next, object_seq);
+            assert!(!fetch.is_finished());
+            release.send(()).unwrap();
+        }
+        loop {
+            tokio::select! {
+                order = &mut fetch => {
+                    assert_eq!((0..10).collect::<Vec<u64>>(), order.unwrap());
+                    break;
+                }
+                next = parked.recv() => {
+                    let (_, release) = next.unwrap();
+                    release.send(()).unwrap();
+                }
+            }
+        }
+        assert_eq!(3, io.max_in_flight.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_store_recovery_fails_closed_on_a_fetch_failure() {
+        let object_store = memory_store();
+        populate(&object_store, 4, 2).await;
+        let io = Arc::new(FaultyIo::over(object_store));
+        io.fail_reads_of.store(2, Ordering::Relaxed);
+
+        let error = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::WalObjectStore { operation: "read", path, .. }
+                if path == &io.object_path(2)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(RetryHint::Retryable, error.retry_hint());
+
+        // Nothing of the failed attempt survives: a retry recovers everything.
+        io.fail_reads_of.store(u64::MAX, Ordering::Relaxed);
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        assert_eq!(3, read(&store, region(1), 1).await.len());
+        assert_eq!(3, read(&store, region(2), 1).await.len());
+        append(&store, region(1), "a4").await.unwrap();
+        assert_eq!(vec![0, 1, 2, 3, 4], object_seqs(io.as_ref()).await);
+        assert_eq!(4, read(&store, region(1), 1).await.len());
+    }
+
+    #[tokio::test]
+    async fn test_store_recovery_fetches_a_footer_longer_than_the_tail_window() {
+        let object_store = memory_store();
+        let regions = (RECOVERY_TAIL_WINDOW / 40 + 100) as u32;
+        let store = open(object_store.clone(), &eager()).await;
+        let wide_entries = (1..=regions)
+            .map(|number| entry(&store, region(number), "wide"))
+            .collect::<Vec<_>>();
+        store.append_batch(wide_entries).await.unwrap();
+        append(&store, region(1), "narrow").await.unwrap();
+        store.stop().await.unwrap();
+
+        let (io, reads) = RecordingIo::over(object_store.clone());
+        let objects = io.list().await.unwrap();
+        let wide = &objects[0];
+        let (trailer, _) = footer_of(&object_store.read(&wide.path).await.unwrap().to_vec());
+        assert!(trailer.footer_len > RECOVERY_TAIL_WINDOW as u64);
+
+        let (catalog, next_object_seq, durable) = recover(io.as_ref()).await.unwrap();
+        let (expected_catalog, expected_next_object_seq, expected_durable) =
+            recover_by_decoding(io.as_ref()).await.unwrap();
+        assert_eq!(
+            catalog_contents(&expected_catalog),
+            catalog_contents(&catalog)
+        );
+        assert_eq!(expected_next_object_seq, next_object_seq);
+        assert_eq!(expected_durable, durable);
+        assert_eq!(regions as usize, durable.len());
+
+        // The wide object took the header, the tail window and the footer;
+        // the narrow one was read whole.
+        let mut wide_reads = reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(object_seq, _, _)| *object_seq == wide.object_seq)
+            .map(|(_, offset, len)| (*offset, *len))
+            .collect::<Vec<_>>();
+        wide_reads.sort_unstable();
+        assert_eq!(
+            vec![
+                (0, HEADER_LEN as u64),
+                (trailer.footer_offset, trailer.footer_len),
+                (
+                    wide.size - RECOVERY_TAIL_WINDOW as u64,
+                    RECOVERY_TAIL_WINDOW as u64
+                ),
+            ],
+            wide_reads
+        );
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(object_seq, _, _)| *object_seq == wide.object_seq)
+        );
+
+        let store = open(object_store, &eager()).await;
+        assert_eq!(
+            entries(&[(1, "wide"), (2, "narrow")]),
+            read(&store, region(1), 1).await
+        );
+        assert_eq!(
+            entries(&[(1, "wide")]),
+            read(&store, region(regions), 1).await
+        );
+    }
+
     /// Object access that fails a conditional create on request, either before
-    /// or after the object was actually written.
+    /// or after the object was actually written, or every read of one object.
     struct FaultyIo {
         inner: ObjectStoreIo,
         fail_next_put: AtomicBool,
         fail_after_next_put: AtomicBool,
+        /// Sequence of the object whose reads fail; `u64::MAX` fails none.
+        fail_reads_of: AtomicU64,
     }
 
     impl FaultyIo {
         fn new() -> Self {
+            Self::over(memory_store())
+        }
+
+        fn over(object_store: ObjectStore) -> Self {
             Self {
-                inner: ObjectStoreIo::new(memory_store(), PREFIX).unwrap(),
+                inner: ObjectStoreIo::new(object_store, PREFIX).unwrap(),
                 fail_next_put: AtomicBool::new(false),
                 fail_after_next_put: AtomicBool::new(false),
+                fail_reads_of: AtomicU64::new(u64::MAX),
+            }
+        }
+
+        fn check_read(&self, object_seq: u64) -> Result<()> {
+            if self.fail_reads_of.load(Ordering::Relaxed) == object_seq {
+                injected_failure("read", self.inner.object_path(object_seq))
+            } else {
+                Ok(())
             }
         }
     }
 
-    fn injected_failure<T>(path: String) -> Result<T> {
+    fn injected_failure<T>(operation: &'static str, path: String) -> Result<T> {
         Err(object_store::Error::new(ErrorKind::Unexpected, "injected failure").set_temporary())
-            .context(WalObjectStoreSnafu {
-                operation: "write",
-                path,
-            })
+            .context(WalObjectStoreSnafu { operation, path })
     }
 
     #[async_trait::async_trait]
     impl WalObjectIo for FaultyIo {
         async fn put_if_absent(&self, object_seq: u64, content: Bytes) -> Result<PutResult> {
             if self.fail_next_put.swap(false, Ordering::Relaxed) {
-                return injected_failure(self.inner.object_path(object_seq));
+                return injected_failure("write", self.inner.object_path(object_seq));
             }
             let result = self.inner.put_if_absent(object_seq, content).await?;
             if self.fail_after_next_put.swap(false, Ordering::Relaxed) {
-                return injected_failure(self.inner.object_path(object_seq));
+                return injected_failure("write", self.inner.object_path(object_seq));
             }
             Ok(result)
         }
 
         async fn get(&self, object_seq: u64) -> Result<Bytes> {
+            self.check_read(object_seq)?;
             self.inner.get(object_seq).await
+        }
+
+        async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
+            self.check_read(object_seq)?;
+            self.inner.get_range(object_seq, offset, len).await
         }
 
         async fn list(&self) -> Result<Vec<ListedObject>> {
@@ -1724,12 +2233,121 @@ mod tests {
             if opened.await.unwrap() {
                 self.inner.put_if_absent(object_seq, content).await
             } else {
-                injected_failure(self.inner.object_path(object_seq))
+                injected_failure("write", self.inner.object_path(object_seq))
             }
         }
 
         async fn get(&self, object_seq: u64) -> Result<Bytes> {
             self.inner.get(object_seq).await
+        }
+
+        async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
+            self.inner.get_range(object_seq, offset, len).await
+        }
+
+        async fn list(&self) -> Result<Vec<ListedObject>> {
+            self.inner.list().await
+        }
+
+        fn object_path(&self, object_seq: u64) -> String {
+            self.inner.object_path(object_seq)
+        }
+    }
+
+    /// Object access whose reads park until the test releases them, counting
+    /// how many are in flight. Objects must be short enough to be read whole,
+    /// so every object costs exactly one read.
+    struct ParkedIo {
+        inner: ObjectStoreIo,
+        parked: mpsc::UnboundedSender<(u64, oneshot::Sender<()>)>,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl ParkedIo {
+        fn over(
+            object_store: ObjectStore,
+        ) -> (
+            Arc<Self>,
+            mpsc::UnboundedReceiver<(u64, oneshot::Sender<()>)>,
+        ) {
+            let (parked, parked_rx) = mpsc::unbounded_channel();
+            let io = Self {
+                inner: ObjectStoreIo::new(object_store, PREFIX).unwrap(),
+                parked,
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            };
+            (Arc::new(io), parked_rx)
+        }
+
+        async fn park(&self, object_seq: u64) {
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            let (release, released) = oneshot::channel();
+            self.parked.send((object_seq, release)).unwrap();
+            released.await.unwrap();
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WalObjectIo for ParkedIo {
+        async fn put_if_absent(&self, object_seq: u64, content: Bytes) -> Result<PutResult> {
+            self.inner.put_if_absent(object_seq, content).await
+        }
+
+        async fn get(&self, object_seq: u64) -> Result<Bytes> {
+            self.park(object_seq).await;
+            self.inner.get(object_seq).await
+        }
+
+        async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
+            self.park(object_seq).await;
+            self.inner.get_range(object_seq, offset, len).await
+        }
+
+        async fn list(&self) -> Result<Vec<ListedObject>> {
+            self.inner.list().await
+        }
+
+        fn object_path(&self, object_seq: u64) -> String {
+            self.inner.object_path(object_seq)
+        }
+    }
+
+    type RangeReads = Arc<Mutex<Vec<(u64, u64, u64)>>>;
+
+    /// Object access that records every range read as (sequence, offset, length).
+    struct RecordingIo {
+        inner: ObjectStoreIo,
+        reads: RangeReads,
+    }
+
+    impl RecordingIo {
+        fn over(object_store: ObjectStore) -> (Arc<Self>, RangeReads) {
+            let reads = RangeReads::default();
+            let io = Self {
+                inner: ObjectStoreIo::new(object_store, PREFIX).unwrap(),
+                reads: reads.clone(),
+            };
+            (Arc::new(io), reads)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WalObjectIo for RecordingIo {
+        async fn put_if_absent(&self, object_seq: u64, content: Bytes) -> Result<PutResult> {
+            self.inner.put_if_absent(object_seq, content).await
+        }
+
+        async fn get(&self, object_seq: u64) -> Result<Bytes> {
+            self.inner.get(object_seq).await
+        }
+
+        async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
+            self.reads.lock().unwrap().push((object_seq, offset, len));
+            self.inner.get_range(object_seq, offset, len).await
         }
 
         async fn list(&self) -> Result<Vec<ListedObject>> {

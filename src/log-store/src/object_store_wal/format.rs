@@ -16,6 +16,7 @@
 //! in the [module documentation](super).
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use snafu::{OptionExt, ensure};
@@ -80,6 +81,7 @@ pub(super) struct EncodedObject {
 }
 
 /// A decoded object with its records ordered by region id and entry id.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DecodedObject {
     pub(super) header: Header,
@@ -343,7 +345,11 @@ pub(super) fn decode_segment(bytes: &[u8], entry: &FooterEntry) -> Result<Vec<Re
     ensure!(
         checksum == entry.segment_crc32,
         CorruptedWalObjectSnafu {
-            reason: checksum_mismatch("segment", entry.segment_crc32, checksum),
+            reason: checksum_mismatch(
+                &format!("segment of region {}", entry.region_id),
+                entry.segment_crc32,
+                checksum
+            ),
         }
     );
 
@@ -412,22 +418,20 @@ pub(super) fn decode_segment(bytes: &[u8], entry: &FooterEntry) -> Result<Vec<Re
     Ok(records)
 }
 
-/// Decodes a whole object, verifying every checksum and byte range.
-pub(super) fn decode_object(bytes: &[u8]) -> Result<DecodedObject> {
-    let minimum_len = HEADER_LEN
-        .checked_add(4)
-        .and_then(|len| len.checked_add(TRAILER_LEN))
-        .expect("fixed format lengths fit usize");
+/// Smallest length of a well-formed object: header, a footer holding only its
+/// entry count and the trailer.
+pub(super) const MIN_OBJECT_LEN: usize = HEADER_LEN + 4 + TRAILER_LEN;
+
+/// Locates the footer inside an object of `object_len` bytes from its trailer.
+/// The footer must follow the header and end where the trailer starts.
+pub(super) fn footer_range(trailer: FixedTrailer, object_len: usize) -> Result<Range<usize>> {
     ensure!(
-        bytes.len() >= minimum_len,
+        object_len >= MIN_OBJECT_LEN,
         CorruptedWalObjectSnafu {
-            reason: truncated("object", bytes.len(), minimum_len),
+            reason: truncated("object", object_len, MIN_OBJECT_LEN),
         }
     );
-
-    let header = decode_header(bytes)?;
-    let trailer_start = bytes.len() - TRAILER_LEN;
-    let trailer = decode_trailer(&bytes[trailer_start..])?;
+    let trailer_start = object_len - TRAILER_LEN;
     let footer_start = to_usize(trailer.footer_offset, "footer offset")?;
     let footer_len = to_usize(trailer.footer_len, "footer length")?;
     let footer_end =
@@ -444,8 +448,28 @@ pub(super) fn decode_object(bytes: &[u8]) -> Result<DecodedObject> {
             ),
         }
     );
+    Ok(footer_start..footer_end)
+}
 
-    let footer = decode_footer(&bytes[footer_start..footer_end], trailer)?;
+/// Decodes a whole object, verifying every checksum and byte range. Recovery
+/// reads only the header, trailer and footer, so this is the reference
+/// decoder that tests check the store against.
+#[cfg(test)]
+pub(super) fn decode_object(bytes: &[u8]) -> Result<DecodedObject> {
+    ensure!(
+        bytes.len() >= MIN_OBJECT_LEN,
+        CorruptedWalObjectSnafu {
+            reason: truncated("object", bytes.len(), MIN_OBJECT_LEN),
+        }
+    );
+
+    let header = decode_header(bytes)?;
+    let trailer_start = bytes.len() - TRAILER_LEN;
+    let trailer = decode_trailer(&bytes[trailer_start..])?;
+    let footer_range = footer_range(trailer, bytes.len())?;
+    let footer_start = footer_range.start;
+
+    let footer = decode_footer(&bytes[footer_range], trailer)?;
     ensure!(
         !footer.is_empty(),
         CorruptedWalObjectSnafu {
@@ -786,7 +810,10 @@ mod tests {
         let mut bad_segment = encoded.bytes.to_vec();
         let segment = &encoded.footer[0];
         bad_segment[segment.segment_offset as usize + SEGMENT_HEADER_LEN] ^= 1;
-        assert_corrupted(decode_object(&bad_segment), "segment checksum mismatch");
+        assert_corrupted(
+            decode_object(&bad_segment),
+            &format!("segment of region {} checksum mismatch", segment.region_id),
+        );
 
         let mut bad_footer = encoded.bytes.to_vec();
         bad_footer[encoded.trailer.footer_offset as usize] ^= 1;

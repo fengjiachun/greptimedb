@@ -34,8 +34,10 @@
 //! gaps, so recovery continues after the largest sequence it indexed. An object
 //! is created conditionally: rewriting a sequence with the content it already
 //! holds is a no-op at the object store, while different content under a taken
-//! sequence is a conflict. Recovery replays objects in sequence order to
-//! rebuild the object catalog index, which rejects a sequence it already holds.
+//! sequence is a conflict. Recovery lists the objects, reads and verifies only
+//! the header, trailer and footer of each, and indexes the footers in sequence
+//! order to rebuild the object catalog, which rejects a sequence it already
+//! holds. Segments are read and checksummed only when a read decodes them.
 
 mod batch;
 mod catalog;
