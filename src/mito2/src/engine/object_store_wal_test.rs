@@ -39,7 +39,8 @@ use crate::test_util::{
     reopen_region, rows_schema,
 };
 
-const PREFIX: &str = "cluster-a/wal";
+/// The node prefix a standalone datanode derives from the root `cluster-a/wal`.
+const PREFIX: &str = "cluster-a/wal/datanodes/0/epochs/0";
 
 fn wal_options() -> HashMap<String, String> {
     let options = WalOptions::ObjectStore(ObjectStoreWalOptions::new(PREFIX.to_string()));

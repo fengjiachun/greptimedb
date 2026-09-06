@@ -94,10 +94,13 @@ async fn test_standalone_object_store_wal_round_trip() {
     let rows = execute_sql(frontend, query).await.data.pretty_print().await;
     assert_eq!(expected, rows);
 
-    // The acknowledged inserts are durable as WAL objects under the prefix of
-    // the default file store, which is rooted at the data home.
+    // The acknowledged inserts are durable as WAL objects under the node prefix
+    // derived from the configured root inside the default file store, which is
+    // rooted at the data home.
     let data_home = Path::new(&standalone.opts.storage.data_home);
-    assert!(has_files(&data_home.join("cluster-a").join("wal")));
+    assert!(has_files(
+        &data_home.join("cluster-a/wal/datanodes/0/epochs/0/objects")
+    ));
     // No Raft Engine log store is created as a fallback.
     assert!(!data_home.join("wal").exists());
 
@@ -106,7 +109,8 @@ async fn test_standalone_object_store_wal_round_trip() {
     assert_eq!(expected, rows);
 }
 
-/// WAL objects under the prefix of the default S3 store of `opts`.
+/// WAL objects under the configured root prefix of the default S3 store,
+/// counted recursively so the count does not depend on the layout below it.
 struct WalObjects {
     store: ObjectStore,
     path: String,
@@ -120,7 +124,7 @@ impl WalObjects {
         let store = ObjectStore::new(S3::from(&s3.connection)).unwrap().finish();
         Self {
             store,
-            path: format!("{prefix}/objects/"),
+            path: format!("{prefix}/"),
         }
     }
 
@@ -138,13 +142,17 @@ impl WalObjects {
             if entry.metadata().is_dir() {
                 continue;
             }
-            count += 1;
-            bytes += self
+            let len = self
                 .store
                 .stat(entry.path())
                 .await
                 .unwrap()
                 .content_length();
+            count += 1;
+            bytes += len;
+            // Every key is logged so the driver script can show the layout
+            // the store derived below the root prefix.
+            info!("object_store_wal object={} bytes={len}", entry.path());
         }
         (count, bytes)
     }

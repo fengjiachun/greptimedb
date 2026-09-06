@@ -34,7 +34,7 @@ use common_stat::ResourceStatImpl;
 use common_telemetry::{error, info, warn};
 use common_wal::config::DatanodeWalConfig;
 use common_wal::config::kafka::DatanodeKafkaConfig;
-use common_wal::config::object_store::ObjectStoreWalConfig;
+use common_wal::config::object_store::{ObjectStoreWalConfig, STANDALONE_GENERATION};
 use common_wal::config::raft_engine::RaftEngineConfig;
 use file_engine::engine::FileRegionEngine;
 use log_store::kafka::log_store::KafkaLogStore;
@@ -706,8 +706,15 @@ impl DatanodeBuilder {
                     &opts.storage,
                     &object_store_config.storage_provider,
                 )?;
+                let node_id = opts.node_id.context(MissingNodeIdSnafu)?;
+                // The store runs under the node prefix, which is what the
+                // regions persist in their WAL options.
+                let node_config = ObjectStoreWalConfig {
+                    prefix: object_store_config.node_prefix(node_id, STANDALONE_GENERATION),
+                    ..object_store_config.clone()
+                };
                 let log_store =
-                    Self::build_object_store_log_store(object_store, object_store_config).await?;
+                    Self::build_object_store_log_store(object_store, &node_config).await?;
                 self.object_store_log_store = Some(log_store.clone());
 
                 let builder = MitoEngineBuilder::new(
@@ -1010,7 +1017,7 @@ mod tests {
     use common_meta::kv_backend::memory::MemoryKvBackend;
     use common_test_util::temp_dir::create_temp_dir;
     use common_wal::config::DatanodeWalConfig;
-    use common_wal::config::object_store::ObjectStoreWalConfig;
+    use common_wal::config::object_store::{ObjectStoreWalConfig, STANDALONE_GENERATION};
     use log_store::error::Error as LogStoreError;
     use log_store::object_store_wal::ObjectStoreLogStore;
     use meta_client::client::MetaClientBuilder;
@@ -1022,7 +1029,7 @@ mod tests {
     use store_api::storage::RegionId;
 
     use crate::config::{DatanodeOptions, StorageConfig};
-    use crate::datanode::{DatanodeBuilder, wal_object_store};
+    use crate::datanode::{DatanodeBuilder, validate_object_store_wal_config, wal_object_store};
     use crate::error::{self, Error};
     use crate::tests::{MockRegionEngine, mock_region_server};
 
@@ -1316,9 +1323,21 @@ mod tests {
         let mut datanode = builder.build().await.unwrap();
         let log_store = datanode.object_store_log_store.clone().unwrap();
         assert!(!is_stopped(&log_store).await);
+        // The store runs under the node prefix derived from the configured root.
+        assert!(format!("{log_store:?}").contains(r#"prefix: "wal/datanodes/0/epochs/0""#));
 
         datanode.shutdown().await.unwrap();
         assert!(is_stopped(&log_store).await);
+    }
+
+    #[test]
+    fn test_node_prefix_passes_validation() {
+        let config = ObjectStoreWalConfig::default();
+        let derived = ObjectStoreWalConfig {
+            prefix: config.node_prefix(0, STANDALONE_GENERATION),
+            ..config
+        };
+        validate_object_store_wal_config(&derived).unwrap();
     }
 
     #[tokio::test]

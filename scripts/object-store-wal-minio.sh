@@ -118,6 +118,12 @@ OPENED=$(grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true)
 if [ "${OPENED}" -lt 3 ]; then
   MISSING+=("region open timings (found ${OPENED}, expected 3)")
 fi
+# The test lists the WAL objects recursively under the configured root prefix
+# and logs every key, which is what shows the layout the store derived below it.
+WAL_OBJECTS=$(grep -oE 'object_store_wal object=[^ ]+ bytes=[0-9]+' "${LOG_FILE}" | sort -u || true)
+if [ -z "${WAL_OBJECTS}" ]; then
+  MISSING+=("WAL object keys")
+fi
 
 if [ "${STATUS}" -eq 0 ] && [ "${#MISSING[@]}" -eq 0 ]; then
   RESULT=PASS
@@ -139,6 +145,7 @@ echo "minio image: ${MINIO_IMAGE_ID} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in
 echo "bucket: ${MINIO_BUCKET} at ${GT_S3_ENDPOINT_URL}"
 grep -oE 'object_store_wal (phase|restart)=[^"]*' "${LOG_FILE}" | sed -E 's/^object_store_wal //' || true
 grep -oE "${OPEN_PATTERN}" "${LOG_FILE}" | sed -E 's/^/replay: /' || true
+printf '%s\n' "${WAL_OBJECTS}" | sed -E 's/^object_store_wal object=/object: /'
 for field in ${MISSING[@]+"${MISSING[@]}"}; do
   echo "missing: ${field}"
 done
