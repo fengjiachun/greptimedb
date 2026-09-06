@@ -106,7 +106,11 @@ VERDICT_PERSISTED=no
 RESULT_APPENDED=no
 FINAL_MANIFEST_OPEN=no
 OBJECTS_REMOVED=no
-UNRECORDED=""
+# Every failure reason, kept in memory as well as in the cycle manifest, so
+# a manifest that cannot be read back still names them.
+FAIL_REASONS=""
+CYCLE_MANIFEST_READABLE=yes
+EXIT_NOTE=""
 STORE_ROOT=""
 BINARY_COMMIT=""
 BINARY_SHA256=""
@@ -149,12 +153,24 @@ append_line() {
 }
 
 # Writes the verdict part of the manifest: the run identity, every field
-# collected so far, and the verdict. It renders only values collected
-# earlier and never runs a command that can fail, so it works from the EXIT
-# handler at any point of the run, before a run directory exists included.
-# The verdict counts as persisted only once both copies were written.
+# collected so far, and the verdict. It renders values collected earlier;
+# the one read it does, of the cycle manifest, is checked on the PASS path,
+# where the file must exist, be read in full and hold cycle lines, and is
+# best effort on the failure paths, where there may be no run directory
+# yet. The verdict counts as persisted only once both copies were written.
 print_verdict() {
-  local text
+  local cycles="" text
+  if [ "${VERDICT}" = PASS ]; then
+    cycles=$(cat "${MANIFEST}") || fail "cannot read the cycle manifest ${MANIFEST}"
+    case "${cycles}" in
+      *cycle=*) ;;
+      *) fail "the cycle manifest ${MANIFEST} holds no cycle line" ;;
+    esac
+  elif [ -n "${MANIFEST}" ] && [ -f "${MANIFEST}" ]; then
+    cycles=$(cat "${MANIFEST}" 2>/dev/null) || CYCLE_MANIFEST_READABLE=no
+  else
+    CYCLE_MANIFEST_READABLE=no
+  fi
   text=$(
     echo "== object store WAL crash gate manifest =="
     echo "base commit: ${CHECKED_OUT_COMMIT:-unknown}"
@@ -162,8 +178,11 @@ print_verdict() {
     echo "minio image: ${MINIO_IMAGE_ID:-unknown} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
     echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT:-unknown} wal prefix ${WAL_PREFIX} at http://127.0.0.1:${MINIO_PORT}"
     echo "cycles: ${CYCLES} writers: ${WRITERS} kill window: ${KILL_MIN_SECS}s to ${KILL_MAX_SECS}s"
-    [ -n "${MANIFEST}" ] && [ -f "${MANIFEST}" ] && cat "${MANIFEST}"
-    [ -n "${UNRECORDED}" ] && printf '%s' "${UNRECORDED}"
+    [ -n "${cycles}" ] && printf '%s\n' "${cycles}"
+    if [ "${CYCLE_MANIFEST_READABLE}" = no ] && [ -n "${FAIL_REASONS}" ]; then
+      printf '%s' "${FAIL_REASONS}"
+    fi
+    [ -n "${EXIT_NOTE}" ] && echo "${EXIT_NOTE}"
     for field in ${MISSING[@]+"${MISSING[@]}"}; do
       echo "missing: ${field}"
     done
@@ -177,13 +196,15 @@ print_verdict() {
 }
 
 # Fails the run right away with the reason in the manifest; the EXIT handler
-# prints it. Until the run directory was accepted, and whenever the reason
-# cannot be recorded there, it is kept in memory and printed with the
-# manifest, so a rejected directory is never written to.
+# prints it. The reason is also kept in memory, and the cycle manifest is
+# written only once the run directory was accepted, so a rejected directory
+# is never written to and a manifest that cannot be read back still names
+# the reason.
 fail() {
   log "FAIL: $*"
-  if [ -z "${MANIFEST}" ] || ! echo "fail: $*" 2>/dev/null >> "${MANIFEST}"; then
-    UNRECORDED="${UNRECORDED}fail: $*"$'\n'
+  FAIL_REASONS="${FAIL_REASONS}fail: $*"$'\n'
+  if [ -n "${MANIFEST}" ] && ! echo "fail: $*" 2>/dev/null >> "${MANIFEST}"; then
+    CYCLE_MANIFEST_READABLE=no
   fi
   exit 1
 }
@@ -207,7 +228,7 @@ cleanup() {
   fi
   if [ "${VERDICT_PERSISTED}" = no ]; then
     VERDICT=FAIL
-    UNRECORDED="${UNRECORDED}fail: exited with status ${status} before the verdict was complete"$'\n'
+    EXIT_NOTE="fail: exited with status ${status} before the verdict was complete"
     print_verdict
   fi
   if [ "${RESULT_APPENDED}" = no ]; then
