@@ -224,13 +224,19 @@ Simpler catalog, but every region then produces its own timer-driven object, so 
 
 # Alignment with cluster mode
 
-Distributed mode is out of scope, but several decisions were taken so that the cluster design can build on this backend without a metadata migration. These rest on the proposed changes above:
+Distributed mode is out of scope, but several decisions were taken so that the cluster design can build on this backend without a metadata migration. All of them are *Proposed*; none is implemented at this snapshot.
 
-- *Proposed* object-sequence-major entry ids let a per-region flush watermark be compared with an object sequence directly. A cross-node takeover can therefore describe a region's WAL position as a chain of `(node prefix, first sequence, cutover sequence)` segments and replay them in order.
-- Both acknowledgement modes are defined here, one implemented and one *proposed*. Cluster mode is expected to run `enqueued` for latency-sensitive workloads; the object layout and the recovery path are identical in both modes.
-- Conflicting objects poison the store here because a standalone node has no coordinator. In cluster mode the datanode will carry a metasrv-issued generation in the object header so that a conditional-create conflict can be classified as a stale tail from an earlier generation, an idempotent retry of its own write, or a real second writer to be reported to the metasrv.
-- *Proposed* segment-level skipping with region marking lets cluster mode route the WAL hole event to the metasrv so that a follower or a takeover knows the region needs a fresh replica rather than a replay.
-- *Proposed* garbage collection derives its watermark from each region's manifest `flushed_entry_id`, deletes an object only when every segment's maximum entry id is at or below its region's watermark, always keeps the highest-sequence object, and does not start on an upgraded prefix until the first object under the new id scheme is durable. The handoff already exists: Mito hands that value to the store on region open, and the proposal introduces no additional persisted state.
+**Key layout.** The operator configures only the prefix root. The store derives the prefix it writes under as `<prefix>/datanodes/<node_id>/epochs/<generation>`, so objects live at `<prefix>/datanodes/<node_id>/epochs/<generation>/objects/<sequence>.wal`. Standalone uses its configured node id and generation zero; in cluster mode the metasrv assigns both, and issues a new generation every time it hands a region's write ownership to a node. The persisted `WalOptions` of a region carry the full derived prefix, so a region's WAL location is self-describing and can be opened read-only by a node other than the one that wrote it. Putting the generation into the key rather than only into the object header means that a writer which lost its lease and keeps writing lands in its old epoch directory, where the new writer never creates objects, so the two can never contend for a sequence number; the generation in the header stays as a read-side check.
+
+**Planned migration.** A region that moves while its source node is alive follows the existing migration flow: the source flushes before it downgrades, the target opens the region with a `flushed_entry_id` that covers everything, and starts writing under its own prefix. No cross-node read is needed.
+
+**Failover.** When the source is gone, the target must replay the region's unflushed tail from the source's prefix. The region's WAL position becomes a chain of `(prefix, first sequence, cutover sequence)` segments whose last element is the target's own prefix; the metasrv appends a segment to the region's `WalOptions` when it reassigns the region, with the cutover sequence being the largest sequence it observed under the source prefix at that time. On open the target replays the earlier segments in order, reading only footers and its own region's segments through range reads, and never creates an object under a foreign prefix, so there is nothing to conflict with. Objects the old writer creates after the cutover carry higher sequence numbers and are ignored; the old writer itself is fenced the way Mito already fences a lease-less region, by the metasrv's generation, not by the WAL. Object-sequence-major entry ids are what make this cheap: `entry_id >> 20` locates the object under the right prefix without the source node's in-memory catalog.
+
+**Acknowledgement modes.** Both are defined here, one implemented and one *proposed*. Cluster mode is expected to run `enqueued` for latency-sensitive workloads; the object layout, the flush durability barrier and the recovery path are identical in both modes.
+
+**Corruption.** *Proposed* segment-level skipping with region marking lets cluster mode route the WAL hole event to the metasrv so that a follower or a takeover knows the region needs a fresh replica rather than a replay.
+
+**Garbage collection across nodes.** Within one prefix, garbage collection works as described under *Entry ids*: watermark from each region's manifest, per-segment footer comparison, the highest-sequence object always retained. A source prefix that still holds segments of regions which have moved away cannot be trimmed by the source alone, because it no longer learns those regions' watermarks. Either the target reports to the metasrv, after each flush, the source sequence below which it no longer needs the region, and the metasrv drives deletion, or a cluster-level janitor collects the watermarks; which of the two is the last of the *Unresolved questions*.
 
 # Future work
 
@@ -241,10 +247,10 @@ Distributed mode is out of scope, but several decisions were taken so that the c
 5. Metrics for flush latency, object count and size, replay duration; a fault matrix for network errors, unwritable buckets and missing objects.
 6. After a transient create failure whose immediate read-back also failed, reconcile the sequence number before reusing it, so that a create that succeeded without a response is indexed instead of conflicting with the next batch.
 7. A cost and latency comparison against Raft Engine with `sync_write = true`, to calibrate `flush_interval`, `max_batch_bytes` and the default acknowledgement mode.
-8. Distributed mode, which needs metasrv-side allocation, per-datanode prefixes and a metasrv-issued generation in the object header.
+8. Distributed mode, which needs metasrv-side allocation of node ids and generations, the takeover chain in `WalOptions`, read-only replay of a foreign prefix, and cross-node garbage collection, as sketched under *Alignment with cluster mode*.
 
 # Unresolved questions
 
 - Whether the writer instance id should be used to detect a second writer on the same prefix. Conditional creates already prevent overwrites, but a concurrent writer is only noticed when it wins a sequence number.
 - Whether region-level `read` should fetch only the target segment with a range request rather than the whole object.
-- Whether garbage collection should also run for regions that are closed on this node but still own objects under its prefix, or whether that is left to a cluster-level janitor.
+- Whether garbage collection of a source prefix after a failover is driven by the target reporting its watermark to the metasrv, or by a cluster-level janitor that collects watermarks; the same question covers regions that are closed on a node but still own objects under its prefix.
