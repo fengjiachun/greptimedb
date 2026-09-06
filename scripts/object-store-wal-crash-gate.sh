@@ -33,7 +33,9 @@
 #   GREPTIME_PORT_BASE
 #                   HTTP port of the server; gRPC, MySQL and PostgreSQL take
 #                   the next three ports, default 24000
-#   RUN_DIR         where the config, logs, acked files and manifest go,
+#   RUN_DIR         where the config, logs, acked files and manifest go; it
+#                   must not exist yet or be an empty directory, so the
+#                   evidence of one run is never mixed with another's,
 #                   default a fresh temporary directory
 #   MINIO_*         same as scripts/object-store-wal-minio.sh
 #
@@ -42,8 +44,11 @@
 # restarts it, and reads the table back. The cycle passes when every
 # acknowledged sequence number is present exactly once, no sequence number
 # is present twice, and every present sequence number that was not
-# acknowledged is a write that was in flight at the kill (the last attempt of
-# a writer). Nothing is cleaned between cycles, so replay accumulates.
+# acknowledged is a write that was in flight at the kill: the last attempt
+# of a writer, whose connection dropped no earlier than the kill. A dropped
+# connection before the kill, an acknowledgement after it, or a kill that
+# found no writer still running fails the cycle. Nothing is cleaned between
+# cycles, so replay accumulates.
 #
 # PASS means every cycle passed, the manifest carries every required field,
 # and the objects of the run were removed from the bucket and the removal
@@ -76,12 +81,16 @@ READY_TIMEOUT_SECS=300
 HTTP_ADDR="127.0.0.1:${GREPTIME_PORT_BASE}"
 SQL_URL="http://${HTTP_ADDR}/v1/sql"
 MANIFEST="${RUN_DIR}/manifest.txt"
+FINAL_MANIFEST="${RUN_DIR}/manifest-final.txt"
 ACKED="${RUN_DIR}/acked.log"
 ATTEMPTED="${RUN_DIR}/attempted.log"
 SERVER_PID=""
 WRITER_PIDS=""
 RESULT=FAIL
 MANIFEST_PRINTED=no
+FINAL_MANIFEST_OPEN=no
+OBJECTS_REMOVED=no
+UNRECORDED=""
 STORE_ROOT=""
 BINARY_COMMIT=""
 BINARY_SHA256=""
@@ -102,55 +111,51 @@ now_ms() {
   python3 -c 'import time; print(int(time.time() * 1000))'
 }
 
-mkdir -p "${RUN_DIR}"
-: > "${MANIFEST}"
-: > "${ACKED}"
-: > "${ATTEMPTED}"
+# The writers and the kill are stamped from this one clock.
+now_ns() {
+  python3 -c 'import time; print(time.time_ns())'
+}
 
-# Prints the manifest: the run identity, then every field collected so far.
-# It renders only values collected earlier and never runs a command that
-# can fail, so it works from the EXIT handler at any point of the run.
+# Prints the manifest to the caller and to the final manifest file: the run
+# identity, then every field collected so far. It renders only values
+# collected earlier and never runs a command that can fail, so it works
+# from the EXIT handler at any point of the run, before the run directory
+# exists included. The manifest counts as printed only once both copies
+# were written.
 print_manifest() {
-  {
-    echo
+  local text
+  text=$(
     echo "== object store WAL crash gate manifest =="
     echo "base commit: ${CHECKED_OUT_COMMIT:-unknown}"
     echo "binary: ${GREPTIME_BIN:-not built} commit ${BINARY_COMMIT:-unknown} sha256 ${BINARY_SHA256:-unknown}"
     echo "minio image: ${MINIO_IMAGE_ID:-unknown} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
     echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT:-unknown} wal prefix ${WAL_PREFIX} at http://127.0.0.1:${MINIO_PORT}"
     echo "cycles: ${CYCLES} writers: ${WRITERS} kill window: ${KILL_MIN_SECS}s to ${KILL_MAX_SECS}s"
-    cat "${MANIFEST}"
+    [ -f "${MANIFEST}" ] && cat "${MANIFEST}"
+    [ -n "${UNRECORDED}" ] && printf '%s' "${UNRECORDED}"
     for field in ${MISSING[@]+"${MISSING[@]}"}; do
       echo "missing: ${field}"
     done
+    if [ "${RESULT}" != PASS ] && [ "${OBJECTS_REMOVED}" = yes ]; then
+      echo "objects: removed from the bucket after the PASS verdict, before the manifest could be written"
+    fi
     echo "result: ${RESULT}"
-  } | tee "${RUN_DIR}/manifest-final.txt" >&3 && MANIFEST_PRINTED=yes
-}
-
-# Collects the identity of the run: the checked-out commit and the image of
-# the running MinIO container, which can differ from what the tag resolves
-# to when an older container is reused. Every step is checked, and a
-# missing value fails the run.
-collect_identity() {
-  local commit image_id digests
-  commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) && [ -n "${commit}" ] ||
-    fail "cannot read the checked-out commit"
-  docker ps --format '{{.Names}}' | grep -qx "${MINIO_CONTAINER}" ||
-    fail "container ${MINIO_CONTAINER} is not running"
-  image_id=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}") && [ -n "${image_id}" ] ||
-    fail "cannot read the image of container ${MINIO_CONTAINER}"
-  digests=$(docker inspect --format '{{join .RepoDigests ","}}' "${image_id}") ||
-    fail "cannot read the digests of image ${image_id}"
-  CHECKED_OUT_COMMIT="${commit}"
-  MINIO_IMAGE_ID="${image_id}"
-  MINIO_IMAGE_DIGESTS="${digests}"
+  )
+  printf '\n%s\n' "${text}" >&3 || return 1
+  if [ "${FINAL_MANIFEST_OPEN}" = yes ]; then
+    printf '%s\n' "${text}" >&5 || return 1
+  fi
+  MANIFEST_PRINTED=yes
 }
 
 # Fails the run right away with the reason in the manifest; the EXIT handler
-# prints it.
+# prints it. A reason that cannot be recorded in the run directory is kept
+# in memory and printed with the manifest.
 fail() {
   log "FAIL: $*"
-  echo "fail: $*" >> "${MANIFEST}"
+  if ! echo "fail: $*" 2>/dev/null >> "${MANIFEST}"; then
+    UNRECORDED="${UNRECORDED}fail: $*"$'\n'
+  fi
   exit 1
 }
 
@@ -172,13 +177,14 @@ cleanup() {
   fi
   if [ "${MANIFEST_PRINTED}" = no ]; then
     RESULT=FAIL
-    echo "fail: exited with status ${status} before the manifest was complete" >> "${MANIFEST}"
+    UNRECORDED="${UNRECORDED}fail: exited with status ${status} before the manifest was complete"$'\n'
     print_manifest
     log "run directory: ${RUN_DIR}"
     exit 1
   fi
   log "run directory: ${RUN_DIR}"
 }
+# Installed before anything that can fail, the run directory included.
 trap cleanup EXIT
 # Read once early so a manifest printed before the checked collection still
 # names the commit; the checked collection runs before the verdict.
@@ -204,6 +210,21 @@ fi
 is_positive_integer "${GREPTIME_PORT_BASE}" ||
   fail "GREPTIME_PORT_BASE must be a positive integer, got '${GREPTIME_PORT_BASE}'"
 
+# The run directory holds the evidence of exactly one run, so it must be
+# new or empty, and the final manifest file is opened now and kept open, so
+# a directory that cannot take the manifest fails before anything runs.
+if [ -e "${RUN_DIR}" ]; then
+  if ! [ -d "${RUN_DIR}" ] || [ -n "$(ls -A "${RUN_DIR}" 2>/dev/null || echo occupied)" ]; then
+    fail "RUN_DIR ${RUN_DIR} exists and is not an empty directory"
+  fi
+fi
+mkdir -p "${RUN_DIR}" || fail "cannot create RUN_DIR ${RUN_DIR}"
+: > "${FINAL_MANIFEST}" || fail "cannot write ${FINAL_MANIFEST}"
+exec 5>>"${FINAL_MANIFEST}"
+FINAL_MANIFEST_OPEN=yes
+: > "${MANIFEST}" || fail "cannot write ${MANIFEST}"
+: > "${ACKED}" || fail "cannot write ${ACKED}"
+: > "${ATTEMPTED}" || fail "cannot write ${ATTEMPTED}"
 
 if curl -sf "http://${HTTP_ADDR}/health" >/dev/null 2>&1; then
   fail "something already answers on http://${HTTP_ADDR}; set GREPTIME_PORT_BASE"
@@ -231,6 +252,25 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
+
+# Collects the identity of the run: the checked-out commit and the image of
+# the running MinIO container, which can differ from what the tag resolves
+# to when an older container is reused. Every step is checked, and a
+# missing value fails the run.
+collect_identity() {
+  local commit image_id digests
+  commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) && [ -n "${commit}" ] ||
+    fail "cannot read the checked-out commit"
+  docker ps --format '{{.Names}}' | grep -qx "${MINIO_CONTAINER}" ||
+    fail "container ${MINIO_CONTAINER} is not running"
+  image_id=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}") && [ -n "${image_id}" ] ||
+    fail "cannot read the image of container ${MINIO_CONTAINER}"
+  digests=$(docker inspect --format '{{join .RepoDigests ","}}' "${image_id}") ||
+    fail "cannot read the digests of image ${image_id}"
+  CHECKED_OUT_COMMIT="${commit}"
+  MINIO_IMAGE_ID="${image_id}"
+  MINIO_IMAGE_DIGESTS="${digests}"
+}
 collect_identity
 
 # Runs a MinIO client command in the network namespace of the server, so it
@@ -350,24 +390,78 @@ sql() {
 # One writer owns the stripe `first, first + WRITERS, ...` of the sequence
 # numbers and stops at the first statement that is not acknowledged, so the
 # stripe has at most one attempted but unacknowledged sequence number: the
-# write that was in flight at the kill.
+# write that was in flight at the kill. Every request is recorded with its
+# status code and the time it ended, and the exit of the writer with its
+# time, so the kill time can be compared against them.
 writer() {
   local cycle=$1 index=$2 seq=$3
-  local attempted="${RUN_DIR}/cycle-${cycle}/attempted-${index}.log"
-  local acked="${RUN_DIR}/cycle-${cycle}/acked-${index}.log"
-  local failed="${RUN_DIR}/cycle-${cycle}/failed-${index}.log"
-  local code
+  local dir="${RUN_DIR}/cycle-${cycle}"
+  local code end_ns
   while :; do
-    echo "${seq}" >> "${attempted}"
+    echo "${seq}" >> "${dir}/attempted-${index}.log"
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X POST "${SQL_URL}" \
       --data-urlencode "sql=INSERT INTO t VALUES (${seq}, ${seq})" || true)
+    end_ns=$(now_ns)
+    echo "${seq} ${code} ${end_ns}" >> "${dir}/requests-${index}.log"
     if [ "${code}" != "200" ]; then
-      echo "${seq} ${code}" >> "${failed}"
       break
     fi
-    echo "${seq}" >> "${acked}"
+    echo "${seq}" >> "${dir}/acked-${index}.log"
     seq=$((seq + WRITERS))
   done
+  now_ns > "${dir}/exit-${index}.log"
+}
+
+# Checks the requests of a cycle against the kill time: a dropped
+# connection counts as a write in flight at the kill only when it ended no
+# earlier than the kill, an earlier one is a transport failure, any other
+# status is a rejected insert, no acknowledgement may follow the kill, and
+# at least one writer must have been running at the kill. Prints the counts
+# for the manifest and fails the run on the first violation.
+check_kill() {
+  local cycle=$1 kill_ns=$2
+  python3 - "${cycle}" "${kill_ns}" "${WRITERS}" "${RUN_DIR}/cycle-${cycle}" <<'EOF' >> "${MANIFEST}" || fail "cycle ${cycle}: the writes around the kill are not consistent, see ${RUN_DIR}/cycle-${cycle}"
+import os
+import sys
+
+cycle_no, kill_ns, writers, cycle_dir = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+errors = []
+in_flight = 0
+running_at_kill = 0
+for index in range(writers):
+    requests_path = os.path.join(cycle_dir, f"requests-{index}.log")
+    exit_path = os.path.join(cycle_dir, f"exit-{index}.log")
+    if not os.path.exists(exit_path):
+        errors.append(f"writer {index} left no exit time")
+        continue
+    exit_ns = int(open(exit_path).read())
+    if exit_ns >= kill_ns:
+        running_at_kill += 1
+    requests = []
+    if os.path.exists(requests_path):
+        for line in open(requests_path):
+            if line.strip():
+                seq, code, end_ns = line.split()
+                requests.append((int(seq), code, int(end_ns)))
+    for seq, code, end_ns in requests:
+        if code == "200":
+            if end_ns > kill_ns:
+                errors.append(f"writer {index}: sequence {seq} acknowledged {end_ns - kill_ns}ns after the kill")
+        elif code == "000":
+            if end_ns < kill_ns:
+                errors.append(f"writer {index}: sequence {seq} lost its connection {kill_ns - end_ns}ns before the kill")
+            else:
+                in_flight += 1
+        else:
+            errors.append(f"writer {index}: sequence {seq} rejected with HTTP {code}")
+if running_at_kill == 0:
+    errors.append("no writer was running at the kill")
+
+for error in errors:
+    print(f"cycle={cycle_no} kill violation: {error}")
+print(f"cycle={cycle_no} kill_ns={kill_ns} in_flight={in_flight} writers_at_kill={running_at_kill}")
+sys.exit(1 if errors else 0)
+EOF
 }
 
 # Reads the table back and checks it against the acknowledged and attempted
@@ -459,6 +553,9 @@ for cycle in $(seq 1 "${CYCLES}"); do
   delay_ms=$(python3 -c "import random; print(random.randint(int(${KILL_MIN_SECS} * 1000), int(${KILL_MAX_SECS} * 1000)))")
   log "cycle ${cycle}: writing from sequence ${NEXT_SEQ}, SIGKILL in ${delay_ms}ms"
   sleep "$(python3 -c "print(${delay_ms} / 1000)")"
+  # Stamped just before the signal, so a request that ends in between counts
+  # as in flight rather than as a failure before the kill.
+  kill_ns=$(now_ns)
   kill -KILL "${SERVER_PID}"
   wait "${SERVER_PID}" 2>/dev/null || true
   # A writer exits zero only through its loop; anything else means its
@@ -471,6 +568,7 @@ for cycle in $(seq 1 "${CYCLES}"); do
     index=$((index + 1))
   done
   WRITER_PIDS=""
+  check_kill "${cycle}" "${kill_ns}"
 
   cycle_acked=0
   for index in $(seq 0 $((WRITERS - 1))); do
@@ -482,13 +580,6 @@ for cycle in $(seq 1 "${CYCLES}"); do
       sed -E "s/^/${cycle} ${index} /" "${CYCLE_DIR}/attempted-${index}.log" >> "${ATTEMPTED}"
     fi
   done
-  # A response other than a dropped connection came from a live server that
-  # rejected a valid insert.
-  rejected=$(cat "${CYCLE_DIR}"/failed-*.log 2>/dev/null | grep -vE ' 000$' || true)
-  if [ -n "${rejected}" ]; then
-    echo "${rejected}" >&2
-    fail "cycle ${cycle}: the server rejected inserts"
-  fi
   max_attempted=$(awk '{ if ($3 > max) max = $3 } END { print max + 0 }' "${ATTEMPTED}")
   NEXT_SEQ=$((max_attempted + 1))
   record "${cycle}" "kill_delay_ms=${delay_ms} acked=${cycle_acked}"
@@ -518,6 +609,7 @@ require_line() {
   fi
 }
 for cycle in $(seq 1 "${CYCLES}"); do
+  require_line "cycle ${cycle} kill" "^cycle=${cycle} kill_ns=[0-9]+ in_flight=[0-9]+ writers_at_kill=[1-9][0-9]*$"
   require_line "cycle ${cycle} acked" "^cycle=${cycle} kill_delay_ms=[0-9]+ acked=[0-9]+$"
   require_line "cycle ${cycle} restart wall time" "^cycle=${cycle} restart_wall_ms=[0-9]+$"
   require_line "cycle ${cycle} replay" "^cycle=${cycle} replay: Replay WAL for region: .* rows recovered: [0-9]+, replay from entry id: [0-9]+, last entry id: [0-9]+, .*elapsed: "
@@ -530,10 +622,14 @@ done
 collect_identity
 
 # The objects of a passed run are removed, and the removal is verified
-# before PASS is declared; a failed run keeps them as evidence.
-if [ "${#MISSING[@]}" -eq 0 ] && ! grep -qE '^(cycle=[0-9]+ violation|fail):' "${MANIFEST}"; then
+# before PASS is declared; a failed run keeps them as evidence. The final
+# manifest file was opened at the start, so the only way its write can
+# still fail is the disk itself, and then the manifest says the objects
+# were already removed.
+if [ "${#MISSING[@]}" -eq 0 ] && ! grep -qE '^(cycle=[0-9]+ (kill )?violation|fail):' "${MANIFEST}"; then
   mc_run "mc rm --recursive --force local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
   if REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
+    OBJECTS_REMOVED=yes
     echo "cleanup: root ${STORE_ROOT} removed and verified empty" >> "${MANIFEST}"
     RESULT=PASS
   else
