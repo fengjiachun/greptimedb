@@ -287,6 +287,12 @@ mod tests {
             datanode_wal_config,
             DatanodeWalConfig::ObjectStore(ObjectStoreWalConfig::default())
         );
+        let DatanodeWalConfig::ObjectStore(config) = &datanode_wal_config else {
+            unreachable!()
+        };
+        assert_eq!(config.prefix, "wal");
+        assert_eq!(config.flush_interval, Duration::from_secs(1));
+        assert_eq!(config.max_batch_bytes, ReadableSize::mb(8));
         assert!(matches!(
             MetasrvWalConfig::try_from(datanode_wal_config).unwrap_err(),
             Error::UnsupportedWalProvider { .. }

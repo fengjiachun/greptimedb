@@ -340,6 +340,7 @@ create_topic_timeout = "30s"
 
 ## The max size of a single producer batch.
 ## Warning: Kafka has a default limit of 1MB per message in a topic.
+## Defaults to `8MB` when the provider is `experimental_object_store`.
 ## **It's only used when the provider is `kafka` or `experimental_object_store`**.
 max_batch_bytes = "1MB"
 
