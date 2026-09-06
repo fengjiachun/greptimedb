@@ -101,7 +101,7 @@ Entry ids are assigned per region and are contiguous: when a batch admits entrie
 entry_id = object_seq << 20 | position_in_object   (position < 2^20, the batch seals earlier otherwise)
 ```
 
-This keeps two properties at once. Comparing `entry_id >> 20` with an object sequence answers "is everything in this object flushed" without consulting any index, which is what garbage collection and a future cross-node takeover need. And every entry still has a unique, strictly increasing id, so a flush that lands between two appends of the same region that ended up in the same object records exactly which entries it covered; replay from `flushed_entry_id` can never skip an unflushed entry or repeat a flushed one. A region's ids then have gaps wherever other regions or other positions took the sequence, exactly as Kafka offsets do, and Mito already tolerates gaps. The proposal does not change the object format, only the values written into the footer's entry id ranges, and it keeps `latest_entry_id` region-scoped.
+This keeps two properties at once. Comparing `entry_id >> 20` with an object sequence answers "is everything in this object flushed" without consulting any index, which is what garbage collection and a future cross-node takeover need. And every entry still has a unique, strictly increasing id, so a flush that lands between two appends of the same region that ended up in the same object records exactly which entries it covered; replay from `flushed_entry_id` can never skip an unflushed entry or repeat a flushed one. A region's ids then have gaps wherever other regions or other positions took the sequence, exactly as Kafka offsets do, and Mito already tolerates gaps. The proposal does not change the object layout. It changes the entry id values that are assigned, and those values are encoded in two places that must agree: in each record inside its segment and in the footer's entry id range for that segment. `latest_entry_id` stays region-scoped.
 
 ## Log store
 
@@ -111,7 +111,7 @@ This keeps two properties at once. Comparing `entry_id >> 20` with an object seq
 
 **Writing.** One background actor per store admits appended entries into a single open batch and assigns entry ids as described under *Entry ids* above. The batch is sealed when its estimated size reaches `max_batch_bytes` or when `flush_interval` elapses. The actor then encodes the batch and awaits its conditional create inline: no further command is admitted until that create has completed. Callers wait on a bounded command channel, so under load an append can queue behind several earlier uploads.
 
-*Proposed*: a pipelined uploader. The actor keeps admitting entries into the next batch while uploads are in flight, and up to a small fixed number of uploads run concurrently. Batches are acknowledged in sequence order: a batch whose object is durable is not acknowledged until every earlier batch is durable too, so a region's history can never acquire a hole in the middle. When an earlier batch fails permanently, it and every later batch whose object was not created fail together and their sequence numbers roll back. A later object that is already durable cannot be rolled back; in that case the store poisons itself and the entries of that object replay on the next restart, which is the same outcome as a crash between an object's creation and its acknowledgement, already tolerated by the engine.
+*Proposed*: a pipelined uploader. The actor keeps admitting entries into the next batch while uploads are in flight, and up to a small fixed number of uploads run concurrently. Batches are acknowledged in sequence order: a batch whose object is durable is not acknowledged until every earlier batch is durable too, so the acknowledged prefix of a region's history never has a missing predecessor. When an earlier batch fails permanently, it and every later batch whose object was not created fail together and their sequence numbers roll back. A later object that is already durable cannot be rolled back; in that case the store poisons itself. The guarantee is therefore about acknowledged history only: recovery indexes every object under the prefix, so after such a failure it replays the entries of that later object although the earlier batch is absent. Those entries were never acknowledged, and this is the same outcome as a crash between an object's creation and its acknowledgement, which the engine already tolerates.
 
 **Acknowledgement.** `append_batch` returns only after the object holding the entries is durable and indexed, so callers never see an entry id for an entry that is not durable. This is the only mode implemented.
 
@@ -219,13 +219,13 @@ Simpler catalog, but the number of requests scales with the number of regions in
 
 # Alignment with cluster mode
 
-Distributed mode is out of scope, but several decisions were taken so that the cluster design can build on this backend without a metadata migration. Except for the last bullet, these rest on the proposed changes above:
+Distributed mode is out of scope, but several decisions were taken so that the cluster design can build on this backend without a metadata migration. These rest on the proposed changes above:
 
 - *Proposed* object-sequence-major entry ids let a per-region flush watermark be compared with an object sequence directly. A cross-node takeover can therefore describe a region's WAL position as a chain of `(node prefix, first sequence, cutover sequence)` segments and replay them in order.
 - Both acknowledgement modes are defined here, one implemented and one *proposed*. Cluster mode is expected to run `enqueued` for latency-sensitive workloads; the object layout and the recovery path are identical in both modes.
 - Conflicting objects poison the store here because a standalone node has no coordinator. In cluster mode the datanode will carry a metasrv-issued generation in the object header so that a conditional-create conflict can be classified as a stale tail from an earlier generation, an idempotent retry of its own write, or a real second writer to be reported to the metasrv.
 - *Proposed* segment-level skipping with region marking lets cluster mode route the WAL hole event to the metasrv so that a follower or a takeover knows the region needs a fresh replica rather than a replay.
-- Garbage collection derives its watermark from each region's manifest `flushed_entry_id`, which Mito already hands to the store on region open; no additional persisted state is introduced.
+- *Proposed* garbage collection derives its watermark from each region's manifest `flushed_entry_id`. The handoff already exists: Mito hands that value to the store on region open, and the proposal introduces no additional persisted state.
 
 # Future work
 
