@@ -47,7 +47,7 @@ use crate::object_store_wal::catalog::ObjectCatalog;
 use crate::object_store_wal::format::{
     EncodedObject, FixedTrailer, FooterEntry, HEADER_LEN, Header, MIN_OBJECT_LEN, Record,
     TRAILER_LEN, decode_footer, decode_header, decode_segment, decode_trailer, encode_object,
-    footer_range,
+    footer_range, verify_segment_ranges,
 };
 use crate::object_store_wal::io::{ListedObject, ObjectStoreIo, PutResult};
 
@@ -56,8 +56,8 @@ const MIN_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Number of objects whose footers recovery fetches at a time.
 const RECOVERY_CONCURRENCY: usize = 8;
 /// Bytes recovery reads from the end of an object in one request. The window
-/// holds the trailer and the footer of an object with up to about 1600
-/// regions, so a second request for the footer is rare.
+/// holds the trailer and the footer of an object with up to 1364 regions of
+/// 48 bytes each, so a second request for the footer is rare.
 const RECOVERY_TAIL_WINDOW: usize = 64 * 1024;
 
 /// A [`LogStore`] that persists the entries of many regions as immutable
@@ -755,8 +755,9 @@ async fn fetch_footers(
 }
 
 /// Reads the header, trailer and footer of `object` and verifies them: the
-/// header must carry the sequence of the key, the trailer must be well formed
-/// and the footer must match the checksum the trailer holds.
+/// header must carry the sequence of the key, the trailer must be well formed,
+/// the footer must match the checksum the trailer holds and its segments must
+/// tile the object body.
 ///
 /// A short object is read whole. Otherwise the header and a window at the end
 /// of the object are read concurrently, and the footer is read separately only
@@ -817,7 +818,9 @@ async fn fetch_footer(io: &dyn WalObjectIo, object: &ListedObject) -> Result<Vec
         )
         .await?
     };
-    decode_footer(&footer, trailer).map_err(invalid)
+    let footer = decode_footer(&footer, trailer).map_err(invalid)?;
+    verify_segment_ranges(&footer, footer_range.start).map_err(invalid)?;
+    Ok(footer)
 }
 
 /// Verifies the header and trailer of the object `object_seq` of `object_len`
@@ -906,7 +909,7 @@ mod tests {
 
     use super::*;
     use crate::error::WalObjectStoreSnafu;
-    use crate::object_store_wal::format::decode_object;
+    use crate::object_store_wal::format::{FOOTER_ENTRY_LEN, decode_object};
 
     const PREFIX: &str = "datanodes/1/epochs/2";
     const WAIT: Duration = Duration::from_secs(30);
@@ -1932,6 +1935,66 @@ mod tests {
         );
     }
 
+    /// Overwrites the byte range of footer entry `index` and refreshes the
+    /// footer checksum, so the footer is intact but describes the wrong bytes.
+    fn rewrite_segment_range(bytes: &mut [u8], index: usize, offset: u64, len: u64) {
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let (trailer, _) = footer_of(bytes);
+        let footer = footer_range(trailer, bytes.len()).unwrap();
+        let entry = footer.start + 4 + index * FOOTER_ENTRY_LEN;
+        bytes[entry + 28..entry + 36].copy_from_slice(&offset.to_be_bytes());
+        bytes[entry + 36..entry + 44].copy_from_slice(&len.to_be_bytes());
+        let checksum = crc32fast::hash(&bytes[footer]);
+        bytes[trailer_start + 16..trailer_start + 20].copy_from_slice(&checksum.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_store_recovery_rejects_segment_ranges_that_do_not_tile_the_object() {
+        type Corrupt = fn(&mut Vec<u8>, &[FooterEntry]);
+        let cases: [(&str, Corrupt); 5] = [
+            ("overflows the object", |bytes, footer| {
+                rewrite_segment_range(bytes, 0, u64::MAX, footer[0].segment_len);
+            }),
+            ("invalid segment range", |bytes, footer| {
+                let second = &footer[1];
+                rewrite_segment_range(bytes, 1, second.segment_offset + 1, second.segment_len);
+            }),
+            ("invalid segment range", |bytes, footer| {
+                let second = &footer[1];
+                rewrite_segment_range(bytes, 1, second.segment_offset - 1, second.segment_len);
+            }),
+            ("invalid segment range", |bytes, footer| {
+                let second = &footer[1];
+                rewrite_segment_range(bytes, 1, second.segment_offset, second.segment_len + 1);
+            }),
+            ("segments end at", |bytes, footer| {
+                let second = &footer[1];
+                rewrite_segment_range(bytes, 1, second.segment_offset, second.segment_len - 1);
+            }),
+        ];
+        for (reason, corrupt) in cases {
+            let object_store = memory_store();
+            populate(&object_store, 2, 3).await;
+            let path = object_path(&object_store, 1);
+            corrupt_object(&object_store, &path, |bytes| {
+                let (_, footer) = footer_of(bytes);
+                assert_eq!(2, footer.len());
+                corrupt(bytes, &footer);
+                // The footer itself still verifies.
+                footer_of(bytes);
+            })
+            .await;
+
+            let error = ObjectStoreLogStore::try_new(object_store.clone(), &eager())
+                .await
+                .unwrap_err();
+            assert_invalid_object(&error, &path, reason);
+            let io = ObjectStoreIo::new(object_store, PREFIX).unwrap();
+            let error = recover_by_decoding(&io).await.unwrap_err();
+            assert_invalid_object(&error, &path, reason);
+        }
+    }
+
     #[tokio::test]
     async fn test_store_corrupted_segment_fails_the_read_that_decodes_it() {
         let object_store = memory_store();
@@ -2065,7 +2128,7 @@ mod tests {
     #[tokio::test]
     async fn test_store_recovery_fetches_a_footer_longer_than_the_tail_window() {
         let object_store = memory_store();
-        let regions = (RECOVERY_TAIL_WINDOW / 40 + 100) as u32;
+        let regions = (RECOVERY_TAIL_WINDOW / FOOTER_ENTRY_LEN + 100) as u32;
         let store = open(object_store.clone(), &eager()).await;
         let wide_entries = (1..=regions)
             .map(|number| entry(&store, region(number), "wide"))

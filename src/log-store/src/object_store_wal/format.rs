@@ -34,7 +34,9 @@ pub(super) const HEADER_LEN: usize = 8 + 2 + 8 + 16;
 /// object CRC32 and magic.
 pub(super) const TRAILER_LEN: usize = 8 + 8 + 4 + 4 + 8;
 const SEGMENT_HEADER_LEN: usize = 8 + 4;
-const FOOTER_ENTRY_LEN: usize = 8 + 8 + 8 + 4 + 8 + 8 + 4;
+/// Length of one footer entry: region id, entry id range, entry count, segment
+/// offset, segment length and segment CRC32.
+pub(super) const FOOTER_ENTRY_LEN: usize = 8 + 8 + 8 + 4 + 8 + 8 + 4;
 
 /// Header of a WAL object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,6 +453,44 @@ pub(super) fn footer_range(trailer: FixedTrailer, object_len: usize) -> Result<R
     Ok(footer_start..footer_end)
 }
 
+/// Checks that the segments `footer` describes tile the object body: the first
+/// starts right after the header, each follows the previous one without a gap
+/// or overlap, and the last ends where the footer at `footer_start` begins.
+pub(super) fn verify_segment_ranges(footer: &[FooterEntry], footer_start: usize) -> Result<()> {
+    let mut expected_offset = HEADER_LEN;
+    for entry in footer {
+        let start = to_usize(entry.segment_offset, "segment offset")?;
+        let len = to_usize(entry.segment_len, "segment length")?;
+        let end = start
+            .checked_add(len)
+            .with_context(|| CorruptedWalObjectSnafu {
+                reason: format!(
+                    "segment range {start}..{len} of region {} overflows the object",
+                    entry.region_id
+                ),
+            })?;
+        ensure!(
+            start == expected_offset && end <= footer_start,
+            CorruptedWalObjectSnafu {
+                reason: format!(
+                    "invalid segment range {start}..{end} of region {}, expected {expected_offset}..{footer_start}",
+                    entry.region_id
+                ),
+            }
+        );
+        expected_offset = end;
+    }
+    ensure!(
+        expected_offset == footer_start,
+        CorruptedWalObjectSnafu {
+            reason: format!(
+                "invalid segment range, segments end at {expected_offset}, footer starts at {footer_start}"
+            ),
+        }
+    );
+    Ok(())
+}
+
 /// Decodes a whole object, verifying every checksum and byte range. Recovery
 /// reads only the header, trailer and footer, so this is the reference
 /// decoder that tests check the store against.
@@ -476,40 +516,14 @@ pub(super) fn decode_object(bytes: &[u8]) -> Result<DecodedObject> {
             reason: "object has no records",
         }
     );
+    verify_segment_ranges(&footer, footer_start)?;
 
     let mut records = Vec::new();
-    let mut expected_offset = HEADER_LEN;
     for entry in &footer {
-        let start = to_usize(entry.segment_offset, "segment offset")?;
-        let len = to_usize(entry.segment_len, "segment length")?;
-        let end = start
-            .checked_add(len)
-            .with_context(|| CorruptedWalObjectSnafu {
-                reason: format!(
-                    "segment range {start}..{len} of region {} overflows the object",
-                    entry.region_id
-                ),
-            })?;
-        ensure!(
-            start == expected_offset && end <= footer_start,
-            CorruptedWalObjectSnafu {
-                reason: format!(
-                    "invalid segment range {start}..{end} of region {}, expected {expected_offset}..{footer_start}",
-                    entry.region_id
-                ),
-            }
-        );
+        let start = entry.segment_offset as usize;
+        let end = start + entry.segment_len as usize;
         records.extend(decode_segment(&bytes[start..end], entry)?);
-        expected_offset = end;
     }
-    ensure!(
-        expected_offset == footer_start,
-        CorruptedWalObjectSnafu {
-            reason: format!(
-                "invalid segment range, segments end at {expected_offset}, footer starts at {footer_start}"
-            ),
-        }
-    );
     let checksum = object_crc32(&bytes[..trailer_start], trailer);
     ensure!(
         checksum == trailer.object_crc32,
