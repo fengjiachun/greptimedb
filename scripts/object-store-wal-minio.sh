@@ -17,7 +17,9 @@
 # MinIO server started in Docker and prints a manifest of the run.
 #
 # The script reuses a running MinIO container, empties the bucket before the
-# test, and exports the `GT_S3_*` environment the S3-backed tests expect.
+# test and fails unless it is empty, exports the `GT_S3_*` environment the
+# S3-backed tests expect, and fails unless the test log carries every field
+# of the manifest.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${0}")" >/dev/null 2>&1 && pwd)
@@ -61,14 +63,26 @@ for _ in $(seq 1 60); do
 done
 curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
 
-# The client runs in the network namespace of the server, so it reaches it
-# without host networking.
+# Runs a MinIO client command in the network namespace of the server, so it
+# reaches it without host networking.
+mc_run() {
+  docker run --rm --network "container:${MINIO_CONTAINER}" --entrypoint sh "${MC_IMAGE}" -c "
+    mc alias set local http://127.0.0.1:9000 '${MINIO_ACCESS_KEY_ID}' '${MINIO_ACCESS_KEY}' >/dev/null &&
+    $*
+  "
+}
+
 log "creating bucket ${MINIO_BUCKET} and removing its objects"
-docker run --rm --network "container:${MINIO_CONTAINER}" --entrypoint sh "${MC_IMAGE}" -c "
-  mc alias set local http://127.0.0.1:9000 '${MINIO_ACCESS_KEY_ID}' '${MINIO_ACCESS_KEY}' >/dev/null &&
-  mc mb --ignore-existing local/${MINIO_BUCKET} >/dev/null &&
-  (mc rm --recursive --force local/${MINIO_BUCKET} >/dev/null 2>&1 || true)
-"
+mc_run "mc mb --ignore-existing local/${MINIO_BUCKET}" >/dev/null
+# Removing from an empty bucket reports an error, so the outcome is checked
+# by listing the bucket instead of by the exit status of the removal.
+mc_run "mc rm --recursive --force local/${MINIO_BUCKET}" >/dev/null 2>&1 || true
+REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}")
+if [ -n "${REMAINING}" ]; then
+  log "bucket ${MINIO_BUCKET} still holds objects:"
+  echo "${REMAINING}" >&2
+  exit 1
+fi
 
 export GT_S3_BUCKET="${MINIO_BUCKET}"
 export GT_S3_ACCESS_KEY_ID="${MINIO_ACCESS_KEY_ID}"
@@ -84,18 +98,50 @@ cargo nextest run -p tests-integration --test main \
 STATUS=${PIPESTATUS[0]}
 set -e
 
-if [ "${STATUS}" -eq 0 ]; then
+# The manifest is evidence, so every field it reports must be present in
+# the log; a missing field fails the run even when the test passed.
+MISSING=()
+require_line() {
+  if ! grep -qE "${2}" "${LOG_FILE}"; then
+    MISSING+=("${1}")
+  fi
+}
+for phase in before-writes after-writes after-restart-1 after-flush after-restart-2; do
+  require_line "phase ${phase}" "object_store_wal phase=${phase} objects=[0-9]+ bytes=[0-9]+"
+done
+for restart in 1 2; do
+  require_line "restart ${restart}" "object_store_wal restart=${restart} wall_ms=[0-9]+"
+done
+# The datanode opens regions once per instance: the first build and two restarts.
+OPEN_PATTERN='Opened [0-9]+ regions in [^[:space:]]+'
+OPENED=$(grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true)
+if [ "${OPENED}" -lt 3 ]; then
+  MISSING+=("region open timings (found ${OPENED}, expected 3)")
+fi
+
+if [ "${STATUS}" -eq 0 ] && [ "${#MISSING[@]}" -eq 0 ]; then
   RESULT=PASS
 else
   RESULT=FAIL
+  STATUS=1
 fi
+
+# The image is the one the container runs, which can differ from what the
+# tag resolves to when an older container is reused.
+MINIO_IMAGE_ID=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}")
+MINIO_IMAGE_DIGESTS=$(docker inspect --format '{{join .RepoDigests ","}}' "${MINIO_IMAGE_ID}")
 
 echo
 echo "== object store WAL MinIO manifest =="
+# The commit checked out while the script ran.
 echo "base commit: $(git -C "${ROOT_DIR}" rev-parse HEAD)"
-echo "minio image: ${MINIO_IMAGE} ($(docker inspect --format '{{.Id}}' "${MINIO_IMAGE}"))"
+echo "minio image: ${MINIO_IMAGE_ID} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
 echo "bucket: ${MINIO_BUCKET} at ${GT_S3_ENDPOINT_URL}"
-grep -E 'object_store_wal (phase|restart)=' "${LOG_FILE}" | sed -E 's/.*object_store_wal //' || true
-grep -E 'Opened [0-9]+ regions in' "${LOG_FILE}" | sed -E 's/.*(Opened [0-9]+ regions in [^ ]+).*/replay: \1/' || true
+grep -oE 'object_store_wal (phase|restart)=[^"]*' "${LOG_FILE}" | sed -E 's/^object_store_wal //' || true
+grep -oE "${OPEN_PATTERN}" "${LOG_FILE}" | sed -E 's/^/replay: /' || true
+for field in ${MISSING[@]+"${MISSING[@]}"}; do
+  echo "missing: ${field}"
+done
+echo "test exit status: ${STATUS}"
 echo "result: ${RESULT}"
 exit "${STATUS}"
