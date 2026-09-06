@@ -136,28 +136,40 @@ impl Datanode {
         self.services = services;
     }
 
+    /// Shuts down every component in order. A failed step does not skip the
+    /// later ones; the first error is returned and the rest are logged.
     pub async fn shutdown(&mut self) -> Result<()> {
-        self.services
-            .shutdown_all()
-            .await
-            .context(ShutdownServerSnafu)?;
+        let mut first_error = None;
+        record_shutdown_error(
+            &mut first_error,
+            self.services
+                .shutdown_all()
+                .await
+                .context(ShutdownServerSnafu),
+        );
 
         let _ = self.greptimedb_telemetry_task.stop().await;
         if let Some(heartbeat_task) = &self.heartbeat_task {
-            heartbeat_task
-                .close()
-                .map_err(BoxedError::new)
-                .context(ShutdownInstanceSnafu)?;
+            record_shutdown_error(
+                &mut first_error,
+                heartbeat_task
+                    .close()
+                    .map_err(BoxedError::new)
+                    .context(ShutdownInstanceSnafu),
+            );
         }
-        self.region_server.stop().await?;
+        record_shutdown_error(&mut first_error, self.region_server.stop().await);
         if let Some(log_store) = &self.object_store_log_store {
-            log_store
-                .stop()
-                .await
-                .map_err(BoxedError::new)
-                .context(ShutdownInstanceSnafu)?;
+            record_shutdown_error(
+                &mut first_error,
+                log_store
+                    .stop()
+                    .await
+                    .map_err(BoxedError::new)
+                    .context(ShutdownInstanceSnafu),
+            );
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn region_server(&self) -> RegionServer {
@@ -720,7 +732,6 @@ impl DatanodeBuilder {
         Ok(mito_engine)
     }
 
-    /// Builds [`ObjectStoreLogStore`].
     async fn build_object_store_log_store(
         object_store: ObjectStore,
         config: &ObjectStoreWalConfig,
@@ -781,6 +792,17 @@ impl DatanodeBuilder {
     }
 }
 
+/// Keeps the first shutdown error and logs the later ones.
+fn record_shutdown_error(first_error: &mut Option<error::Error>, result: Result<()>) {
+    if let Err(err) = result {
+        if first_error.is_none() {
+            *first_error = Some(err);
+        } else {
+            warn!(err; "Ignored a later shutdown error");
+        }
+    }
+}
+
 /// Rejects an object store WAL config the log store cannot run on.
 fn validate_object_store_wal_config(config: &ObjectStoreWalConfig) -> Result<()> {
     let prefix = config.prefix.trim();
@@ -800,7 +822,6 @@ fn validate_object_store_wal_config(config: &ObjectStoreWalConfig) -> Result<()>
             reason: "must be a relative path",
         }
     );
-    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
     ensure!(
         !prefix
             .split('/')
@@ -1002,7 +1023,7 @@ mod tests {
 
     use crate::config::{DatanodeOptions, StorageConfig};
     use crate::datanode::{DatanodeBuilder, wal_object_store};
-    use crate::error::Error;
+    use crate::error::{self, Error};
     use crate::tests::{MockRegionEngine, mock_region_server};
 
     async fn setup_table_datanode(kv: &KvBackendRef) {
@@ -1173,6 +1194,13 @@ mod tests {
             ),
             (
                 ObjectStoreWalConfig {
+                    prefix: "wal/".to_string(),
+                    ..Default::default()
+                },
+                "prefix",
+            ),
+            (
+                ObjectStoreWalConfig {
                     flush_interval: Duration::from_millis(999),
                     ..Default::default()
                 },
@@ -1188,14 +1216,20 @@ mod tests {
         ];
 
         for (config, expected_field) in cases {
+            let expected_value = match expected_field {
+                "prefix" => config.prefix.clone(),
+                "flush_interval" => format!("{:?}", config.flush_interval),
+                _ => config.max_batch_bytes.to_string(),
+            };
             let data_home = create_temp_dir("object-store-wal-invalid-config");
             let builder = object_store_wal_builder(data_home.path().to_str().unwrap(), config);
             let err = build_err(builder).await;
 
-            let Error::InvalidObjectStoreWalConfig { field, .. } = &err else {
+            let Error::InvalidObjectStoreWalConfig { field, value, .. } = &err else {
                 panic!("unexpected error for {expected_field}: {err:?}");
             };
             assert_eq!(*field, expected_field);
+            assert_eq!(*value, expected_value);
             assert_eq!(StatusCode::InvalidArguments, err.status_code());
             // The builder stops before it creates any storage or log store.
             assert!(is_empty_dir(data_home.path()));
@@ -1284,6 +1318,33 @@ mod tests {
         assert!(!is_stopped(&log_store).await);
 
         datanode.shutdown().await.unwrap();
+        assert!(is_stopped(&log_store).await);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_stops_object_store_log_store_after_region_server_failure() {
+        common_telemetry::init_default_ut_logging();
+        let data_home = create_temp_dir("object-store-wal-shutdown-failure");
+        let builder = object_store_wal_builder(
+            data_home.path().to_str().unwrap(),
+            ObjectStoreWalConfig::default(),
+        );
+        let mut datanode = builder.build().await.unwrap();
+        let log_store = datanode.object_store_log_store.clone().unwrap();
+        // Stopping the region server fails on this engine.
+        let (engine, _) = MockRegionEngine::with_custom_apply_fn("failing", |engine| {
+            engine.handle_stop_mock_fn = Some(Box::new(|| {
+                error::UnexpectedSnafu {
+                    violated: "stop failed",
+                }
+                .fail()
+            }));
+        });
+        datanode.region_server().register_engine(engine);
+
+        let err = datanode.shutdown().await.unwrap_err();
+
+        assert_matches!(err, Error::StopRegionEngine { .. });
         assert!(is_stopped(&log_store).await);
     }
 
