@@ -7,7 +7,9 @@ Author: jeremyhi
 
 # Summary
 
-Add an object store backed write-ahead log as a first-class WAL provider, alongside Raft Engine and Kafka. A datanode batches the entries of all its regions into immutable objects under one prefix, creates each object conditionally under a monotonically increasing sequence number, and acknowledges a write only after the object holding it is durable. Recovery lists the objects, rebuilds an in-memory catalog from their footers, and replays each region from its own segments. The provider is standalone-only and marked experimental in this RFC; the persisted metadata and object format are designed so that lifting either restriction later does not require a migration.
+Add an object store backed write-ahead log as a first-class WAL provider, alongside Raft Engine and Kafka. A datanode batches the entries of all its regions into immutable objects under one prefix, creates each object conditionally under a monotonically increasing sequence number, and acknowledges a write only after the object holding it is durable. Recovery lists the objects, rebuilds an in-memory catalog from them, and replays each region from its own segments. The provider is standalone-only and marked experimental in this RFC; the persisted metadata and object format are designed so that lifting either restriction later does not require a migration.
+
+This document describes two things and keeps them apart: what the implementation does today, and what is proposed on top of it. Every paragraph that describes proposed behaviour is introduced with the word *Proposed*; everything else describes the current code.
 
 # Motivation
 
@@ -16,14 +18,14 @@ GreptimeDB already stores data files in object storage. The WAL is the last comp
 - Raft Engine ties the node to a persistent volume. Losing the volume loses unflushed writes; moving the node means moving the volume.
 - Kafka is an operational dependency of its own, with topics, retention and a broker fleet to size, and it is disproportionate for a single node.
 
-Object storage is already provisioned, already durable across zones, and already the place the rest of the data lives. An object store WAL lets a standalone node run with no local state that must survive a restart: on a new machine, point it at the same bucket and prefix and it replays. The cost is write latency in the hundreds of milliseconds, which is acceptable for the ingestion patterns GreptimeDB targets when writes are batched, and which the design keeps bounded by a single flush interval plus one PUT.
+Object storage is already provisioned, already durable across zones, and already the place the rest of the data lives. An object store WAL lets a standalone node run with no local state that must survive a restart: on a new machine, point it at the same bucket and prefix and it replays. The cost is write latency: a write waits for its batch to seal, for earlier uploads to finish, and for one PUT. That is acceptable for the ingestion patterns GreptimeDB targets when writes are batched.
 
 # Goals
 
 - A WAL provider that needs nothing but an object store and a prefix.
 - Exactly-once replay of acknowledged writes across graceful and ungraceful restarts.
 - Region isolation: many regions share objects, but a region only ever replays its own entries.
-- Recovery that never silently loses data: structural damage or a conflicting object stops the node; a corrupted segment is skipped at segment granularity only when configured to, and the affected region is marked and counted.
+- Recovery that never silently loses data. Today any corruption fails the node. *Proposed*: a corrupted segment is skipped at segment granularity only when configured to, and the affected region is marked and counted.
 - Default behaviour of the existing providers unchanged; the new provider is opt-in through configuration.
 
 # Non-goals
@@ -65,9 +67,11 @@ header | segment(region 1) | ... | segment(region N) | footer | trailer
 - The footer records, per segment, the region id, the entry id range, the entry count, the byte range and a CRC32 of the segment.
 - The fixed-size trailer carries the magic `GTWALTRL`, the footer location, a CRC32 of the footer and a CRC32 of the whole object. A reader locates the footer by reading the trailer at the end of the object and can decode a single region's segment without touching the others.
 
-Corruption is handled at two levels. Structural damage, meaning a trailer or footer that cannot be decoded, a version the reader does not know, or a header sequence that does not match the key, fails recovery: nothing can be trusted about such an object and continuing would only widen the damage. A segment whose CRC does not match is a data-level failure confined to one region; a read is retried once to rule out a truncated download, and then the behaviour follows `on_corrupted_segment`: `skip` (the default) skips that segment, records a WAL hole for the region with the object key and entry range, increments a metric and logs a warning, while every other region in the object replays normally; `fail` stops the node. Skipping loses only the unflushed entries of that region in that object; nothing already flushed is affected, and the loss is reported rather than hidden. The format is frozen at version 1; a compatibility fixture will pin it.
+Any corruption fails recovery today. The decoder verifies the trailer magic, the format version, the header sequence against the key, the footer CRC, that the segment byte ranges tile the object body exactly, every segment CRC and the whole-object CRC; the first object that fails any of these checks fails construction of the store, and a segment that fails its CRC on the read path fails that read. The format is frozen at version 1; a compatibility fixture will pin it.
 
-Object keys are the prefix followed by the zero-padded sequence number and a fixed suffix. Listing accepts only well-formed keys and returns them in sequence order.
+*Proposed*: corruption is handled at two levels. Structural damage, meaning a trailer, footer or header that cannot be decoded, a version the reader does not know, a header sequence that does not match the key, or segment ranges that do not tile the body, keeps failing recovery: nothing can be trusted about such an object. A segment whose CRC does not match becomes a data-level failure confined to one region: the read is retried once to rule out a truncated download, then the behaviour follows `on_corrupted_segment`. `skip` (the proposed default) skips that segment, records a WAL hole for the region with the object key and entry range, increments a metric and logs a warning, while every other region in the object replays normally; `fail` stops the node. Skipping loses only the unflushed entries of that region in that object; nothing already flushed is affected, and the loss is reported rather than hidden. Under this proposal the whole-object CRC is no longer a recovery requirement, since a bad segment would fail it by construction; the footer CRC and the per-segment CRCs carry the verification, and the whole-object CRC stays in the trailer as a fixture-level check so the format does not change.
+
+Object keys are `<prefix>/objects/<sequence>.wal`, where the sequence is zero-padded to 20 decimal digits; with prefix `wal` the first object is `wal/objects/00000000000000000000.wal`. Listing accepts only well-formed keys under `<prefix>/objects/` and returns them in sequence order.
 
 ## Catalog
 
@@ -87,25 +91,31 @@ Deterministic encoding is what makes the middle row decidable.
 
 ## Entry ids
 
-Entry ids are object-sequence-major: the high bits are the sequence number of the object that holds the entry, the low bits are the entry's position among that region's entries inside the object.
+Entry ids are assigned per region and are contiguous: when a batch admits entries of a region, each entry receives the region's previous id plus one, independently of the object sequence. A region's ids therefore have no gaps, and the object sequence cannot be derived from an entry id without the catalog.
+
+`latest_entry_id(provider)` is region-scoped: the highest entry id durable under the prefix for the provider's region, or zero when the region has none. A freshly created region therefore starts at zero even if other regions under the prefix have entries. This differs from Kafka, whose high watermark is per topic; it is sufficient here because ids are per region, and Mito consumes the value only for the region that asked.
+
+*Proposed*: entry ids become object-sequence-major. The high bits are the sequence number of the object that holds the entry, the low bits are the entry's position among that region's entries inside the object:
 
 ```text
 entry_id = object_seq << 20 | position_in_object   (position < 2^20, the batch seals earlier otherwise)
 ```
 
-This keeps two properties at once. Comparing `entry_id >> 20` with an object sequence answers "is everything in this object flushed" without consulting any index, which is what garbage collection and a future cross-node takeover need. And every entry still has a unique, strictly increasing id, so a flush that lands between two appends of the same region that ended up in the same object records exactly which entries it covered; replay from `flushed_entry_id` can never skip an unflushed entry or repeat a flushed one. A region's ids have gaps wherever other regions or other positions took the sequence, exactly as Kafka offsets do, and Mito already tolerates gaps.
-
-`latest_entry_id(provider)` is the highest entry id durable under the prefix for any region, the counterpart of Kafka's topic high watermark; it is what a fresh region takes as its initial flushed entry id so that replay starts after everything that existed when the region was created.
+This keeps two properties at once. Comparing `entry_id >> 20` with an object sequence answers "is everything in this object flushed" without consulting any index, which is what garbage collection and a future cross-node takeover need. And every entry still has a unique, strictly increasing id, so a flush that lands between two appends of the same region that ended up in the same object records exactly which entries it covered; replay from `flushed_entry_id` can never skip an unflushed entry or repeat a flushed one. A region's ids then have gaps wherever other regions or other positions took the sequence, exactly as Kafka offsets do, and Mito already tolerates gaps. The proposal does not change the object format, only the values written into the footer's entry id ranges, and it keeps `latest_entry_id` region-scoped.
 
 ## Log store
 
 `ObjectStoreLogStore` implements the `LogStore` trait for `Provider::ObjectStore`.
 
-**Construction and recovery.** The prefix, flush interval and batch size are validated, then the store lists the prefix, decodes each object, rebuilds the catalog, resumes the sequence number and records the largest accepted entry id per region. The first corrupted or conflicting object fails construction.
+**Construction and recovery.** The prefix, flush interval and batch size are validated, then the store lists the prefix, fetches and decodes each object in sequence order, rebuilds the catalog, resumes the sequence number and records the largest accepted entry id per region. The first corrupted or conflicting object fails construction. Recovery is serial and reads whole objects; fetching only trailers and footers with bounded concurrency is listed under *Future work*.
 
-**Writing.** One background actor per store admits appended entries into an open batch and assigns entry ids as described under *Entry ids* above. The batch is sealed when it reaches `max_batch_bytes` or when `flush_interval` elapses, encoded, and handed to an uploader; the actor keeps admitting entries into the next batch while uploads are in flight, and up to a small fixed number of uploads may run concurrently. Batches are acknowledged in sequence order: a batch whose object is durable is not acknowledged until every earlier batch is durable too, so a region's history can never acquire a hole in the middle. When an earlier batch fails permanently, it and every later in-flight batch fail together and their sequence numbers roll back.
+**Writing.** One background actor per store admits appended entries into a single open batch and assigns entry ids as described under *Entry ids* above. The batch is sealed when its estimated size reaches `max_batch_bytes` or when `flush_interval` elapses. The actor then encodes the batch and awaits its conditional create inline: no further command is admitted until that create has completed. Callers wait on a bounded command channel, so under load an append can queue behind several earlier uploads.
 
-**Acknowledgement modes.** `ack_mode = "durable"` (the default in this RFC) returns from `append_batch` only after the object holding the entries is durable and indexed, so callers never see an entry id for an entry that is not durable. `ack_mode = "enqueued"` returns as soon as the entries are admitted, with their entry ids already assigned; the object is uploaded in the background. In that mode the recovery point objective is the unpersisted backlog, bounded by `max_unpersisted_bytes` and `max_unpersisted_age`: when either bound is reached, admission stalls until an upload completes; nothing is dropped and nothing is acknowledged early. The durable mode is the default because a write-ahead log is expected to mean durability on return; whether the enqueued mode should become the default is decided on the crash-gate and benchmark results rather than assumed.
+*Proposed*: a pipelined uploader. The actor keeps admitting entries into the next batch while uploads are in flight, and up to a small fixed number of uploads run concurrently. Batches are acknowledged in sequence order: a batch whose object is durable is not acknowledged until every earlier batch is durable too, so a region's history can never acquire a hole in the middle. When an earlier batch fails permanently, it and every later batch whose object was not created fail together and their sequence numbers roll back. A later object that is already durable cannot be rolled back; in that case the store poisons itself and the entries of that object replay on the next restart, which is the same outcome as a crash between an object's creation and its acknowledgement, already tolerated by the engine.
+
+**Acknowledgement.** `append_batch` returns only after the object holding the entries is durable and indexed, so callers never see an entry id for an entry that is not durable. This is the only mode implemented.
+
+*Proposed*: an `ack_mode` option. `durable` keeps the behaviour above and stays the default, because a write-ahead log is expected to mean durability on return. `enqueued` returns from `append_batch` as soon as the entries are admitted, with their entry ids already assigned, and uploads the object in the background. In that mode the recovery point objective is the unpersisted backlog, bounded by `max_unpersisted_bytes` and `max_unpersisted_age`: when either bound is reached, admission stalls until an upload completes, so nothing is dropped and the backlog cannot grow without limit. Its failure contract differs from the durable one: a permanent upload failure can no longer be reported to a caller that has already returned, so it poisons the store, and `stop` uploads the remaining backlog before returning. Whether `enqueued` should become the default is decided on the crash-gate and benchmark results rather than assumed.
 
 **Failure matrix.**
 
@@ -115,9 +125,9 @@ This keeps two properties at once. Comparing `entry_id >> 20` with an object seq
 | transient I/O error | unchanged | fail; entry ids roll back to the durable watermark so a retry writes the same object | healthy |
 | conflicting object | unchanged | fail | poisoned |
 | encoding or catalog error | unchanged | fail | poisoned |
-| object sequence exhausted | unchanged | every pending waiter fails immediately | poisoned |
+| create succeeds at the last representable sequence | cannot advance | acknowledged | poisoned: no later batch can be allocated a sequence, every later append fails |
 
-A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are surfaced to the caller rather than retried inside the store: the engine already owns write retries, and a store-level retry would only hide the latency.
+A store cannot be constructed on a prefix whose largest object already carries the maximum sequence. A poisoned store fails every `LogStore` operation except `stop` with the same terminal error; in particular `obsolete` can no longer move a watermark. Transient errors are surfaced to the caller rather than retried inside the store: the engine already owns write retries, and a store-level retry would only hide the latency.
 
 **Stopping.** `stop` is idempotent and awaits the actor. A create that is already in flight runs to completion and, if it succeeds, acknowledges its now-durable entries; entries that never became durable receive a stopped error, including a batch whose in-flight create fails after stop began. Once stop has begun, queued appends are not admitted and no timer or seal triggered flush starts. Appends after stop, including empty ones, fail with the stopped error.
 
@@ -137,18 +147,29 @@ Configuration is validated before any store or engine exists: the prefix must be
 
 ## Configuration
 
+The options accepted today:
+
 ```toml
 [wal]
 provider = "experimental_object_store"
 # Name of a configured storage provider; empty selects the default store.
 storage_provider = ""
 prefix = "wal"
+# How long a batch may stay open before it is sealed; at least 1s.
 flush_interval = "1s"
-# Upper bound of one object. Object stores bill per request, and the
-# cost-effective request size is 8 to 16 MiB; write latency is governed
-# by flush_interval, not by this bound.
+# Estimated batch size at which the open batch is sealed. It is a
+# threshold, not an upper bound: a single append larger than this is
+# admitted whole, and object framing adds bytes on top. Object stores
+# bill per request, and the cost-effective request size is 8 to 16 MiB.
 max_batch_bytes = "8MB"
-# "durable": append returns after the object is durable.
+```
+
+`config/config.md` is generated from the example files.
+
+*Proposed* additions, not accepted by the current configuration:
+
+```toml
+# "durable": append returns after the object is durable (the default).
 # "enqueued": append returns on admission; the unpersisted backlog is
 # bounded by the two limits below and admission stalls at the bound.
 ack_mode = "durable"
@@ -159,8 +180,6 @@ max_unpersisted_age = "8s"
 on_corrupted_segment = "skip"
 ```
 
-`config/config.md` is generated from the example files.
-
 ## Compatibility
 
 - `WalOptions::ObjectStore` is a new persisted variant. Existing `raft_engine`, `kafka` and `noop` options decode unchanged; a region's options never change provider implicitly.
@@ -169,18 +188,19 @@ on_corrupted_segment = "skip"
 
 ## Evidence
 
-The implementation on the proof-of-concept branch was accepted on the following evidence (entry ids were still per-region contiguous at that point; the object-sequence-major scheme replaces them without changing the object format):
+The implementation was accepted on the following evidence, all of it reproducible from this repository:
 
 - Deterministic recovery tests on a real `ObjectStoreLogStore` over an in-memory object store: two regions sharing a prefix with only one flushed, an abrupt drop after an object is durable but before any flush, a prefix mismatch on reopen, reopening on an empty prefix, and two consecutive restarts with writes and a flush between them. Each asserts the concrete flushed, replayed, manifest and latest entry ids and row-level scan equality.
 - A standalone round trip against MinIO: five write batches produce five objects; a restart without flushing replays 20 rows from entry 1; after a flush a second restart replays nothing; rows are identical after each restart; restart wall time around 120 ms. The run is reproduced by `scripts/object-store-wal-minio.sh`, whose manifest fails if any measurement is missing.
-- Unit coverage of every corruption class, the catalog invariants, the conditional create outcomes, every row of the failure matrix, every stop path including in-flight creates that succeed, fail transiently or conflict after stop began, and entry id exhaustion.
-- A process-level crash gate: eight concurrent writers, SIGKILL at a random point of a 2 to 6 second window, restart on the same bucket, five cycles per run with replay accumulating; three runs, every acknowledged row present exactly once, no duplicates, no unacknowledged row surviving. Reproduced by `scripts/object-store-wal-crash-gate.sh`.
+- Unit coverage of every corruption class, the catalog invariants, the conditional create outcomes, every row of the failure matrix, every stop path including in-flight creates that succeed, fail transiently or conflict after stop began, and sequence exhaustion.
+
+A process-level crash gate (concurrent writers, SIGKILL at a random point of a window, restart on the same bucket, repeated cycles with replay accumulating) is delivered as a separate change with its own script and manifest. Its results are not part of the evidence above and are reported with that change.
 
 # Alternatives
 
 ## A generic external provider injected from outside the repository
 
-An earlier approach kept the object store WAL outside the main crates and injected it through an `ExternalProvider` and a `resolve_provider` hook on the `LogStore` trait. It avoided touching the four enums, but every resolution path then had to special-case an opaque provider, distributed rejection had to be enforced by convention, and nothing in the repository could test the backend. Making the provider a first-class variant removed the hook, made every match exhaustive, and let the engine tests run against the real store.
+The backend could stay outside the main crates and be injected through an opaque provider variant plus a resolution hook on the `LogStore` trait. That avoids touching the four enums, but every resolution path then has to special-case an opaque value, distributed rejection can only be enforced by convention, and nothing in the repository can test the backend. Making the provider an explicit variant keeps every match exhaustive and lets the engine tests run against the real store, at the cost of one more arm in each enum.
 
 ## Reusing the Kafka provider with an object store "topic"
 
@@ -192,20 +212,20 @@ Simpler catalog, but the number of requests scales with the number of regions in
 
 # Drawbacks
 
-- Write latency is roughly `flush_interval` plus one PUT, in the hundreds of milliseconds. Raft Engine on local disk is an order of magnitude faster.
-- Every object costs a request; a small `flush_interval` multiplies cost. The default of one second and the 8 MiB bound are a compromise, not a measurement on GreptimeDB workloads yet.
+- Write latency is the time until the batch seals (up to `flush_interval`, one second by default), plus queueing behind earlier uploads, plus one PUT. Raft Engine on local disk is an order of magnitude faster.
+- Every object costs a request; a small `flush_interval` multiplies cost. The default of one second and the 8 MiB sealing threshold are a compromise, not a measurement on GreptimeDB workloads yet.
 - Without garbage collection, objects accumulate and recovery time grows linearly with their number.
-- Object-sequence-major entry ids consume 20 bits per object for positions, which caps a region at about a million entries per object; the batch seals when the cap is reached. Sequence numbers are 44 bits wide as a result, enough for one object per second for half a million years.
+- *Proposed* object-sequence-major entry ids consume 20 bits per object for positions, which caps a region at about a million entries per object; the batch seals when the cap is reached. Sequence numbers are 44 bits wide as a result, enough for one object per second for half a million years.
 
 # Alignment with cluster mode
 
-Distributed mode is out of scope, but several decisions were taken so that the cluster design can build on this backend without a metadata migration:
+Distributed mode is out of scope, but several decisions were taken so that the cluster design can build on this backend without a metadata migration. Except for the last bullet, these rest on the proposed changes above:
 
-- Entry ids are object-sequence-major (see *Entry ids*), so a per-region flush watermark can be compared with an object sequence directly. A cross-node takeover can therefore describe a region's WAL position as a chain of `(node prefix, first sequence, cutover sequence)` segments and replay them in order.
-- Both acknowledgement modes are defined here. Cluster mode is expected to run `enqueued` for latency-sensitive workloads; the object layout and the recovery path are identical in both modes.
+- *Proposed* object-sequence-major entry ids let a per-region flush watermark be compared with an object sequence directly. A cross-node takeover can therefore describe a region's WAL position as a chain of `(node prefix, first sequence, cutover sequence)` segments and replay them in order.
+- Both acknowledgement modes are defined here, one implemented and one *proposed*. Cluster mode is expected to run `enqueued` for latency-sensitive workloads; the object layout and the recovery path are identical in both modes.
 - Conflicting objects poison the store here because a standalone node has no coordinator. In cluster mode the datanode will carry a metasrv-issued generation in the object header so that a conditional-create conflict can be classified as a stale tail from an earlier generation, an idempotent retry of its own write, or a real second writer to be reported to the metasrv.
-- Segment-level skipping with region marking is defined here; cluster mode can route the WAL hole event to the metasrv so that a follower or a takeover knows the region needs a fresh replica rather than a replay.
-- Garbage collection derives its watermark from each region's manifest `flushed_entry_id`, which Mito hands to the store on region open; no additional persisted state is introduced.
+- *Proposed* segment-level skipping with region marking lets cluster mode route the WAL hole event to the metasrv so that a follower or a takeover knows the region needs a fresh replica rather than a replay.
+- Garbage collection derives its watermark from each region's manifest `flushed_entry_id`, which Mito already hands to the store on region open; no additional persisted state is introduced.
 
 # Future work
 
