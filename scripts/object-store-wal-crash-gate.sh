@@ -22,6 +22,8 @@
 # Needs Docker (MinIO runs in a container that is reused across runs), curl
 # and python3. The binary is built with `cargo build --bin greptime` unless
 # GREPTIME_BIN points at one. Knobs, all optional:
+#   WAL_ACK_MODE    acknowledgement mode of the WAL, `durable` (default) or
+#                   `enqueued`; see below for what the gate checks in each
 #   CYCLES          kill/restart cycles on the same bucket, default 5
 #   WRITERS         concurrent writers, default 8; each owns a stripe of the
 #                   sequence numbers (writer w inserts w, w+WRITERS, ...), and
@@ -51,6 +53,14 @@
 # of a writer, whose connection dropped no earlier than the kill. A dropped
 # connection before the kill or a kill that found no writer still running
 # fails the cycle. Nothing is cleaned between cycles, so replay accumulates.
+#
+# In the `enqueued` acknowledgement mode an INSERT is acknowledged before
+# its WAL object exists, so acknowledged rows may legitimately be lost within
+# the unpersisted backlog after a SIGKILL, and a later object may exist while
+# an earlier one does not. The gate then relaxes both acknowledgement rules
+# to "every present row was attempted": no row is present twice, no present
+# row was never attempted, and the manifest reports how many acknowledged
+# rows were lost per cycle. The kill and stripe checks are unchanged.
 #
 # The in-flight verdict is lenient inside the sampling window around the
 # kill: the controller stamps the clock just before it sends SIGKILL and
@@ -88,6 +98,7 @@ KILL_MAX_SECS="${KILL_MAX_SECS:-6}"
 KILL_WINDOW_MAX_MS="${KILL_WINDOW_MAX_MS:-100}"
 GREPTIME_PORT_BASE="${GREPTIME_PORT_BASE:-24000}"
 RUN_DIR="${RUN_DIR:-}"
+WAL_ACK_MODE="${WAL_ACK_MODE:-durable}"
 WAL_PREFIX="wal"
 READY_TIMEOUT_SECS=300
 
@@ -178,6 +189,11 @@ print_verdict() {
     echo "minio image: ${MINIO_IMAGE_ID:-unknown} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
     echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT:-unknown} wal prefix ${WAL_PREFIX} at http://127.0.0.1:${MINIO_PORT}"
     echo "cycles: ${CYCLES} writers: ${WRITERS} kill window: ${KILL_MIN_SECS}s to ${KILL_MAX_SECS}s"
+    if [ "${WAL_ACK_MODE}" = enqueued ]; then
+      echo "ack mode: enqueued (acknowledged rows may be lost within the backlog; the gate checks that every present row was attempted exactly once)"
+    else
+      echo "ack mode: ${WAL_ACK_MODE}"
+    fi
     [ -n "${cycles}" ] && printf '%s\n' "${cycles}"
     if [ "${CYCLE_MANIFEST_READABLE}" = no ] && [ -n "${FAIL_REASONS}" ]; then
       printf '%s' "${FAIL_REASONS}"
@@ -270,6 +286,10 @@ is_positive_integer "${KILL_WINDOW_MAX_MS}" ||
   fail "KILL_WINDOW_MAX_MS must be a positive integer, got '${KILL_WINDOW_MAX_MS}'"
 is_positive_integer "${GREPTIME_PORT_BASE}" ||
   fail "GREPTIME_PORT_BASE must be a positive integer, got '${GREPTIME_PORT_BASE}'"
+case "${WAL_ACK_MODE}" in
+  durable | enqueued) ;;
+  *) fail "WAL_ACK_MODE must be 'durable' or 'enqueued', got '${WAL_ACK_MODE}'" ;;
+esac
 
 # The run directory holds the evidence of exactly one run, so a given one
 # must be new or empty and is not touched before that is known. The final
@@ -415,6 +435,7 @@ addr = "127.0.0.1:$((GREPTIME_PORT_BASE + 3))"
 [wal]
 provider = "experimental_object_store"
 prefix = "${WAL_PREFIX}"
+ack_mode = "${WAL_ACK_MODE}"
 
 [storage]
 data_home = "${DATA_HOME}"
@@ -546,17 +567,19 @@ EOF
 
 # Reads the table back and checks it against the acknowledged and attempted
 # sequence numbers. Prints the counts for the manifest and fails the run on
-# the first violated invariant.
+# the first violated invariant. In the enqueued mode the acknowledgement
+# rules are relaxed as described in the header.
 verify() {
   local cycle=$1
   local found="${RUN_DIR}/cycle-${cycle}/found.csv"
   sql "SELECT seq FROM t ORDER BY seq" > "${found}" ||
     fail "cycle ${cycle}: reading the table back failed"
-  python3 - "${cycle}" "${ACKED}" "${ATTEMPTED}" "${found}" <<'EOF' >> "${MANIFEST}" || fail "cycle ${cycle}: invariant violated, see ${RUN_DIR}/cycle-${cycle}"
+  python3 - "${cycle}" "${ACKED}" "${ATTEMPTED}" "${found}" "${WAL_ACK_MODE}" <<'EOF' >> "${MANIFEST}" || fail "cycle ${cycle}: invariant violated, see ${RUN_DIR}/cycle-${cycle}"
 import collections
 import sys
 
-cycle_no, acked_path, attempted_path, found_path = sys.argv[1:5]
+cycle_no, acked_path, attempted_path, found_path, ack_mode = sys.argv[1:6]
+enqueued = ack_mode == "enqueued"
 acked = [int(line) for line in open(acked_path) if line.strip()]
 attempted = collections.OrderedDict()
 for line in open(attempted_path):
@@ -574,7 +597,7 @@ duplicated = sorted(seq for seq, n in counts.items() if n > 1)
 if duplicated:
     errors.append(f"present more than once: {duplicated}")
 missing = sorted(acked_set - set(counts))
-if missing:
+if missing and not enqueued:
     errors.append(f"acknowledged but absent: {missing}")
 unattempted = sorted(set(counts) - attempted_set)
 if unattempted:
@@ -593,7 +616,7 @@ for (cycle, writer), stripe in attempted.items():
     in_flight.update(tail)
 survivors = sorted(set(counts) - acked_set)
 stray = sorted(seq for seq in survivors if seq not in in_flight)
-if stray:
+if stray and not enqueued:
     errors.append(f"present, unacknowledged and not in flight at the kill: {stray}")
 
 if len(acked) != len(acked_set):
@@ -603,7 +626,7 @@ for error in errors:
     print(f"cycle={cycle_no} violation: {error}")
 print(
     f"cycle={cycle_no} found={len(found)} cumulative_acked={len(acked_set)} "
-    f"unacked_survivors={len(survivors)} survivors={survivors}"
+    f"acked_lost={len(missing)} unacked_survivors={len(survivors)} survivors={survivors}"
 )
 sys.exit(1 if errors else 0)
 EOF
@@ -695,7 +718,7 @@ for cycle in $(seq 1 "${CYCLES}"); do
   require_line "cycle ${cycle} restart wall time" "^cycle=${cycle} restart_wall_ms=[0-9]+$"
   require_line "cycle ${cycle} replay" "^cycle=${cycle} replay: Replay WAL for region: .* rows recovered: [0-9]+, replay from entry id: [0-9]+, last entry id: [0-9]+, .*elapsed: "
   require_line "cycle ${cycle} region open time" "^cycle=${cycle} open: Opened [0-9]+ regions in "
-  require_line "cycle ${cycle} rows found" "^cycle=${cycle} found=[0-9]+ cumulative_acked=[0-9]+ unacked_survivors=[0-9]+ survivors=\\["
+  require_line "cycle ${cycle} rows found" "^cycle=${cycle} found=[0-9]+ cumulative_acked=[0-9]+ acked_lost=[0-9]+ unacked_survivors=[0-9]+ survivors=\\["
   require_line "cycle ${cycle} WAL objects" "^cycle=${cycle} wal_objects=[0-9]+ bytes=[0-9]+$"
 done
 [ -n "${BINARY_COMMIT}" ] || MISSING+=("binary commit")
