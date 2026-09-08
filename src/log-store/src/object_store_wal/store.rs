@@ -52,7 +52,7 @@ use crate::object_store_wal::format::{
 use crate::object_store_wal::io::{ListedObject, ObjectStoreIo, PutResult};
 
 const COMMAND_BUFFER: usize = 1024;
-const MIN_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 /// Number of objects whose footers recovery fetches at a time.
 const RECOVERY_CONCURRENCY: usize = 8;
 /// Bytes recovery reads from the end of an object in one request. The window
@@ -1734,9 +1734,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_flushes_at_the_minimum_interval() {
+        // An append is acknowledged once its object is durable, so a completed
+        // append proves the tick after it sealed the batch. The appends are
+        // spaced far apart, so every one of them lands in its own tick and
+        // the ticks in between find an empty batch.
+        let interval = MIN_FLUSH_INTERVAL;
+        let store = open(memory_store(), &config(interval, u64::MAX)).await;
+        let data = ["a1", "a2", "a3"];
+        for (index, data) in data.iter().enumerate() {
+            tokio::time::sleep(interval * 5).await;
+            timeout(WAIT, append(&store, region(1), data))
+                .await
+                .unwrap()
+                .unwrap();
+            let expected_seqs = (0..=index as u64).collect::<Vec<_>>();
+            assert_eq!(expected_seqs, object_seqs(store.io.as_ref()).await);
+        }
+
+        // Ticks with an empty open batch do not create objects.
+        tokio::time::sleep(interval * 5).await;
+        let seqs = object_seqs(store.io.as_ref()).await;
+        assert_eq!(vec![0, 1, 2], seqs);
+        for object_seq in seqs {
+            let bytes = store.io.get(object_seq).await.unwrap();
+            let decoded = decode_object(&bytes).unwrap();
+            assert_eq!(1, decoded.records.len(), "object {object_seq} is empty");
+        }
+        assert_eq!(
+            entries(&[(1, "a1"), (2, "a2"), (3, "a3")]),
+            read(&store, region(1), 1).await
+        );
+    }
+
+    #[tokio::test]
     async fn test_store_rejects_invalid_config() {
         for config in [
-            config(Duration::from_millis(999), 1),
+            config(Duration::from_millis(9), 1),
             config(Duration::from_secs(1), 0),
             ObjectStoreWalConfig {
                 prefix: "/absolute".to_string(),

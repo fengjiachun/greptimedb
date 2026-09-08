@@ -367,7 +367,8 @@ overwrite_entry_start_id = false
 ## **It's only used when the provider is `experimental_object_store`**.
 #+ prefix = "wal"
 
-## The interval of flushing buffered entries to the object store, at least `1s`.
+## The interval of flushing buffered entries to the object store, at least `10ms`, defaults to `1s`.
+## Every interval with pending entries costs one object request, and the durable acknowledgement latency of a write is bounded below by the interval.
 ## **It's only used when the provider is `experimental_object_store`**.
 #+ flush_interval = "1s"
 
