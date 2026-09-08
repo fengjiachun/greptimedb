@@ -924,6 +924,7 @@ mod tests {
             prefix: PREFIX.to_string(),
             flush_interval,
             max_batch_bytes: ReadableSize(max_batch_bytes),
+            ..Default::default()
         }
     }
 

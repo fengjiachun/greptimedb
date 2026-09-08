@@ -64,6 +64,7 @@ async fn open_store(object_store: &ObjectStore, prefix: &str) -> Arc<ObjectStore
         prefix: prefix.to_string(),
         flush_interval: Duration::from_secs(3600),
         max_batch_bytes: ReadableSize(u64::MAX),
+        ..Default::default()
     };
     ObjectStoreLogStore::try_new(object_store.clone(), &config)
         .await
