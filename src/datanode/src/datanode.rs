@@ -833,11 +833,11 @@ fn validate_object_store_wal_config(config: &ObjectStoreWalConfig) -> Result<()>
         }
     );
     ensure!(
-        config.flush_interval >= Duration::from_secs(1),
+        config.flush_interval >= Duration::from_millis(10),
         InvalidObjectStoreWalConfigSnafu {
             field: "flush_interval",
             value: format!("{:?}", config.flush_interval),
-            reason: "must be at least 1s",
+            reason: "must be at least 10ms",
         }
     );
     ensure!(
@@ -1201,7 +1201,7 @@ mod tests {
             ),
             (
                 ObjectStoreWalConfig {
-                    flush_interval: Duration::from_millis(999),
+                    flush_interval: Duration::from_millis(9),
                     ..Default::default()
                 },
                 "flush_interval",
