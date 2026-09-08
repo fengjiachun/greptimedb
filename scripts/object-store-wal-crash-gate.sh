@@ -363,9 +363,11 @@ if [ -n "${REMAINING}" ]; then
   fail "root ${STORE_ROOT} of bucket ${MINIO_BUCKET} still holds objects"
 fi
 
-# Prints `objects=N bytes=N` of the WAL objects under the prefix.
+# Prints `objects=N bytes=N` of the WAL objects under the prefix, listed
+# recursively so the count does not depend on the layout the store derives
+# below it.
 wal_objects() {
-  mc_run "mc ls --recursive --json local/${MINIO_BUCKET}/${STORE_ROOT}/${WAL_PREFIX}/objects/" 2>/dev/null |
+  mc_run "mc ls --recursive --json local/${MINIO_BUCKET}/${STORE_ROOT}/${WAL_PREFIX}/" 2>/dev/null |
     python3 -c '
 import json, sys
 count = 0
