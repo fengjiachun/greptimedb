@@ -901,3 +901,49 @@ async fn test_enqueued_truncate_waits_until_the_wal_is_durable(
     assert_eq!(rows_before, scan_rows(&engine, REGION_A).await);
     assert_eq!(2, engine.get_region_statistic(REGION_A).unwrap().num_rows);
 }
+
+#[tokio::test]
+async fn test_flush_does_not_publish_a_frontier_for_a_lost_enqueued_backlog() {
+    let mut env = TestEnv::with_prefix("object-store-wal-lost-backlog").await;
+    let object_store = memory_store();
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (_, schema) = create_region(&engine, REGION_A, &[]).await;
+
+    // Entry 1 is acknowledged, then its create fails while stop has begun
+    // but the stop command is not handled yet: the backlog is lost.
+    store.hold_creates();
+    store.fail_creates();
+    put_rows(&engine, REGION_A, rows(&schema, 0, 3)).await;
+    let seal = {
+        let store = store.clone();
+        tokio::spawn(async move { store.seal_open_batch().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    store.begin_stop();
+    store.release_creates();
+    assert!(
+        tokio::time::timeout(WAIT, seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(wal_objects(&object_store).await.is_empty());
+
+    // A flush in that window fails at the barrier instead of recording the
+    // lost entry as flushed.
+    let flush = spawn_flush(&engine, REGION_A);
+    assert!(
+        tokio::time::timeout(WAIT, flush)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        0,
+        entry_ids(&engine, REGION_A).await.manifest_flushed_entry_id
+    );
+    assert!(store.stop().await.is_err());
+}

@@ -96,11 +96,6 @@ impl OpenBatch {
         self.first_admitted_at
     }
 
-    /// Returns the largest entry id handed out to `region_id`, durable or not.
-    pub(super) fn accepted_entry_id(&self, region_id: RegionId) -> Option<EntryId> {
-        self.accepted_entry_ids.get(&region_id).copied()
-    }
-
     /// Returns true once the admitted entries reach the size limit.
     pub(super) fn should_seal(&self) -> bool {
         !self.is_empty() && self.estimated_bytes >= self.max_bytes

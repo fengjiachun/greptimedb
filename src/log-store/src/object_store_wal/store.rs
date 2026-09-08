@@ -98,6 +98,8 @@ pub struct ObjectStoreLogStore {
     admitted_appends: watch::Receiver<usize>,
     #[cfg(any(test, feature = "testing"))]
     creates_held: watch::Sender<bool>,
+    #[cfg(any(test, feature = "testing"))]
+    creates_fail: Arc<AtomicBool>,
 }
 
 type TerminalError = Arc<Mutex<Option<Arc<Error>>>>;
@@ -154,6 +156,8 @@ impl ObjectStoreLogStore {
         let (admitted_appends_tx, admitted_appends_rx) = watch::channel(0);
         #[cfg(any(test, feature = "testing"))]
         let (creates_held_tx, creates_held_rx) = watch::channel(false);
+        #[cfg(any(test, feature = "testing"))]
+        let creates_fail = Arc::new(AtomicBool::new(false));
 
         let actor = Actor {
             io: io.clone(),
@@ -164,7 +168,8 @@ impl ObjectStoreLogStore {
             ack_mode: config.ack_mode,
             max_unpersisted_bytes,
             max_unpersisted_age: config.max_unpersisted_age,
-            open_batch: OpenBatch::new(max_batch_bytes, durable_entry_ids),
+            open_batch: OpenBatch::new(max_batch_bytes, durable_entry_ids.clone()),
+            issued_entry_ids: durable_entry_ids,
             pending: Vec::new(),
             sealed: VecDeque::new(),
             creates: FuturesUnordered::new(),
@@ -180,6 +185,8 @@ impl ObjectStoreLogStore {
             admitted_appends: admitted_appends_tx,
             #[cfg(any(test, feature = "testing"))]
             creates_held: creates_held_rx,
+            #[cfg(any(test, feature = "testing"))]
+            creates_fail: creates_fail.clone(),
         };
         common_runtime::spawn_global(actor.run());
 
@@ -196,6 +203,8 @@ impl ObjectStoreLogStore {
             admitted_appends: admitted_appends_rx,
             #[cfg(any(test, feature = "testing"))]
             creates_held: creates_held_tx,
+            #[cfg(any(test, feature = "testing"))]
+            creates_fail,
         }))
     }
 
@@ -318,6 +327,18 @@ impl ObjectStoreLogStore {
     /// Lets the creates parked by [`hold_creates`](Self::hold_creates) run.
     pub fn release_creates(&self) {
         self.creates_held.send_replace(false);
+    }
+
+    /// Makes every create that runs from now on fail with a transient object
+    /// store error instead of writing, so a test can lose a backlog.
+    pub fn fail_creates(&self) {
+        self.creates_fail.store(true, Ordering::Release);
+    }
+
+    /// Sets the stopped flag without sending the stop command, which is the
+    /// state a store is in between the two steps of [`stop`](LogStore::stop).
+    pub fn begin_stop(&self) {
+        self.stopped.store(true, Ordering::Release);
     }
 }
 
@@ -659,6 +680,10 @@ struct Actor {
     max_unpersisted_bytes: usize,
     max_unpersisted_age: Duration,
     open_batch: OpenBatch,
+    /// Largest entry id ever handed out per region, whether it became
+    /// durable, was rolled back or was lost with a dropped backlog. Unlike
+    /// the accepted ids of the open batch it never moves down.
+    issued_entry_ids: HashMap<RegionId, EntryId>,
     /// Waiters of the open batch in the `durable` mode.
     pending: Vec<PendingAppend>,
     /// Batches that are not durable yet, in sequence order.
@@ -684,6 +709,8 @@ struct Actor {
     admitted_appends: watch::Sender<usize>,
     #[cfg(any(test, feature = "testing"))]
     creates_held: watch::Receiver<bool>,
+    #[cfg(any(test, feature = "testing"))]
+    creates_fail: Arc<AtomicBool>,
 }
 
 impl Actor {
@@ -760,6 +787,12 @@ impl Actor {
                 return;
             }
         };
+        for (region_id, entry_id) in &last_entry_ids {
+            self.issued_entry_ids
+                .entry(*region_id)
+                .and_modify(|issued| *issued = (*issued).max(*entry_id))
+                .or_insert(*entry_id);
+        }
         match self.ack_mode {
             AckMode::Durable => self.pending.push(PendingAppend {
                 last_entry_ids,
@@ -913,12 +946,27 @@ impl Actor {
             let bytes = batch.bytes.clone();
             #[cfg(any(test, feature = "testing"))]
             let mut creates_held = self.creates_held.clone();
+            #[cfg(any(test, feature = "testing"))]
+            let creates_fail = self.creates_fail.clone();
             self.creates.push(Box::pin(async move {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
                 #[cfg(any(test, feature = "testing"))]
                 let _ = creates_held.wait_for(|held| !*held).await;
+                #[cfg(any(test, feature = "testing"))]
+                if creates_fail.load(Ordering::Acquire) {
+                    let error = object_store::Error::new(
+                        object_store::ErrorKind::Unexpected,
+                        "injected create failure",
+                    )
+                    .set_temporary();
+                    let result = Err(error).context(crate::error::WalObjectStoreSnafu {
+                        operation: "write",
+                        path: io.object_path(object_seq),
+                    });
+                    return (object_seq, result);
+                }
                 (object_seq, io.put_if_absent(object_seq, bytes).await)
             }));
         }
@@ -1165,10 +1213,21 @@ impl Actor {
             let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
             catalog.region_max_entry_id(region_id).unwrap_or(0)
         };
+        if entry_id <= durable {
+            let _ = response.send(Ok(()));
+            return;
+        }
+        // An acknowledged backlog was dropped: no entry that is not durable
+        // can be certified any more, whether it was in that backlog or not.
+        if let Some(error) = &self.stop_error {
+            let _ = response.send(Err(shared(error)));
+            return;
+        }
         // An id this store never handed out is not in its backlog, so there
-        // is nothing to wait for.
-        let accepted = self.open_batch.accepted_entry_id(region_id).unwrap_or(0);
-        if entry_id <= durable || entry_id > accepted {
+        // is nothing to wait for. Ids that were handed out and rolled back
+        // are waited for like any other, since they are handed out again.
+        let issued = self.issued_entry_ids.get(&region_id).copied().unwrap_or(0);
+        if entry_id > issued {
             let _ = response.send(Ok(()));
             return;
         }
@@ -3462,13 +3521,27 @@ mod tests {
         // Stop began, but the actor has not received the stop command when
         // the create fails: the backlog is dropped and the failure is kept
         // for the stop that follows.
-        store.stopped.store(true, Ordering::Release);
+        store.begin_stop();
         gate.send(false).unwrap();
         let error = timeout(WAIT, seal).await.unwrap().unwrap().unwrap_err();
         assert!(
             matches!(error, Error::ObjectStoreWalStopped { .. }),
             "unexpected error: {error:?}"
         );
+        // The lost entry cannot be certified as durable before the stop
+        // command is handled; a durable id still is.
+        let error = timeout(WAIT, store.wait_durable(&provider(region_id), 1))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
+            "unexpected error: {error:?}"
+        );
+        timeout(WAIT, store.wait_durable(&provider(region_id), 0))
+            .await
+            .unwrap()
+            .unwrap();
         let error = store.stop().await.unwrap_err();
         assert!(
             matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
