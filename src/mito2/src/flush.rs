@@ -514,9 +514,13 @@ impl RegionFlushTask {
         // The manifest may name only a durable entry as flushed. A log store
         // that acknowledges appends before their entries are durable can have
         // handed out `last_entry_id` for an entry that is still in its backlog.
-        self.durability_barrier
-            .wait(version_data.last_entry_id)
-            .await?;
+        // A DDL that cancels the flush must not wait behind that upload.
+        let durable = self.durability_barrier.wait(version_data.last_entry_id);
+        tokio::pin!(durable);
+        match CancellableFuture::new(durable.as_mut(), state.cancel_handle()).await {
+            Ok(result) => result?,
+            Err(_) => return FlushCancelledSnafu.fail(),
+        }
 
         let edit = RegionEdit {
             files_to_add: file_metas,
