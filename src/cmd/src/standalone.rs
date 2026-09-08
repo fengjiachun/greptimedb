@@ -53,6 +53,7 @@ use common_telemetry::{info, warn};
 use common_time::timezone::set_default_timezone;
 use common_version::{short_version, verbose_version};
 use common_wal::config::DatanodeWalConfig;
+use common_wal::config::object_store::STANDALONE_GENERATION;
 use datanode::config::{DatanodeOptions, StorageConfig};
 use datanode::datanode::{Datanode, DatanodeBuilder};
 use datanode::region_server::RegionServer;
@@ -85,13 +86,18 @@ use crate::{App, create_resource_limit_metrics, error, log_versions, maybe_activ
 pub const APP_NAME: &str = "greptime-standalone";
 
 /// Builds the WAL provider that allocates region WAL options in standalone mode.
+///
+/// The object store WAL allocates the node prefix of `node_id`, the datanode id
+/// of the standalone instance; an absent id is treated as 0, the id
+/// `StandaloneOptions::datanode_options` assigns.
 pub async fn build_standalone_wal_provider(
     wal: &DatanodeWalConfig,
+    node_id: Option<DatanodeId>,
     kv_backend: KvBackendRef,
 ) -> Result<WalProvider> {
     match wal {
         DatanodeWalConfig::ObjectStore(config) => Ok(WalProvider::ObjectStore {
-            prefix: config.prefix.clone(),
+            prefix: config.node_prefix(node_id.unwrap_or(0), STANDALONE_GENERATION),
         }),
         DatanodeWalConfig::RaftEngine(_)
         | DatanodeWalConfig::Kafka(_)
@@ -656,7 +662,7 @@ impl StartCommand {
                 .build(),
         );
         let wal_provider =
-            Arc::new(build_standalone_wal_provider(&opts.wal, kv_backend.clone()).await?);
+            Arc::new(build_standalone_wal_provider(&opts.wal, node_id, kv_backend.clone()).await?);
         let table_metadata_allocator = Arc::new(TableMetadataAllocator::new(
             table_id_allocator.clone(),
             wal_provider.clone(),
@@ -1107,31 +1113,37 @@ mod tests {
     async fn test_build_standalone_wal_provider() {
         let kv_backend = Arc::new(MemoryKvBackend::new()) as KvBackendRef;
 
+        let config = ObjectStoreWalConfig {
+            prefix: "cluster-a/wal".to_string(),
+            ..Default::default()
+        };
+        // The regions persist the node prefix the datanode runs its store under.
+        let node_prefix = config.node_prefix(0, STANDALONE_GENERATION);
+        assert_eq!(node_prefix, "cluster-a/wal/datanodes/0/epochs/0");
         let provider = build_standalone_wal_provider(
-            &DatanodeWalConfig::ObjectStore(ObjectStoreWalConfig {
-                prefix: "cluster-a/wal".to_string(),
-                ..Default::default()
-            }),
+            &DatanodeWalConfig::ObjectStore(config),
+            Some(0),
             kv_backend.clone(),
         )
         .await
         .unwrap();
         assert!(matches!(
             &provider,
-            WalProvider::ObjectStore { prefix } if prefix == "cluster-a/wal"
+            WalProvider::ObjectStore { prefix } if *prefix == node_prefix
         ));
         let regions = vec![0, 1];
         let wal_options = provider.allocate(&regions, false).await.unwrap();
         for region in regions {
             assert_eq!(
                 wal_options[&region],
-                WalOptions::ObjectStore(ObjectStoreWalOptions::new("cluster-a/wal".to_string()))
+                WalOptions::ObjectStore(ObjectStoreWalOptions::new(node_prefix.clone()))
             );
         }
 
-        let provider = build_standalone_wal_provider(&DatanodeWalConfig::default(), kv_backend)
-            .await
-            .unwrap();
+        let provider =
+            build_standalone_wal_provider(&DatanodeWalConfig::default(), Some(0), kv_backend)
+                .await
+                .unwrap();
         assert!(matches!(provider, WalProvider::RaftEngine));
     }
 

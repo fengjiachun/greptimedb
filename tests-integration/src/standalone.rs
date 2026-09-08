@@ -235,10 +235,13 @@ impl GreptimeDbStandaloneBuilder {
                 .step(10)
                 .build(),
         );
-        let wal_provider =
-            cmd::standalone::build_standalone_wal_provider(&opts.wal, kv_backend.clone())
-                .await
-                .unwrap();
+        let wal_provider = cmd::standalone::build_standalone_wal_provider(
+            &opts.wal,
+            opts.datanode_options().node_id,
+            kv_backend.clone(),
+        )
+        .await
+        .unwrap();
         let wal_provider = Arc::new(wal_provider);
         let table_metadata_allocator = Arc::new(TableMetadataAllocator::new(
             table_id_allocator,

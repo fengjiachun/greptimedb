@@ -45,7 +45,8 @@ use crate::test_util::{
     CreateRequestBuilder, TestEnv, build_rows, flush_region, put_rows, rows_schema,
 };
 
-const PREFIX: &str = "cluster-a/wal";
+/// The node prefix a standalone datanode derives from the root `cluster-a/wal`.
+const PREFIX: &str = "cluster-a/wal/datanodes/0/epochs/0";
 /// The engine runs two workers and these regions map to different ones, so
 /// their writes can be admitted into the same open batch.
 const REGION_A: RegionId = RegionId::new(1, 1);
@@ -384,9 +385,9 @@ async fn test_open_region_rejects_mismatched_wal_prefix() {
     drop(writer);
     drop(store);
 
-    // The process now runs its store under another prefix while the region
-    // still persists the prefix it was created with.
-    let other_prefix = "cluster-b/wal";
+    // The process now runs its store under the next generation while the
+    // region still persists the prefix it was created with.
+    let other_prefix = "cluster-a/wal/datanodes/0/epochs/1";
     let store = open_store(&object_store, other_prefix).await;
     let engine = new_engine(&mut env, store).await;
     let err = open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
