@@ -2953,6 +2953,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_seals_at_the_threshold_while_creates_are_in_flight() {
+        // The threshold holds exactly two entries, so every second admission
+        // must seal, whether or not a create is in flight.
+        let region_id = region(1);
+        let sample = Entry::Naive(NaiveEntry {
+            provider: provider(region_id),
+            region_id,
+            entry_id: 0,
+            data: b"a1".to_vec(),
+        });
+        let threshold = 2 * sample.estimated_size();
+        let (io, mut gates) = GatedIo::new();
+        let store = ObjectStoreLogStore::open(
+            io.clone(),
+            &config(Duration::from_secs(3600), threshold as u64),
+        )
+        .await
+        .unwrap();
+
+        // Nine appends are admitted while the first create is gated: the
+        // batches seal at admissions 2, 4, 6 and 8 and the ninth entry stays
+        // in the open batch.
+        let appends = spawn_appends(&store, region_id, 9).await;
+        let mut open = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_CREATES {
+            open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
+        }
+        assert!(gates.try_recv().is_err());
+        for gate in open {
+            gate.send(true).unwrap();
+        }
+        let mut appends = appends.into_iter();
+        for expected in 1..=8 {
+            let response = timeout(WAIT, appends.next().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                HashMap::from([(region_id, expected)]),
+                response.last_entry_ids
+            );
+        }
+        assert!(!appends.next().unwrap().is_finished());
+
+        // No object holds more than the threshold plus the append that
+        // reached it.
+        assert_eq!(vec![0, 1, 2, 3], object_seqs(io.as_ref()).await);
+        for object_seq in 0..4 {
+            let decoded = decode_object(&io.get(object_seq).await.unwrap()).unwrap();
+            assert_eq!(2, decoded.records.len(), "object {object_seq}");
+            let payload = decoded
+                .records
+                .iter()
+                .map(|record| record.payload.len())
+                .sum::<usize>();
+            assert!(payload <= threshold + sample.estimated_size());
+        }
+    }
+
+    #[tokio::test]
     async fn test_store_transient_failure_rolls_back_batches_that_were_not_created() {
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
