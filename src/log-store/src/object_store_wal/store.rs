@@ -673,7 +673,8 @@ struct Actor {
     durable_waiters: Vec<DurableWaiter>,
     /// Callers of `stop`, answered once nothing is in flight.
     stop: Vec<oneshot::Sender<Result<()>>>,
-    /// The failure `stop` reports when the backlog could not be uploaded.
+    /// The failure `stop` reports in the `enqueued` mode once an
+    /// acknowledged backlog was dropped, recorded when it happens.
     stop_error: Option<Arc<Error>>,
     /// Sequence of the next sealed batch, `None` once the sequence is exhausted.
     next_object_seq: Option<u64>,
@@ -814,6 +815,8 @@ impl Actor {
                 return;
             }
             if self.backlog_at_threshold() {
+                // The remaining waiters need an upload to complete.
+                self.ensure_create_in_flight();
                 return;
             }
             let Some((entries, response)) = self.stalled.pop_front() else {
@@ -1089,7 +1092,9 @@ impl Actor {
         }
         self.reset_open_batch();
         self.fail_unacknowledged(failure);
-        if self.ack_mode == AckMode::Enqueued && !self.stop.is_empty() {
+        // An acknowledged backlog was dropped: `stop` reports it, whether
+        // its caller has arrived yet or not.
+        if self.ack_mode == AckMode::Enqueued {
             self.stop_error.get_or_insert(error);
         }
     }
@@ -1116,7 +1121,7 @@ impl Actor {
         }
         self.reset_open_batch();
         self.fail_unacknowledged(failure);
-        if self.ack_mode == AckMode::Enqueued && !self.stop.is_empty() {
+        if self.ack_mode == AckMode::Enqueued {
             self.stop_error.get_or_insert(error.clone());
         }
         error
@@ -3260,30 +3265,45 @@ mod tests {
         };
         let (store, io, mut gates, stalled, gate) = stall_second_append(config).await;
         let region_id = region(1);
+        // Two more appends queue behind the stalled one.
+        let third = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_id, "a3").await })
+        };
+        let fourth = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_id, "a4").await })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!third.is_finished() && !fourth.is_finished());
+        assert!(gates.try_recv().is_err());
 
+        // The upload releases the second append, whose entry reaches the
+        // threshold again; the stall seals it so that the next upload can
+        // release the third, and so on.
         gate.send(true).unwrap();
         let response = timeout(WAIT, stalled).await.unwrap().unwrap().unwrap();
         assert_eq!(HashMap::from([(region_id, 2)]), response.last_entry_ids);
         assert_eq!(vec![0], object_seqs(io.as_ref()).await);
         assert_eq!(1, latest(&store, region_id));
-
-        // The second entry is in the open batch and stalls the next append
-        // again, which its own upload releases.
-        let third = {
-            let store = store.clone();
-            tokio::spawn(async move { append(&store, region_id, "a3").await })
-        };
-        timeout(WAIT, gates.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .send(true)
-            .unwrap();
-        let response = timeout(WAIT, third).await.unwrap().unwrap().unwrap();
-        assert_eq!(HashMap::from([(region_id, 3)]), response.last_entry_ids);
-        assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+        for (append, expected) in [(third, 3), (fourth, 4)] {
+            timeout(WAIT, gates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .send(true)
+                .unwrap();
+            let response = timeout(WAIT, append).await.unwrap().unwrap().unwrap();
+            assert_eq!(
+                HashMap::from([(region_id, expected)]),
+                response.last_entry_ids
+            );
+        }
+        assert_eq!(vec![0, 1, 2], object_seqs(io.as_ref()).await);
         assert_eq!(
-            entries(&[(1, "a1"), (2, "a2")]),
+            entries(&[(1, "a1"), (2, "a2"), (3, "a3")]),
             read(&store, region_id, 1).await
         );
     }
@@ -3356,7 +3376,45 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert!(store.latest_entry_id(&provider(region_id)).is_err());
-        store.stop().await.unwrap();
+        // The acknowledged entry was dropped, which stop reports.
+        let error = store.stop().await.unwrap_err();
+        assert!(
+            matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_enqueued_stop_reports_a_backlog_lost_before_the_stop_command() {
+        let (io, mut gates) = GatedIo::new();
+        let store = ObjectStoreLogStore::open(io.clone(), &enqueued(manual()))
+            .await
+            .unwrap();
+        let region_id = region(1);
+        append(&store, region_id, "a1").await.unwrap();
+        let seal = {
+            let store = store.clone();
+            tokio::spawn(async move { store.seal_open_batch().await })
+        };
+        let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+
+        // Stop began, but the actor has not received the stop command when
+        // the create fails: the backlog is dropped and the failure is kept
+        // for the stop that follows.
+        store.stopped.store(true, Ordering::Release);
+        gate.send(false).unwrap();
+        let error = timeout(WAIT, seal).await.unwrap().unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalStopped { .. }),
+            "unexpected error: {error:?}"
+        );
+        let error = store.stop().await.unwrap_err();
+        assert!(
+            matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(object_seqs(io.as_ref()).await.is_empty());
+        assert!(gates.try_recv().is_err());
     }
 
     #[tokio::test]
