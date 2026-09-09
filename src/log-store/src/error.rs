@@ -346,13 +346,11 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "WAL entry id of region {} is exhausted, last entry id: {}",
-        region_id,
-        last_entry_id
+        "WAL entry positions of region {} in one object are exhausted",
+        region_id
     ))]
-    WalEntryIdExhausted {
+    WalEntryPositionExhausted {
         region_id: RegionId,
-        last_entry_id: u64,
         #[snafu(implicit)]
         location: Location,
     },
@@ -483,7 +481,7 @@ impl ErrorExt for Error {
             | WalObjectConflict { .. }
             | WalObjectHistoryGap { .. }
             | WalObjectSequenceExhausted { .. }
-            | WalEntryIdExhausted { .. } => StatusCode::Unexpected,
+            | WalEntryPositionExhausted { .. } => StatusCode::Unexpected,
 
             // Object store related errors
             CreateWriter { .. }

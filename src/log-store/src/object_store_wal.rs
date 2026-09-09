@@ -38,6 +38,10 @@
 //! the header, trailer and footer of each, and indexes the footers in sequence
 //! order to rebuild the object catalog, which rejects a sequence it already
 //! holds. Segments are read and checksummed only when a read decodes them.
+//!
+//! Entry ids are object-sequence-major, see [`entry_id`]: the high bits of an
+//! id name the object that holds the entry, the low bits its position among
+//! the entries of its region in that object.
 
 mod batch;
 mod catalog;
@@ -45,4 +49,5 @@ mod format;
 mod io;
 mod store;
 
+pub use batch::entry_id;
 pub use store::ObjectStoreLogStore;
