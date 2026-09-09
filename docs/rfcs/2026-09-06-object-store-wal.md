@@ -9,7 +9,7 @@ Author: jeremyhi
 
 Add an object store backed write-ahead log as a first-class WAL provider, alongside Raft Engine and Kafka. A datanode batches the entries of all its regions into immutable objects under one prefix, creates each object conditionally under a monotonically increasing sequence number, and by default acknowledges a write only after the object holding it is durable; an opt-in acknowledgement mode returns on admission with a stated loss bound. Recovery lists the objects, rebuilds an in-memory catalog from their footers, and replays each region from its own segments. The provider is standalone-only and marked experimental in this RFC; the persisted metadata and object format are designed so that lifting either restriction later does not require a migration.
 
-This document describes two things and keeps them apart: what the implementation does today, and what is proposed on top of it. Every passage that describes proposed behaviour is introduced with the word *Proposed*; everything else describes the current code.
+This document describes two things and keeps them apart: what the implementation does today, and what is proposed on top of it. Every passage that describes proposed behaviour is introduced with the word *Proposed*; everything else describes the current code. The *Future work* and *Unresolved questions* sections are proposed by definition and carry no marker.
 
 # Motivation
 
