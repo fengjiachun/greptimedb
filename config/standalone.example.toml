@@ -370,7 +370,7 @@ overwrite_entry_start_id = false
 
 ## The interval of flushing buffered entries to the object store, at least `10ms`, defaults to `100ms`.
 ## Each non-empty timer-triggered flush creates one object, and a batch that reaches `max_batch_bytes` is flushed immediately, so under sustained load the batch seals on size and the interval no longer matters.
-## When writes are sparse, a shorter interval lowers the acknowledgement latency of `durable` appends and raises the number of object requests, at most one object per interval per node; the `enqueued` mode makes the latency independent of the interval.
+## When writes are sparse, a shorter interval lowers the acknowledgement latency of `durable` appends and raises the number of object requests: timer-triggered sealing creates at most one object per interval per node, and in `enqueued` mode the backlog thresholds can seal earlier. The `enqueued` mode makes the latency independent of the interval.
 ## **It's only used when the provider is `experimental_object_store`**.
 #+ flush_interval = "100ms"
 
