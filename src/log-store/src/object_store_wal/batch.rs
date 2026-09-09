@@ -15,6 +15,7 @@
 //! Accumulation of admitted entries into the batch that becomes the next object.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use snafu::OptionExt;
 use store_api::logstore::EntryId;
@@ -36,6 +37,8 @@ pub(super) struct OpenBatch {
     max_bytes: usize,
     entries: Vec<Entry>,
     estimated_bytes: usize,
+    /// When the first entry of the batch was admitted.
+    first_admitted_at: Option<Instant>,
     accepted_entry_ids: HashMap<RegionId, EntryId>,
 }
 
@@ -46,6 +49,7 @@ impl OpenBatch {
             max_bytes,
             entries: Vec::new(),
             estimated_bytes: 0,
+            first_admitted_at: None,
             accepted_entry_ids,
         }
     }
@@ -73,6 +77,7 @@ impl OpenBatch {
         }
         self.accepted_entry_ids.extend(&last_entry_ids);
         self.estimated_bytes += entries.iter().map(Entry::estimated_size).sum::<usize>();
+        self.first_admitted_at.get_or_insert_with(Instant::now);
         self.entries.extend(entries);
         Ok(last_entry_ids)
     }
@@ -81,15 +86,27 @@ impl OpenBatch {
         self.entries.is_empty()
     }
 
+    /// Returns the estimated size of the admitted entries.
+    pub(super) fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
+    }
+
+    /// Returns when the first admitted entry was admitted, if any.
+    pub(super) fn first_admitted_at(&self) -> Option<Instant> {
+        self.first_admitted_at
+    }
+
     /// Returns true once the admitted entries reach the size limit.
     pub(super) fn should_seal(&self) -> bool {
         !self.is_empty() && self.estimated_bytes >= self.max_bytes
     }
 
-    /// Takes the admitted entries out of the batch.
-    pub(super) fn seal(&mut self) -> Vec<Entry> {
+    /// Takes the admitted entries out of the batch together with the time the
+    /// first of them was admitted.
+    pub(super) fn seal(&mut self) -> (Vec<Entry>, Instant) {
         self.estimated_bytes = 0;
-        std::mem::take(&mut self.entries)
+        let first_admitted_at = self.first_admitted_at.take().unwrap_or_else(Instant::now);
+        (std::mem::take(&mut self.entries), first_admitted_at)
     }
 
     /// Drops the admitted entries and rolls the accepted ids back to
@@ -97,6 +114,7 @@ impl OpenBatch {
     pub(super) fn reset(&mut self, durable_entry_ids: HashMap<RegionId, EntryId>) {
         self.entries.clear();
         self.estimated_bytes = 0;
+        self.first_admitted_at = None;
         self.accepted_entry_ids = durable_entry_ids;
     }
 }
@@ -151,7 +169,7 @@ mod tests {
                 (region_a, 7),
                 (region_b, 3),
             ],
-            entry_ids(&batch.seal())
+            entry_ids(&batch.seal().0)
         );
         assert!(batch.is_empty());
         assert_eq!(
@@ -174,7 +192,7 @@ mod tests {
         batch.admit(vec![second]).unwrap();
         assert!(batch.should_seal());
 
-        assert_eq!(2, batch.seal().len());
+        assert_eq!(2, batch.seal().0.len());
         assert!(!batch.should_seal());
     }
 

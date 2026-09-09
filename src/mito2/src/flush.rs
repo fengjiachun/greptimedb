@@ -69,6 +69,7 @@ use crate::sst::parquet::{
     DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE, SstInfo, WriteOptions, flat_format,
 };
 use crate::sst::{FlatSchemaOptions, FormatType, to_flat_sst_arrow_schema};
+use crate::wal::DurabilityBarrier;
 use crate::worker::WorkerListener;
 
 /// Global write buffer (memtable) manager.
@@ -282,6 +283,8 @@ pub(crate) struct RegionFlushTask {
     ///
     /// This is used to generate the file meta.
     pub(crate) partition_expr: Option<String>,
+    /// Waits until the WAL is durable through the entry id the flush records.
+    pub(crate) durability_barrier: DurabilityBarrier,
 }
 
 struct FlushTaskWaiters {
@@ -506,6 +509,17 @@ impl RegionFlushTask {
                 .collect();
             hook.on_sst_files_written(self.region_id, &version.metadata, &files)
                 .await;
+        }
+
+        // The manifest may name only a durable entry as flushed. A log store
+        // that acknowledges appends before their entries are durable can have
+        // handed out `last_entry_id` for an entry that is still in its backlog.
+        // A DDL that cancels the flush must not wait behind that upload.
+        let durable = self.durability_barrier.wait(version_data.last_entry_id);
+        tokio::pin!(durable);
+        match CancellableFuture::new(durable.as_mut(), state.cancel_handle()).await {
+            Ok(result) => result?,
+            Err(_) => return FlushCancelledSnafu.fail(),
         }
 
         let edit = RegionEdit {
@@ -1699,6 +1713,7 @@ mod tests {
             flush_semaphore: Arc::new(Semaphore::new(2)),
             is_staging: false,
             partition_expr: None,
+            durability_barrier: DurabilityBarrier::noop(),
         }
     }
 
@@ -1848,6 +1863,7 @@ mod tests {
             flush_semaphore: Arc::new(Semaphore::new(2)),
             is_staging: false,
             partition_expr: None,
+            durability_barrier: DurabilityBarrier::noop(),
         };
         task.push_sender(OptionOutputTx::from(output_tx));
         scheduler
@@ -2138,6 +2154,7 @@ mod tests {
                 flush_semaphore: Arc::new(Semaphore::new(2)),
                 is_staging: false,
                 partition_expr: None,
+                durability_barrier: DurabilityBarrier::noop(),
             })
             .collect();
         // Schedule first task.
@@ -2442,6 +2459,7 @@ mod tests {
                 flush_semaphore: Arc::new(Semaphore::new(2)),
                 is_staging: false,
                 partition_expr: None,
+                durability_barrier: DurabilityBarrier::noop(),
             })
             .collect();
         // Schedule first task.

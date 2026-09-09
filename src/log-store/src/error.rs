@@ -364,6 +364,18 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "WAL object {} was not created while the later object {} is durable",
+        object_seq,
+        later_object_seq
+    ))]
+    WalObjectHistoryGap {
+        object_seq: u64,
+        later_object_seq: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to {} WAL object, path: {}", operation, path))]
     WalObjectStore {
         operation: &'static str,
@@ -469,6 +481,7 @@ impl ErrorExt for Error {
 
             CorruptedWalObject { .. }
             | WalObjectConflict { .. }
+            | WalObjectHistoryGap { .. }
             | WalObjectSequenceExhausted { .. }
             | WalEntryIdExhausted { .. } => StatusCode::Unexpected,
 

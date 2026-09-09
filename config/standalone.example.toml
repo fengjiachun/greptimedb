@@ -374,6 +374,21 @@ overwrite_entry_start_id = false
 ## **It's only used when the provider is `experimental_object_store`**.
 #+ flush_interval = "1s"
 
+## When an append to the object store WAL returns.
+## - `durable`: an append returns after the object holding its entries is durable (the default).
+## - `enqueued`: an append returns once its entries are admitted and their ids are assigned, and the object is created in the background. A crash loses the unpersisted backlog.
+## **It's only used when the provider is `experimental_object_store`**.
+#+ ack_mode = "durable"
+
+## The size of the unpersisted backlog at which new appends stall until an upload completes, in `enqueued` mode.
+## Nothing is dropped and nothing is rejected; the threshold does not bound what a crash during an outage can lose.
+## **It's only used when the provider is `experimental_object_store` and `ack_mode` is `enqueued`**.
+#+ max_unpersisted_bytes = "64MB"
+
+## The age of the oldest unpersisted entry at which new appends stall until an upload completes, in `enqueued` mode.
+## **It's only used when the provider is `experimental_object_store` and `ack_mode` is `enqueued`**.
+#+ max_unpersisted_age = "8s"
+
 # The Kafka SASL configuration.
 # **It's only used when the provider is `kafka`**.
 # Available SASL mechanisms:

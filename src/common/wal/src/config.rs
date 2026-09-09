@@ -138,6 +138,7 @@ mod tests {
 
     use super::*;
     use crate::TopicSelectorType;
+    use crate::config::object_store::AckMode;
     use crate::config::{DatanodeKafkaConfig, MetasrvKafkaConfig};
 
     #[test]
@@ -293,6 +294,9 @@ mod tests {
         assert_eq!(config.prefix, "wal");
         assert_eq!(config.flush_interval, Duration::from_secs(1));
         assert_eq!(config.max_batch_bytes, ReadableSize::mb(8));
+        assert_eq!(config.ack_mode, AckMode::Durable);
+        assert_eq!(config.max_unpersisted_bytes, ReadableSize::mb(64));
+        assert_eq!(config.max_unpersisted_age, Duration::from_secs(8));
         assert!(matches!(
             MetasrvWalConfig::try_from(datanode_wal_config).unwrap_err(),
             Error::UnsupportedWalProvider { .. }
@@ -304,6 +308,9 @@ mod tests {
             prefix = "cluster-a/wal"
             flush_interval = "500ms"
             max_batch_bytes = "4MB"
+            ack_mode = "enqueued"
+            max_unpersisted_bytes = "32MB"
+            max_unpersisted_age = "4s"
         "#;
         let datanode_wal_config: DatanodeWalConfig = toml::from_str(toml_str).unwrap();
         let expected = ObjectStoreWalConfig {
@@ -311,6 +318,9 @@ mod tests {
             prefix: "cluster-a/wal".to_string(),
             flush_interval: Duration::from_millis(500),
             max_batch_bytes: ReadableSize::mb(4),
+            ack_mode: AckMode::Enqueued,
+            max_unpersisted_bytes: ReadableSize::mb(32),
+            max_unpersisted_age: Duration::from_secs(4),
         };
         assert_eq!(
             datanode_wal_config,

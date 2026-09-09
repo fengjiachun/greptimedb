@@ -26,16 +26,20 @@ use common_base::readable_size::ReadableSize;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
-use common_wal::config::object_store::ObjectStoreWalConfig;
+use common_wal::config::object_store::{AckMode, ObjectStoreWalConfig};
 use common_wal::options::{ObjectStoreWalOptions, WAL_OPTIONS_KEY, WalOptions};
 use log_store::object_store_wal::ObjectStoreLogStore;
 use object_store::ObjectStore;
 use object_store::services::Memory;
+use rstest::rstest;
 use store_api::logstore::LogStore;
 use store_api::logstore::provider::Provider;
 use store_api::mito_engine_options::SKIP_WAL_KEY;
 use store_api::region_engine::{RegionEngine, RegionRole};
-use store_api::region_request::{PathType, RegionOpenRequest, RegionRequest};
+use store_api::region_request::{
+    PathType, RegionDropRequest, RegionFlushRequest, RegionOpenRequest, RegionRequest,
+    RegionTruncateRequest,
+};
 use store_api::storage::{RegionId, ScanRequest};
 
 use crate::config::MitoConfig;
@@ -59,11 +63,23 @@ fn memory_store() -> ObjectStore {
 
 /// Opens a store under `prefix` that never seals a batch on its own.
 async fn open_store(object_store: &ObjectStore, prefix: &str) -> Arc<ObjectStoreLogStore> {
+    open_store_with(object_store, prefix, AckMode::Durable).await
+}
+
+/// Opens a store under `prefix` with `ack_mode` that never seals a batch on
+/// its own.
+async fn open_store_with(
+    object_store: &ObjectStore,
+    prefix: &str,
+    ack_mode: AckMode,
+) -> Arc<ObjectStoreLogStore> {
     let config = ObjectStoreWalConfig {
         storage_provider: String::new(),
         prefix: prefix.to_string(),
         flush_interval: Duration::from_secs(3600),
         max_batch_bytes: ReadableSize(u64::MAX),
+        ack_mode,
+        ..Default::default()
     };
     ObjectStoreLogStore::try_new(object_store.clone(), &config)
         .await
@@ -234,11 +250,14 @@ fn latest(store: &ObjectStoreLogStore, region_id: RegionId) -> u64 {
     store.latest_entry_id(&provider(region_id)).unwrap()
 }
 
+#[rstest]
+#[case(AckMode::Durable)]
+#[case(AckMode::Enqueued)]
 #[tokio::test]
-async fn test_reopen_after_partial_flush_replays_only_unflushed_regions() {
+async fn test_reopen_after_partial_flush_replays_only_unflushed_regions(#[case] ack_mode: AckMode) {
     let mut env = TestEnv::with_prefix("object-store-wal-partial-flush").await;
     let object_store = memory_store();
-    let store = open_store(&object_store, PREFIX).await;
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     let (table_dir_a, schema_a) = create_region(&engine, REGION_A, &[]).await;
     let (table_dir_b, schema_b) = create_region(&engine, REGION_B, &[]).await;
@@ -287,7 +306,7 @@ async fn test_reopen_after_partial_flush_replays_only_unflushed_regions() {
     drop(writer);
     drop(store);
 
-    let store = open_store(&object_store, PREFIX).await;
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     open_region(&engine, REGION_A, &table_dir_a, PREFIX, &[])
         .await
@@ -326,11 +345,14 @@ async fn test_reopen_after_partial_flush_replays_only_unflushed_regions() {
     assert_eq!(5, engine.get_region_statistic(REGION_B).unwrap().num_rows);
 }
 
+#[rstest]
+#[case(AckMode::Durable)]
+#[case(AckMode::Enqueued)]
 #[tokio::test]
-async fn test_reopen_after_abrupt_drop_replays_durable_entries_once() {
+async fn test_reopen_after_abrupt_drop_replays_durable_entries_once(#[case] ack_mode: AckMode) {
     let mut env = TestEnv::with_prefix("object-store-wal-abrupt-drop").await;
     let object_store = memory_store();
-    let store = open_store(&object_store, PREFIX).await;
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     let (table_dir, schema) = create_region(&engine, REGION_A, &[]).await;
 
@@ -347,7 +369,7 @@ async fn test_reopen_after_abrupt_drop_replays_durable_entries_once() {
     drop(writer);
     drop(store);
 
-    let store = open_store(&object_store, PREFIX).await;
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
         .await
@@ -463,11 +485,14 @@ async fn test_reopen_on_empty_prefix_without_durable_entries() {
     assert_eq!(2, engine.get_region_statistic(REGION_A).unwrap().num_rows);
 }
 
+#[rstest]
+#[case(AckMode::Durable)]
+#[case(AckMode::Enqueued)]
 #[tokio::test]
-async fn test_entry_ids_continue_across_two_restarts() {
+async fn test_entry_ids_continue_across_two_restarts(#[case] ack_mode: AckMode) {
     let mut env = TestEnv::with_prefix("object-store-wal-two-restarts").await;
     let object_store = memory_store();
-    let store = open_store(&object_store, PREFIX).await;
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     let (table_dir, schema) = create_region(&engine, REGION_A, &[]).await;
 
@@ -487,7 +512,7 @@ async fn test_entry_ids_continue_across_two_restarts() {
     drop(store);
 
     // First restart replays entry 2 only.
-    let store = open_store(&object_store, PREFIX).await;
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
         .await
@@ -523,7 +548,7 @@ async fn test_entry_ids_continue_across_two_restarts() {
     drop(store);
 
     // Second restart replays entry 4 only.
-    let store = open_store(&object_store, PREFIX).await;
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
         .await
@@ -547,4 +572,378 @@ async fn test_entry_ids_continue_across_two_restarts() {
             .version_control
             .committed_sequence()
     );
+}
+
+/// Lists the WAL objects under the prefix.
+async fn wal_objects(object_store: &ObjectStore) -> Vec<String> {
+    object_store
+        .list(&format!("{PREFIX}/objects/"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.metadata().is_file())
+        .map(|entry| entry.path().to_string())
+        .collect()
+}
+
+/// Requests a flush of the region in the background and returns its handle;
+/// the result is up to the caller.
+fn spawn_flush(
+    engine: &MitoEngine,
+    region_id: RegionId,
+) -> tokio::task::JoinHandle<std::result::Result<(), BoxedError>> {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        engine
+            .handle_request(
+                region_id,
+                RegionRequest::Flush(RegionFlushRequest {
+                    row_group_size: None,
+                    reason: None,
+                }),
+            )
+            .await
+            .map(|_| ())
+    })
+}
+
+#[tokio::test]
+async fn test_flush_waits_until_the_wal_is_durable() {
+    let mut env = TestEnv::with_prefix("object-store-wal-flush-barrier").await;
+    let object_store = memory_store();
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (_, schema) = create_region(&engine, REGION_A, &[]).await;
+
+    // The write is acknowledged on admission; its object is not created
+    // while creates are held.
+    store.hold_creates();
+    put_rows(&engine, REGION_A, rows(&schema, 0, 3)).await;
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: 0,
+            last_entry_id: 1,
+            topic_latest_entry_id: 0,
+            manifest_flushed_entry_id: 0,
+            memtable_rows: 3,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    assert_eq!(0, latest(&store, REGION_A));
+
+    // The flush writes its SST, then waits for entry 1 to be durable before
+    // it records the entry as flushed in the manifest.
+    let flush = spawn_flush(&engine, REGION_A);
+    let seal = {
+        let store = store.clone();
+        tokio::spawn(async move { store.seal_open_batch().await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!flush.is_finished());
+    assert!(!seal.is_finished());
+    assert_eq!(
+        0,
+        entry_ids(&engine, REGION_A).await.manifest_flushed_entry_id
+    );
+    assert!(wal_objects(&object_store).await.is_empty());
+
+    store.release_creates();
+    tokio::time::timeout(WAIT, seal)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(WAIT, flush)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(1, latest(&store, REGION_A));
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: 1,
+            last_entry_id: 1,
+            topic_latest_entry_id: 1,
+            manifest_flushed_entry_id: 1,
+            memtable_rows: 0,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    assert_eq!(3, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+}
+
+#[tokio::test]
+async fn test_enqueued_crash_before_the_object_exists_replays_durable_entries() {
+    let mut env = TestEnv::with_prefix("object-store-wal-enqueued-crash").await;
+    let object_store = memory_store();
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (table_dir, schema) = create_region(&engine, REGION_A, &[]).await;
+
+    // Entry 1 is acknowledged and a flush is attempted, but the object is
+    // never created: the flush waits and the manifest keeps watermark 0.
+    store.hold_creates();
+    put_rows(&engine, REGION_A, rows(&schema, 0, 3)).await;
+    assert_eq!(1, entry_ids(&engine, REGION_A).await.last_entry_id);
+    let flush = spawn_flush(&engine, REGION_A);
+    let seal = {
+        let store = store.clone();
+        tokio::spawn(async move { store.seal_open_batch().await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!flush.is_finished());
+    assert_eq!(
+        0,
+        entry_ids(&engine, REGION_A).await.manifest_flushed_entry_id
+    );
+    assert!(wal_objects(&object_store).await.is_empty());
+
+    // The process dies with the create still held.
+    drop(engine);
+    drop(store);
+    flush.abort();
+    seal.abort();
+    assert!(wal_objects(&object_store).await.is_empty());
+
+    // Nothing is durable, so nothing replays and the region starts over
+    // from entry 1; the lost entry was inside the unpersisted backlog.
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: 0,
+            last_entry_id: 0,
+            topic_latest_entry_id: 0,
+            manifest_flushed_entry_id: 0,
+            memtable_rows: 0,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    assert_eq!(0, latest(&store, REGION_A));
+    let mut writer = SealedWriter::new(&store);
+    writer
+        .put_and_seal(&engine, vec![(REGION_A, rows(&schema, 3, 5))])
+        .await;
+    assert_eq!(1, latest(&store, REGION_A));
+    assert_eq!(1, entry_ids(&engine, REGION_A).await.last_entry_id);
+    assert_eq!(1, wal_objects(&object_store).await.len());
+    let rows_before = scan_rows(&engine, REGION_A).await;
+    assert_eq!(2, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+    drop(engine);
+    drop(writer);
+    drop(store);
+
+    // The second restart replays the entry that became durable and skips
+    // nothing: the manifest never named an entry that was not durable.
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: 0,
+            last_entry_id: 1,
+            topic_latest_entry_id: 0,
+            manifest_flushed_entry_id: 0,
+            memtable_rows: 2,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    assert_eq!(1, latest(&store, REGION_A));
+    assert_eq!(rows_before, scan_rows(&engine, REGION_A).await);
+    assert_eq!(2, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+}
+
+#[tokio::test]
+async fn test_drop_cancels_a_flush_waiting_for_wal_durability() {
+    let mut env = TestEnv::with_prefix("object-store-wal-flush-barrier-drop").await;
+    let object_store = memory_store();
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (_, schema) = create_region(&engine, REGION_A, &[]).await;
+
+    // The flush reaches the durability barrier and waits for a create that
+    // is held.
+    store.hold_creates();
+    put_rows(&engine, REGION_A, rows(&schema, 0, 3)).await;
+    let flush = spawn_flush(&engine, REGION_A);
+    let seal = {
+        let store = store.clone();
+        tokio::spawn(async move { store.seal_open_batch().await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!flush.is_finished());
+
+    // The drop cancels the flush instead of waiting behind the upload.
+    tokio::time::timeout(
+        WAIT,
+        engine.handle_request(
+            REGION_A,
+            RegionRequest::Drop(RegionDropRequest {
+                fast_path: false,
+                force: false,
+                partial_drop: false,
+            }),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!engine.is_region_exists(REGION_A));
+    assert!(wal_objects(&object_store).await.is_empty());
+    assert!(
+        tokio::time::timeout(WAIT, flush)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+
+    store.release_creates();
+    tokio::time::timeout(WAIT, seal)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[rstest]
+#[case(RegionTruncateRequest::All)]
+#[case(RegionTruncateRequest::Unflushed)]
+#[tokio::test]
+async fn test_enqueued_truncate_waits_until_the_wal_is_durable(
+    #[case] request: RegionTruncateRequest,
+) {
+    let mut env = TestEnv::with_prefix("object-store-wal-truncate-barrier").await;
+    let object_store = memory_store();
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (table_dir, schema) = create_region(&engine, REGION_A, &[]).await;
+
+    // Entry 1 is acknowledged and a truncate is attempted, but the object is
+    // never created: the truncate waits and the manifest keeps frontier 0.
+    store.hold_creates();
+    put_rows(&engine, REGION_A, rows(&schema, 0, 3)).await;
+    assert_eq!(1, entry_ids(&engine, REGION_A).await.last_entry_id);
+    let truncate = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .handle_request(REGION_A, RegionRequest::Truncate(request))
+                .await
+                .map(|_| ())
+        })
+    };
+    let seal = {
+        let store = store.clone();
+        tokio::spawn(async move { store.seal_open_batch().await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!truncate.is_finished());
+    let manifest = region(&engine, REGION_A).manifest_ctx.manifest().await;
+    assert_eq!(0, manifest.flushed_entry_id);
+    assert_eq!(None, manifest.truncated_entry_id);
+    assert!(wal_objects(&object_store).await.is_empty());
+
+    // The process dies with the create still held.
+    drop(engine);
+    drop(store);
+    truncate.abort();
+    seal.abort();
+
+    // Nothing is durable and the manifest names no entry, so the region
+    // starts over from entry 1, which becomes durable this time.
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: 0,
+            last_entry_id: 0,
+            topic_latest_entry_id: 0,
+            manifest_flushed_entry_id: 0,
+            memtable_rows: 0,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    let mut writer = SealedWriter::new(&store);
+    writer
+        .put_and_seal(&engine, vec![(REGION_A, rows(&schema, 3, 5))])
+        .await;
+    assert_eq!(1, latest(&store, REGION_A));
+    let rows_before = scan_rows(&engine, REGION_A).await;
+    drop(engine);
+    drop(writer);
+    drop(store);
+
+    // The second restart replays the durable entry instead of skipping it.
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: 0,
+            last_entry_id: 1,
+            topic_latest_entry_id: 0,
+            manifest_flushed_entry_id: 0,
+            memtable_rows: 2,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    assert_eq!(rows_before, scan_rows(&engine, REGION_A).await);
+    assert_eq!(2, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+}
+
+#[tokio::test]
+async fn test_flush_does_not_publish_a_frontier_for_a_lost_enqueued_backlog() {
+    let mut env = TestEnv::with_prefix("object-store-wal-lost-backlog").await;
+    let object_store = memory_store();
+    let store = open_store_with(&object_store, PREFIX, AckMode::Enqueued).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (_, schema) = create_region(&engine, REGION_A, &[]).await;
+
+    // Entry 1 is acknowledged, then its create fails while stop has begun
+    // but the stop command is not handled yet: the backlog is lost.
+    store.hold_creates();
+    store.fail_creates();
+    put_rows(&engine, REGION_A, rows(&schema, 0, 3)).await;
+    let seal = {
+        let store = store.clone();
+        tokio::spawn(async move { store.seal_open_batch().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    store.begin_stop();
+    store.release_creates();
+    assert!(
+        tokio::time::timeout(WAIT, seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(wal_objects(&object_store).await.is_empty());
+
+    // A flush in that window fails at the barrier instead of recording the
+    // lost entry as flushed.
+    let flush = spawn_flush(&engine, REGION_A);
+    assert!(
+        tokio::time::timeout(WAIT, flush)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        0,
+        entry_ids(&engine, REGION_A).await.manifest_flushed_entry_id
+    );
+    assert!(store.stop().await.is_err());
 }
