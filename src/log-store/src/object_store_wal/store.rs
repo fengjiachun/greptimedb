@@ -507,7 +507,8 @@ impl LogStore for ObjectStoreLogStore {
     /// assigned under another prefix, or one whose object this prefix no
     /// longer holds, raises the sequence of the next object above the object
     /// it names. The watermark and the sequence are applied together by the
-    /// actor, so a call that is cancelled publishes neither, and the call
+    /// actor: a call cancelled before its command is queued publishes
+    /// neither, while a command already queued still applies both. The call
     /// fails with [`Error::WalObjectSequenceUnsettled`] while the sequence
     /// cannot be raised without skipping a sequence whose create outcome is
     /// unknown. In the `enqueued` mode an `entry_id` this store handed out
@@ -2976,7 +2977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_cancelled_obsolete_publishes_nothing() {
+    async fn test_store_obsolete_cancelled_before_queueing_publishes_nothing() {
         let store = open(memory_store(), &eager()).await;
         let region_id = region(1);
 
