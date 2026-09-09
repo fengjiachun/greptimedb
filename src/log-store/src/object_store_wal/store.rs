@@ -43,7 +43,7 @@ use crate::error::{
     CorruptedWalObjectSnafu, Error, InvalidProviderSnafu, InvalidWalEntrySnafu,
     InvalidWalObjectSnafu, InvalidWalObjectStoreSnafu, MismatchedWalPrefixSnafu,
     ObjectStoreWalSnafu, ObjectStoreWalStoppedSnafu, Result, WalObjectHistoryGapSnafu,
-    WalObjectSequenceExhaustedSnafu,
+    WalObjectSequenceExhaustedSnafu, WalObjectSequenceUnsettledSnafu,
 };
 use crate::object_store_wal::batch::{OBJECT_SEQ_LIMIT, OpenBatch, sequence_floor};
 use crate::object_store_wal::catalog::ObjectCatalog;
@@ -87,7 +87,7 @@ pub struct ObjectStoreLogStore {
     io: Arc<dyn WalObjectIo>,
     catalog: Arc<RwLock<ObjectCatalog>>,
     /// Largest obsolete entry id per region. Objects are not deleted yet.
-    obsolete_entry_ids: Mutex<HashMap<RegionId, EntryId>>,
+    obsolete_entry_ids: ObsoleteEntryIds,
     /// Set once the store hit an error it cannot recover from, such as a
     /// conflicting object; every operation fails with it afterwards.
     terminal_error: TerminalError,
@@ -103,6 +103,7 @@ pub struct ObjectStoreLogStore {
 }
 
 type TerminalError = Arc<Mutex<Option<Arc<Error>>>>;
+type ObsoleteEntryIds = Arc<Mutex<HashMap<RegionId, EntryId>>>;
 
 impl fmt::Debug for ObjectStoreLogStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -149,6 +150,7 @@ impl ObjectStoreLogStore {
 
         let (catalog, next_object_seq, durable_entry_ids) = recover(io.as_ref()).await?;
         let catalog = Arc::new(RwLock::new(catalog));
+        let obsolete_entry_ids = ObsoleteEntryIds::default();
         let terminal_error = TerminalError::default();
         let stopped = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
@@ -162,6 +164,7 @@ impl ObjectStoreLogStore {
         let actor = Actor {
             io: io.clone(),
             catalog: catalog.clone(),
+            obsolete_entry_ids: obsolete_entry_ids.clone(),
             terminal_error: terminal_error.clone(),
             stopped: stopped.clone(),
             command_rx,
@@ -179,7 +182,7 @@ impl ObjectStoreLogStore {
             stop: Vec::new(),
             stop_error: None,
             next_object_seq: Some(next_object_seq),
-            sequence_floor: next_object_seq,
+            unresolved_object_seq: None,
             writer_instance: uuid::Uuid::new_v4().into_bytes(),
             flush_interval: config.flush_interval,
             #[cfg(any(test, feature = "testing"))]
@@ -196,7 +199,7 @@ impl ObjectStoreLogStore {
             ack_mode: config.ack_mode,
             io,
             catalog,
-            obsolete_entry_ids: Mutex::new(HashMap::new()),
+            obsolete_entry_ids,
             terminal_error,
             stopped,
             command_tx,
@@ -250,13 +253,9 @@ impl ObjectStoreLogStore {
         }
     }
 
-    /// Records the obsolete watermark of `region_id`, which never moves down.
-    fn record_obsolete(
-        &self,
-        provider: &Provider,
-        region_id: RegionId,
-        entry_id: EntryId,
-    ) -> Result<()> {
+    /// Checks that the store is healthy and that `provider` selects this
+    /// store's prefix and `region_id`.
+    fn check_region(&self, provider: &Provider, region_id: RegionId) -> Result<()> {
         self.check_terminal()?;
         let provider_region = self.region_of(provider)?;
         ensure!(
@@ -266,32 +265,18 @@ impl ObjectStoreLogStore {
                 reason: format!("provider belongs to region {provider_region}"),
             }
         );
-        self.obsolete_entry_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(region_id)
-            .and_modify(|current| *current = (*current).max(entry_id))
-            .or_insert(entry_id);
         Ok(())
     }
+}
 
-    /// Raises the sequence of the next object to `object_seq` unless it is
-    /// there already, and returns once the actor applied it. An actor that
-    /// exited admits nothing more, so there is nothing left to raise.
-    async fn raise_sequence_floor(&self, object_seq: u64) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let sent = self
-            .command_tx
-            .send(Command::RaiseSequenceFloor {
-                object_seq,
-                response: response_tx,
-            })
-            .await;
-        if sent.is_err() {
-            return Ok(());
-        }
-        response_rx.await.unwrap_or(Ok(()))
-    }
+/// Records the obsolete watermark of `region_id`, which never moves down.
+fn record_obsolete(obsolete_entry_ids: &ObsoleteEntryIds, region_id: RegionId, entry_id: EntryId) {
+    obsolete_entry_ids
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(region_id)
+        .and_modify(|current| *current = (*current).max(entry_id))
+        .or_insert(entry_id);
 }
 
 fn positive_bytes(bytes: u64, name: &str) -> Result<usize> {
@@ -517,25 +502,48 @@ impl LogStore for ObjectStoreLogStore {
     /// entry id: an entry that is not durable yet is replayed after a crash,
     /// and hiding it would skip it.
     ///
-    /// Every id the region is assigned from now on is greater than
-    /// `entry_id`: a watermark that was assigned under another prefix raises
-    /// the sequence of the next object above the object the watermark names.
+    /// Every id the region is assigned from now on is greater than the
+    /// recorded watermark: a watermark that was assigned under another
+    /// prefix raises the sequence of the next object above the object it
+    /// names. The watermark and the sequence are applied together by the
+    /// actor, so a call that is cancelled publishes neither, and the call
+    /// fails with [`Error::WalObjectSequenceUnsettled`] while the sequence
+    /// cannot be raised without skipping a sequence whose create outcome is
+    /// unknown.
     async fn obsolete(
         &self,
         provider: &Provider,
         region_id: RegionId,
         entry_id: EntryId,
     ) -> Result<()> {
+        self.check_region(provider, region_id)?;
         let watermark = match self.ack_mode {
             AckMode::Durable => entry_id,
             AckMode::Enqueued => entry_id.min(self.durable_entry_id_of(region_id)),
         };
-        self.record_obsolete(provider, region_id, watermark)?;
-        self.raise_sequence_floor(sequence_floor(entry_id)).await
+        let (response_tx, response_rx) = oneshot::channel();
+        let sent = self
+            .command_tx
+            .send(Command::Obsolete {
+                region_id,
+                watermark,
+                sequence_floor: sequence_floor(watermark),
+                response: response_tx,
+            })
+            .await;
+        if sent.is_err() {
+            // The actor exited: nothing is assigned an id any more, so the
+            // watermark alone is consistent.
+            record_obsolete(&self.obsolete_entry_ids, region_id, watermark);
+            return Ok(());
+        }
+        response_rx.await.unwrap_or(Ok(()))
     }
 
     async fn obsolete_all(&self, provider: &Provider, region_id: RegionId) -> Result<()> {
-        self.record_obsolete(provider, region_id, EntryId::MAX)
+        self.check_region(provider, region_id)?;
+        record_obsolete(&self.obsolete_entry_ids, region_id, EntryId::MAX);
+        Ok(())
     }
 
     fn entry(
@@ -604,9 +612,12 @@ enum Command {
         entry_id: EntryId,
         response: oneshot::Sender<Result<()>>,
     },
-    /// Answered once no id below the object `object_seq` can be assigned.
-    RaiseSequenceFloor {
-        object_seq: u64,
+    /// Answered once the watermark is recorded and no id below the object
+    /// `sequence_floor` can be assigned, or with the reason neither was done.
+    Obsolete {
+        region_id: RegionId,
+        watermark: EntryId,
+        sequence_floor: u64,
         response: oneshot::Sender<Result<()>>,
     },
     Stop {
@@ -702,6 +713,7 @@ type CreateOutcome = (u64, Result<PutResult>);
 struct Actor {
     io: Arc<dyn WalObjectIo>,
     catalog: Arc<RwLock<ObjectCatalog>>,
+    obsolete_entry_ids: ObsoleteEntryIds,
     terminal_error: TerminalError,
     stopped: Arc<AtomicBool>,
     command_rx: mpsc::Receiver<Command>,
@@ -733,11 +745,11 @@ struct Actor {
     /// Sequence of the next sealed batch, `None` once the sequence is
     /// exhausted. The open batch assigns its entry ids from it.
     next_object_seq: Option<u64>,
-    /// Sequence below which no entry id may be assigned any more: the one
-    /// recovery resumed at, raised by every obsolete watermark that names a
-    /// later object. A sequence rolled back after a failed create stays at or
-    /// above it.
-    sequence_floor: u64,
+    /// Largest sequence whose batch failed transiently and was rolled back:
+    /// its object may exist. The sequences from the next one up to it are
+    /// reused in order, so the conditional create at each reconciles it; no
+    /// sequence is skipped until an object at or above it is indexed.
+    unresolved_object_seq: Option<u64>,
     writer_instance: [u8; 16],
     flush_interval: Duration,
     #[cfg(any(test, feature = "testing"))]
@@ -774,8 +786,8 @@ impl Actor {
                     Some(Command::WaitDurable { region_id, entry_id, response }) => {
                         self.handle_wait_durable(region_id, entry_id, response);
                     }
-                    Some(Command::RaiseSequenceFloor { object_seq, response }) => {
-                        self.handle_raise_sequence_floor(object_seq, response);
+                    Some(Command::Obsolete { region_id, watermark, sequence_floor, response }) => {
+                        self.handle_obsolete(region_id, watermark, sequence_floor, response);
                     }
                     Some(Command::Stop { response }) => {
                         self.handle_stop(response);
@@ -1165,6 +1177,14 @@ impl Actor {
         for waiter in batch.seal_waiters {
             let _ = waiter.send(Ok(()));
         }
+        // Objects are indexed in sequence order, so every rolled back
+        // sequence up to this one was written again and reconciled.
+        if self
+            .unresolved_object_seq
+            .is_some_and(|unresolved| unresolved <= batch.object_seq)
+        {
+            self.unresolved_object_seq = None;
+        }
         self.resolve_durable_waiters();
         true
     }
@@ -1188,7 +1208,15 @@ impl Actor {
     /// stopped meanwhile learn that instead of the I/O error, like every
     /// other entry that never became durable.
     fn roll_back(&mut self, object_seq: u64, error: Arc<Error>) {
-        self.next_object_seq = Some(object_seq.max(self.sequence_floor));
+        self.next_object_seq = Some(object_seq);
+        // Every batch that failed may have left an object behind.
+        let failed = self
+            .sealed
+            .iter()
+            .filter(|batch| matches!(batch.state, CreateState::Failed(_)))
+            .map(|batch| batch.object_seq)
+            .max();
+        self.unresolved_object_seq = self.unresolved_object_seq.max(failed);
         self.draining = false;
         let stopped = self.is_stopped();
         let failure = || {
@@ -1297,47 +1325,71 @@ impl Actor {
         });
     }
 
-    /// Raises the sequence of the next object to `object_seq`. When the open
-    /// batch was opened below it, the batch is sealed first, so that no id
-    /// below the floor is assigned from now on.
-    fn handle_raise_sequence_floor(
+    /// Raises the sequence of the next object to `sequence_floor`, then
+    /// records the obsolete watermark of the region; neither is done when the
+    /// sequence cannot be raised.
+    fn handle_obsolete(
         &mut self,
-        object_seq: u64,
+        region_id: RegionId,
+        watermark: EntryId,
+        sequence_floor: u64,
         response: oneshot::Sender<Result<()>>,
     ) {
-        self.sequence_floor = self.sequence_floor.max(object_seq);
-        if !self.is_stopped()
-            && self
-                .next_object_seq
-                .is_some_and(|next_object_seq| next_object_seq < object_seq)
-        {
-            self.flush_open_batch();
-            self.raise_next_object_seq(object_seq);
-        }
-        let result = terminal(&self.terminal_error).map_or(Ok(()), |error| Err(shared(&error)));
+        let result = self.raise_sequence_floor(sequence_floor).map(|_| {
+            record_obsolete(&self.obsolete_entry_ids, region_id, watermark);
+        });
         let _ = response.send(result);
     }
 
-    /// Moves the sequence of the next object up to `object_seq` unless it is
-    /// there already. A sequence that does not fit an entry id poisons the
-    /// store like an exhausted one.
-    fn raise_next_object_seq(&mut self, object_seq: u64) {
-        let Some(next_object_seq) = self.next_object_seq else {
-            return;
-        };
-        if next_object_seq >= object_seq {
-            return;
+    /// Moves the sequence of the next object up to `sequence_floor` unless
+    /// it is there already. The move fails while the next sequence is not
+    /// settled: the open batch handed out ids under it, a create is in
+    /// flight, or a rolled back batch may have left an object at it. Skipping
+    /// such a sequence would leave an object that recovery indexes but this
+    /// store never did, so the next create at that sequence has to reconcile
+    /// it first. A floor that does not fit an entry id poisons the store like
+    /// an exhausted sequence.
+    fn raise_sequence_floor(&mut self, sequence_floor: u64) -> Result<()> {
+        // Nothing is assigned an id after stop began.
+        if self.is_stopped() {
+            return Ok(());
         }
-        if object_seq < OBJECT_SEQ_LIMIT {
-            self.next_object_seq = Some(object_seq);
+        if let Some(error) = terminal(&self.terminal_error) {
+            return Err(shared(&error));
+        }
+        let Some(next_object_seq) = self.next_object_seq else {
+            return Ok(());
+        };
+        if next_object_seq >= sequence_floor {
+            return Ok(());
+        }
+        if let Some(batch) = self.sealed.front() {
+            return WalObjectSequenceUnsettledSnafu {
+                object_seq: batch.object_seq,
+            }
+            .fail();
+        }
+        ensure!(
+            self.open_batch.is_empty()
+                && self
+                    .unresolved_object_seq
+                    .is_none_or(|unresolved| unresolved < next_object_seq),
+            WalObjectSequenceUnsettledSnafu {
+                object_seq: next_object_seq,
+            }
+        );
+        if sequence_floor < OBJECT_SEQ_LIMIT {
+            self.next_object_seq = Some(sequence_floor);
+            Ok(())
         } else {
             self.next_object_seq = None;
-            self.poison(
+            let error = self.poison(
                 WalObjectSequenceExhaustedSnafu {
                     last_object_seq: OBJECT_SEQ_LIMIT - 1,
                 }
                 .build(),
             );
+            Err(shared(&error))
         }
     }
 
@@ -2662,12 +2714,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_obsolete_raises_the_sequence_floor() {
-        let store = open(memory_store(), &enqueued(manual())).await;
+        let store = open(memory_store(), &manual()).await;
         let region_one = region(1);
         let region_two = region(2);
-        append(&store, region_one, "a1").await.unwrap();
+        let mut admitted = 0;
+        let mut spawn_append = |region_id, data: &'static str| {
+            let store = store.clone();
+            admitted += 1;
+            (
+                tokio::spawn(async move { append(&store, region_id, data).await }),
+                admitted,
+            )
+        };
+        let (first, count) = spawn_append(region_one, "a1");
+        store.wait_for_admitted_appends(count).await.unwrap();
         store.seal_open_batch().await.unwrap();
-        append(&store, region_one, "a2").await.unwrap();
+        let response = timeout(WAIT, first).await.unwrap().unwrap().unwrap();
+        assert_eq!(HashMap::from([(region_one, 1)]), response.last_entry_ids);
+        let (second, count) = spawn_append(region_one, "a2");
+        store.wait_for_admitted_appends(count).await.unwrap();
 
         // A durable watermark names an object below the next sequence and
         // changes nothing: the open batch goes on under sequence 1.
@@ -2675,31 +2740,64 @@ mod tests {
             .obsolete(&provider(region_one), region_one, 1)
             .await
             .unwrap();
-        let response = append(&store, region_one, "a3").await.unwrap();
+        let (third, count) = spawn_append(region_one, "a3");
+        store.wait_for_admitted_appends(count).await.unwrap();
+
+        // A watermark that names a later object, as one inherited from
+        // another prefix does, cannot move the sequence while the open batch
+        // handed out ids under it: neither the sequence nor the watermark
+        // moves.
+        let error = store
+            .obsolete(&provider(region_two), region_two, id(3, 7))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::WalObjectSequenceUnsettled { object_seq: 1, .. }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            store
+                .obsolete_entry_ids
+                .lock()
+                .unwrap()
+                .get(&region_two)
+                .is_none()
+        );
+
+        // Once the batch is durable the sequence moves above that object, so
+        // the region's next id is greater than the watermark.
+        store.seal_open_batch().await.unwrap();
+        let response = timeout(WAIT, second).await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            HashMap::from([(region_one, id(1, 1))]),
+            response.last_entry_ids
+        );
+        let response = timeout(WAIT, third).await.unwrap().unwrap().unwrap();
         assert_eq!(
             HashMap::from([(region_one, id(1, 2))]),
             response.last_entry_ids
         );
-
-        // A watermark that names a later object, as one inherited from
-        // another prefix does, seals the open batch and moves the sequence
-        // above that object, so the region's next id is greater.
+        assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
         store
             .obsolete(&provider(region_two), region_two, id(3, 7))
             .await
             .unwrap();
-        timeout(WAIT, store.wait_durable(&provider(region_one), id(1, 2)))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
-        let response = append(&store, region_two, "b1").await.unwrap();
+        assert_eq!(
+            Some(&id(3, 7)),
+            store.obsolete_entry_ids.lock().unwrap().get(&region_two)
+        );
+        let (fourth, count) = spawn_append(region_two, "b1");
+        store.wait_for_admitted_appends(count).await.unwrap();
+        store.seal_open_batch().await.unwrap();
+        let response = timeout(WAIT, fourth).await.unwrap().unwrap().unwrap();
         assert_eq!(
             HashMap::from([(region_two, id(4, 1))]),
             response.last_entry_ids
         );
         assert!(id(4, 1) > id(3, 7));
-        store.seal_open_batch().await.unwrap();
         assert_eq!(vec![0, 1, 4], object_seqs(store.io.as_ref()).await);
         // The watermark hides nothing of this prefix; the region has no
         // entry at or below it.
@@ -2711,7 +2809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_rollback_keeps_the_sequence_floor() {
+    async fn test_store_floor_waits_for_a_create_in_flight_and_its_rollback() {
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -2723,17 +2821,36 @@ mod tests {
             tokio::spawn(async move { append(&store, region_one, "a1").await })
         };
         let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+        let assert_unsettled = |error: Error| {
+            assert!(
+                matches!(
+                    error,
+                    Error::WalObjectSequenceUnsettled { object_seq: 0, .. }
+                ),
+                "unexpected error: {error:?}"
+            );
+        };
 
-        // The floor rises while object 0 is in flight, then the create fails:
-        // the sequence rolls back to the floor, not to object 0.
-        store
+        // Object 0 is in flight: the floor cannot move past it.
+        let error = store
             .obsolete(&provider(region_two), region_two, id(5, 1))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_unsettled(error);
+
+        // The create fails before anything was written; whether an object
+        // exists at sequence 0 is not known to the store, so the floor still
+        // cannot skip it.
         gate.send(false).unwrap();
         timeout(WAIT, pending).await.unwrap().unwrap().unwrap_err();
         assert!(object_seqs(io.as_ref()).await.is_empty());
+        let error = store
+            .obsolete(&provider(region_two), region_two, id(5, 1))
+            .await
+            .unwrap_err();
+        assert_unsettled(error);
 
+        // The retry reconciles sequence 0, after which the floor applies.
         let retry = {
             let store = store.clone();
             tokio::spawn(async move { append(&store, region_one, "a1").await })
@@ -2745,11 +2862,142 @@ mod tests {
             .send(true)
             .unwrap();
         let response = timeout(WAIT, retry).await.unwrap().unwrap().unwrap();
+        assert_eq!(HashMap::from([(region_one, 1)]), response.last_entry_ids);
+        store
+            .obsolete(&provider(region_two), region_two, id(5, 1))
+            .await
+            .unwrap();
+        let next = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_one, "a2").await })
+        };
+        timeout(WAIT, gates.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .send(true)
+            .unwrap();
+        let response = timeout(WAIT, next).await.unwrap().unwrap().unwrap();
         assert_eq!(
             HashMap::from([(region_one, id(6, 1))]),
             response.last_entry_ids
         );
-        assert_eq!(vec![6], object_seqs(io.as_ref()).await);
+        assert_eq!(vec![0, 6], object_seqs(io.as_ref()).await);
+    }
+
+    #[tokio::test]
+    async fn test_store_floor_does_not_skip_an_object_left_by_a_failed_create() {
+        let io = Arc::new(FaultyIo::new());
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_one = region(1);
+        let region_two = region(2);
+
+        // Object 0 is written, but its create is reported as failed: the
+        // object exists and is not indexed.
+        io.fail_after_next_put.store(true, Ordering::Relaxed);
+        append(&store, region_one, "a1").await.unwrap_err();
+        assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+        assert_eq!(0, latest(&store, region_one));
+
+        // A floor from another region may not skip sequence 0: a later
+        // object would carry the retry, and recovery would index both.
+        let error = store
+            .obsolete(&provider(region_two), region_two, id(5, 1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::WalObjectSequenceUnsettled { object_seq: 0, .. }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            store
+                .obsolete_entry_ids
+                .lock()
+                .unwrap()
+                .get(&region_two)
+                .is_none()
+        );
+
+        // The identical retry reconciles sequence 0; now the floor applies.
+        let response = append(&store, region_one, "a1").await.unwrap();
+        assert_eq!(HashMap::from([(region_one, 1)]), response.last_entry_ids);
+        store
+            .obsolete(&provider(region_two), region_two, id(5, 1))
+            .await
+            .unwrap();
+        let response = append(&store, region_two, "b1").await.unwrap();
+        assert_eq!(
+            HashMap::from([(region_two, id(6, 1))]),
+            response.last_entry_ids
+        );
+        assert_eq!(vec![0, 6], object_seqs(io.as_ref()).await);
+        store.stop().await.unwrap();
+
+        // Recovery indexes the same objects the store did: one copy of "a1".
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        assert_eq!(entries(&[(1, "a1")]), read(&store, region_one, 0).await);
+        assert_eq!(
+            entries(&[(id(6, 1), "b1")]),
+            read(&store, region_two, 0).await
+        );
+        assert_eq!(1, latest(&store, region_one));
+    }
+
+    #[tokio::test]
+    async fn test_store_cancelled_obsolete_publishes_nothing() {
+        let store = open(memory_store(), &eager()).await;
+        let region_id = region(1);
+
+        // The command channel is full, so the call suspends before the
+        // actor learns of it, and is dropped there.
+        let permits = store.command_tx.reserve_many(COMMAND_BUFFER).await.unwrap();
+        {
+            let provider = provider(region_id);
+            let obsolete = store.obsolete(&provider, region_id, id(5, 1));
+            tokio::pin!(obsolete);
+            assert!(futures::poll!(obsolete.as_mut()).is_pending());
+        }
+        drop(permits);
+
+        // Neither the watermark nor the floor was applied: the next entry
+        // takes sequence 0 and is readable.
+        assert!(
+            store
+                .obsolete_entry_ids
+                .lock()
+                .unwrap()
+                .get(&region_id)
+                .is_none()
+        );
+        let response = append(&store, region_id, "new").await.unwrap();
+        assert_eq!(HashMap::from([(region_id, 1)]), response.last_entry_ids);
+        assert_eq!(entries(&[(1, "new")]), read(&store, region_id, 0).await);
+
+        // A call that completes applies both.
+        store
+            .obsolete(&provider(region_id), region_id, id(5, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(&id(5, 1)),
+            store.obsolete_entry_ids.lock().unwrap().get(&region_id)
+        );
+        let response = append(&store, region_id, "later").await.unwrap();
+        assert_eq!(
+            HashMap::from([(region_id, id(6, 1))]),
+            response.last_entry_ids
+        );
+        assert_eq!(
+            entries(&[(id(6, 1), "later")]),
+            read(&store, region_id, 0).await
+        );
     }
 
     #[tokio::test]

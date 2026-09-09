@@ -346,6 +346,16 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "WAL object sequence {} is not settled: its entries are being written or the outcome of its create is unknown",
+        object_seq
+    ))]
+    WalObjectSequenceUnsettled {
+        object_seq: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
         "WAL entry positions of region {} in one object are exhausted",
         region_id
     ))]
@@ -482,6 +492,7 @@ impl ErrorExt for Error {
             | WalObjectHistoryGap { .. }
             | WalObjectSequenceExhausted { .. }
             | WalEntryPositionExhausted { .. } => StatusCode::Unexpected,
+            WalObjectSequenceUnsettled { .. } => StatusCode::IllegalState,
 
             // Object store related errors
             CreateWriter { .. }
@@ -520,7 +531,10 @@ impl ErrorExt for Error {
             | WalObjectStore { error, .. } => retry_hint_from_opendal_error(error),
             ObjectStoreWal { source, .. } => source.retry_hint(),
             Io { error, .. } => retry_hint_from_io_error(error),
-            FetchEntry { .. } | RaftEngine { .. } | AddEntryLogBatch { .. } => RetryHint::Retryable,
+            FetchEntry { .. }
+            | RaftEngine { .. }
+            | AddEntryLogBatch { .. }
+            | WalObjectSequenceUnsettled { .. } => RetryHint::Retryable,
             ProduceRecord { error, .. } => match error {
                 rskafka::client::producer::Error::Client(error) => {
                     rskafka_client_error_to_retry_hint(error)
