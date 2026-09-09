@@ -292,7 +292,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(config.prefix, "wal");
-        assert_eq!(config.flush_interval, Duration::from_secs(1));
+        assert_eq!(config.flush_interval, Duration::from_millis(100));
         assert_eq!(config.max_batch_bytes, ReadableSize::mb(8));
         assert_eq!(config.ack_mode, AckMode::Durable);
         assert_eq!(config.max_unpersisted_bytes, ReadableSize::mb(64));
