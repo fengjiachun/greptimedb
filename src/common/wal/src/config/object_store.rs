@@ -48,7 +48,8 @@ pub struct ObjectStoreWalConfig {
     /// The store runs under a node prefix derived from it, see
     /// [`node_prefix`](Self::node_prefix).
     pub prefix: String,
-    /// Interval of flushing buffered entries to the object store.
+    /// Interval of flushing buffered entries to the object store, at least
+    /// 10ms, defaults to 100ms.
     #[serde(with = "humantime_serde")]
     pub flush_interval: Duration,
     /// The max size of a single batch object, defaults to 8MiB.
@@ -69,7 +70,7 @@ impl Default for ObjectStoreWalConfig {
         Self {
             storage_provider: String::new(),
             prefix: "wal".to_string(),
-            flush_interval: Duration::from_secs(1),
+            flush_interval: Duration::from_millis(100),
             max_batch_bytes: ReadableSize::mb(8),
             ack_mode: AckMode::Durable,
             max_unpersisted_bytes: ReadableSize::mb(64),

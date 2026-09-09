@@ -368,11 +368,11 @@ overwrite_entry_start_id = false
 ## **It's only used when the provider is `experimental_object_store`**.
 #+ prefix = "wal"
 
-## The interval of flushing buffered entries to the object store, at least `10ms`, defaults to `1s`.
-## Each non-empty timer-triggered flush creates one object; a batch that reaches `max_batch_bytes` is flushed immediately, and a failed create adds a read-back.
-## An append waits for the next tick plus the create, so a smaller interval lowers acknowledgement latency at the cost of more object requests when writes are sparse.
+## The interval of flushing buffered entries to the object store, at least `10ms`, defaults to `100ms`.
+## Each non-empty timer-triggered flush creates one object, and a batch that reaches `max_batch_bytes` is flushed immediately, so under sustained load the batch seals on size and the interval no longer matters.
+## When writes are sparse, a shorter interval lowers the acknowledgement latency of `durable` appends and raises the number of object requests, at most one object per interval per node; the `enqueued` mode makes the latency independent of the interval.
 ## **It's only used when the provider is `experimental_object_store`**.
-#+ flush_interval = "1s"
+#+ flush_interval = "100ms"
 
 ## When an append to the object store WAL returns.
 ## - `durable`: an append returns after the object holding its entries is durable (the default).
