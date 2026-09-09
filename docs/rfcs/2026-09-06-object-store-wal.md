@@ -243,7 +243,7 @@ The Kafka code path assumes a broker assigns offsets and that a topic is shared 
 
 ## One object per region per flush
 
-Simpler catalog, but every region then produces its own timer-driven object, so the request rate scales with the number of regions even when they write little, which is the cost trap object stores punish. Sharing one batch across regions removes that per-region floor: at low volume there is one object per interval regardless of region count, and at high volume the count is governed by aggregate bytes and `max_batch_bytes`, which is the same request volume a single busy region would produce.
+Simpler catalog, but every region then produces its own timer-driven object, so the request rate scales with the number of regions even when they write little, which is the cost trap object stores punish. Sharing one batch across regions removes that per-region floor: at low volume timer-triggered sealing creates one object per interval regardless of region count, with the `enqueued` backlog thresholds able to seal earlier, and at high volume the count is governed by aggregate bytes and `max_batch_bytes`, which is the same request volume a single busy region would produce.
 
 # Drawbacks
 
