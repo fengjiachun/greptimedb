@@ -277,8 +277,9 @@ Sealing may only exclude objects whose writes were never acknowledged, which tak
 3. Garbage collection of objects whose every segment is at or below its region's flushed watermark, keeping the highest-sequence object, driven by the watermarks Mito re-establishes on open.
 4. Metrics for flush latency, object count and size, replay duration; a fault matrix for network errors, unwritable buckets and missing objects.
 5. After a transient create failure whose immediate read-back also failed, reconcile the sequence number before reusing it, so that a create that succeeded without a response is indexed instead of conflicting with the next batch.
-6. A cost comparison against Raft Engine with `sync_write = true` on a cloud object store, to confirm `max_batch_bytes` and the request cost of the default interval; the local measurements under *Evidence* calibrated only the interval and the acknowledgement mode.
-7. Distributed mode, which needs metasrv-side allocation of node ids and generations, the takeover chain in `WalOptions`, read-only replay of a foreign prefix, and cross-node garbage collection, as sketched under *Alignment with cluster mode*.
+6. Probe the next sequence with a GET from the last known sequence instead of listing the whole prefix at recovery; on a prefix with many objects the probe is cheaper than the listing.
+7. A cost comparison against Raft Engine with `sync_write = true` on a cloud object store, to confirm `max_batch_bytes` and the request cost of the default interval; the local measurements under *Evidence* calibrated only the interval and the acknowledgement mode.
+8. Distributed mode, which needs metasrv-side allocation of node ids and generations, the takeover chain in `WalOptions`, read-only replay of a foreign prefix, and cross-node garbage collection, as sketched under *Alignment with cluster mode*.
 
 # Unresolved questions
 
