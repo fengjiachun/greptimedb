@@ -510,7 +510,8 @@ impl LogStore for ObjectStoreLogStore {
     /// actor, so a call that is cancelled publishes neither, and the call
     /// fails with [`Error::WalObjectSequenceUnsettled`] while the sequence
     /// cannot be raised without skipping a sequence whose create outcome is
-    /// unknown, which includes an `entry_id` that is not durable yet.
+    /// unknown. In the `enqueued` mode an `entry_id` this store handed out
+    /// needs no floor: it is never handed out again while the store runs.
     async fn obsolete(
         &self,
         provider: &Provider,
@@ -525,8 +526,8 @@ impl LogStore for ObjectStoreLogStore {
         let (response_tx, response_rx) = oneshot::channel();
         let command = Command::Obsolete {
             region_id,
+            entry_id,
             watermark,
-            sequence_floor: sequence_floor(entry_id),
             response: response_tx,
         };
         let answered = match self.command_tx.send(command).await {
@@ -617,12 +618,13 @@ enum Command {
         entry_id: EntryId,
         response: oneshot::Sender<Result<()>>,
     },
-    /// Answered once the watermark is recorded and no id below the object
-    /// `sequence_floor` can be assigned, or with the reason neither was done.
+    /// Answered once the watermark is recorded and no id of the region at
+    /// or below `entry_id` can be assigned, or with the reason neither was
+    /// done.
     Obsolete {
         region_id: RegionId,
+        entry_id: EntryId,
         watermark: EntryId,
-        sequence_floor: u64,
         response: oneshot::Sender<Result<()>>,
     },
     Stop {
@@ -791,8 +793,8 @@ impl Actor {
                     Some(Command::WaitDurable { region_id, entry_id, response }) => {
                         self.handle_wait_durable(region_id, entry_id, response);
                     }
-                    Some(Command::Obsolete { region_id, watermark, sequence_floor, response }) => {
-                        self.handle_obsolete(region_id, watermark, sequence_floor, response);
+                    Some(Command::Obsolete { region_id, entry_id, watermark, response }) => {
+                        self.handle_obsolete(region_id, entry_id, watermark, response);
                     }
                     Some(Command::Stop { response }) => {
                         self.handle_stop(response);
@@ -1330,31 +1332,31 @@ impl Actor {
         });
     }
 
-    /// Raises the sequence of the next object to `sequence_floor`, then
-    /// records the obsolete watermark of the region; neither is done when the
-    /// sequence cannot be raised.
+    /// Makes sure no id of the region at or below `entry_id` is assigned
+    /// from now on, then records the obsolete watermark of the region;
+    /// neither is done when the sequence cannot be raised.
     fn handle_obsolete(
         &mut self,
         region_id: RegionId,
+        entry_id: EntryId,
         watermark: EntryId,
-        sequence_floor: u64,
         response: oneshot::Sender<Result<()>>,
     ) {
-        let result = self.raise_sequence_floor(sequence_floor).map(|_| {
+        let result = self.raise_sequence_floor(region_id, entry_id).map(|_| {
             record_obsolete(&self.obsolete_entry_ids, region_id, watermark);
         });
         let _ = response.send(result);
     }
 
-    /// Moves the sequence of the next object up to `sequence_floor` unless
-    /// it is there already. The move fails while the next sequence is not
-    /// settled: the open batch handed out ids under it, a create is in
-    /// flight, or a rolled back batch may have left an object at it. Skipping
-    /// such a sequence would leave an object that recovery indexes but this
-    /// store never did, so the next create at that sequence has to reconcile
-    /// it first. A floor that does not fit an entry id poisons the store like
-    /// an exhausted sequence.
-    fn raise_sequence_floor(&mut self, sequence_floor: u64) -> Result<()> {
+    /// Moves the sequence of the next object above the object that holds
+    /// `entry_id` unless it is there already. The move fails while the next
+    /// sequence is not settled: the open batch handed out ids under it, a
+    /// create is in flight, or a rolled back batch may have left an object
+    /// at it. Skipping such a sequence would leave an object that recovery
+    /// indexes but this store never did, so the next create at that sequence
+    /// has to reconcile it first. A floor that does not fit an entry id
+    /// poisons the store like an exhausted sequence.
+    fn raise_sequence_floor(&mut self, region_id: RegionId, entry_id: EntryId) -> Result<()> {
         // Nothing is assigned an id after stop began.
         if self.is_stopped() {
             return Ok(());
@@ -1362,6 +1364,17 @@ impl Actor {
         if let Some(error) = terminal(&self.terminal_error) {
             return Err(shared(&error));
         }
+        // In the `enqueued` mode an id the store handed out is never handed
+        // out again while it runs: a create that fails transiently is
+        // repeated under its sequence and a permanent failure poisons the
+        // store. Every later id of the region is greater, so the id needs no
+        // floor even before it is durable.
+        if self.ack_mode == AckMode::Enqueued
+            && entry_id <= self.issued_entry_ids.get(&region_id).copied().unwrap_or(0)
+        {
+            return Ok(());
+        }
+        let sequence_floor = sequence_floor(entry_id);
         let Some(next_object_seq) = self.next_object_seq else {
             return Ok(());
         };
@@ -3068,6 +3081,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_enqueued_issued_id_needs_no_floor_while_in_flight() {
+        let store = open(memory_store(), &enqueued(manual())).await;
+        let region_id = region(1);
+        store.hold_creates();
+        append(&store, region_id, "a1").await.unwrap();
+        let seal = {
+            let store = store.clone();
+            tokio::spawn(async move { store.seal_open_batch().await })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!seal.is_finished());
+
+        // Id 1 was handed out and is in flight: a region that is dropped
+        // hands it in, and it is accepted without waiting for the upload,
+        // with the watermark capped to what is durable. An id the store
+        // never handed out still has to wait.
+        store
+            .obsolete(&provider(region_id), region_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(&0),
+            store.obsolete_entry_ids.lock().unwrap().get(&region_id)
+        );
+        let error = store
+            .obsolete(&provider(region_id), region_id, 2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::WalObjectSequenceUnsettled { object_seq: 0, .. }
+            ),
+            "unexpected error: {error:?}"
+        );
+
+        store.release_creates();
+        timeout(WAIT, seal).await.unwrap().unwrap().unwrap();
+        assert_eq!(entries(&[(1, "a1")]), read(&store, region_id, 0).await);
+        store
+            .obsolete(&provider(region_id), region_id, 1)
+            .await
+            .unwrap();
+        assert!(read(&store, region_id, 0).await.is_empty());
+        let response = append(&store, region_id, "a2").await.unwrap();
+        assert_eq!(
+            HashMap::from([(region_id, id(1, 1))]),
+            response.last_entry_ids
+        );
+    }
+
+    #[tokio::test]
     async fn test_store_enqueued_inherited_watermark_raises_the_floor() {
         let object_store = memory_store();
         let store = open(object_store.clone(), &enqueued(manual())).await;
@@ -4098,26 +4165,13 @@ mod tests {
         append(&store, region_id, "a1").await.unwrap();
         append(&store, region_id, "a2").await.unwrap();
 
-        // An id that is not durable names the open batch, whose sequence is
-        // not settled: nothing is recorded.
-        let error = store
+        store
             .obsolete(&provider(region_id), region_id, 2)
             .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                Error::WalObjectSequenceUnsettled { object_seq: 0, .. }
-            ),
-            "unexpected error: {error:?}"
-        );
-        assert!(
-            store
-                .obsolete_entry_ids
-                .lock()
-                .unwrap()
-                .get(&region_id)
-                .is_none()
+            .unwrap();
+        assert_eq!(
+            Some(&0),
+            store.obsolete_entry_ids.lock().unwrap().get(&region_id)
         );
         store.seal_open_batch().await.unwrap();
         assert_eq!(
