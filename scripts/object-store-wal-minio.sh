@@ -312,7 +312,7 @@ fi
 DRAIN_SECONDS=30
 DRAIN_DEADLINE=""
 while true; do
-  STATE=$(ps -o stat= -p "${TEST_PID}" 2>/dev/null | tr -d ' ')
+  STATE=$(ps -o stat= -p "${TEST_PID}" 2>/dev/null | tr -d ' ' || true)
   case "${STATE}" in
     "" | Z*) break ;;
   esac
