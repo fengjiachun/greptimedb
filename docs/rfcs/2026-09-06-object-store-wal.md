@@ -43,7 +43,7 @@ The provider is added to the four parallel WAL enums so that every resolution pa
 
 | Enum | Variant | Notes |
 | --- | --- | --- |
-| `DatanodeWalConfig` | `ObjectStore(ObjectStoreWalConfig)` | serde tag `experimental_object_store`; fields `storage_provider`, `prefix`, `flush_interval`, `max_batch_bytes`, `ack_mode`, `max_unpersisted_bytes`, `max_unpersisted_age` |
+| `DatanodeWalConfig` | `ObjectStore(ObjectStoreWalConfig)` | serde tag `experimental_object_store`; fields `storage_provider`, `prefix`, `flush_interval`, `max_batch_bytes`, `ack_mode`, `max_unpersisted_bytes`, `max_unpersisted_age`, `on_corrupted_segment` |
 | `WalOptions` | `ObjectStore(ObjectStoreWalOptions { prefix })` | persisted per region with the stable tag `object_store`; flat key `wal.object_store.prefix`; the value is the derived node prefix |
 | `WalProvider` | `ObjectStore { prefix }` | allocates the per-region options in standalone under the derived node prefix; `start` is a no-op |
 | `Provider` | `ObjectStore(Arc<ObjectStoreProvider { region_id, prefix }>)` | `is_remote_wal()` is true |
@@ -249,7 +249,7 @@ Simpler catalog, but every region then produces its own timer-driven object, so 
 - Write latency under the `durable` mode is the time until the batch seals (up to `flush_interval`, 100 ms by default), plus waiting for every earlier object, plus one PUT. For a serial writer Raft Engine on local disk is faster by about the interval; under concurrency the two converge, see *Write path measurements*.
 - Every object costs a request. Timer-triggered sealing creates at most one object per interval per node, ten per second at the default; the `enqueued` mode can seal earlier when the unpersisted backlog reaches a threshold, and under sustained load the count is governed by aggregate bytes and `max_batch_bytes`. The defaults were calibrated on a local object store, not on a cloud bill.
 - Without garbage collection, objects accumulate and recovery time grows linearly with their number.
-- *Proposed* object-sequence-major entry ids consume 20 bits per object for positions, which caps a region at about a million entries per object; the batch seals when the cap is reached. Sequence numbers are 44 bits wide as a result, enough for one object per second for half a million years.
+- Object-sequence-major entry ids consume 20 bits per object for positions, which caps a region at about a million entries per object; the batch seals when the cap is reached. Sequence numbers are 44 bits wide as a result, enough for one object per second for half a million years.
 
 # Alignment with cluster mode
 
@@ -267,21 +267,19 @@ Sealing may only exclude objects whose writes were never acknowledged, which tak
 
 **Acknowledgement modes.** Both are implemented. Cluster mode is expected to run `enqueued` for latency-sensitive workloads; the object layout, the flush durability barrier and the recovery path are identical in both modes.
 
-**Corruption.** *Proposed* segment-level skipping with region marking lets cluster mode route the WAL hole event to the metasrv so that a follower or a takeover knows the region needs a fresh replica rather than a replay.
+**Corruption.** Segment-level skipping with the hole recorded per region is implemented, see *Object format*. *Proposed*: cluster mode routes the WAL hole event to the metasrv so that a follower or a takeover knows the region needs a fresh replica rather than a replay.
 
 **Garbage collection across nodes.** Within one prefix, garbage collection works as described under *Entry ids*: watermark from each region's manifest, per-segment footer comparison, the highest-sequence object always retained. A source prefix that still holds segments of regions which have moved away cannot be trimmed by the source alone, because it no longer learns those regions' watermarks. Either the target reports to the metasrv, after each flush, the source sequence below which it no longer needs the region, and the metasrv drives deletion, or a cluster-level janitor collects the watermarks; which of the two is the last of the *Unresolved questions*.
 
 # Future work
 
-1. Object-sequence-major entry ids, landing as its own change with the crash gate run in both acknowledgement modes.
-2. Segment-level corruption skipping with region marking and metrics.
-3. Garbage collection of objects whose every segment is at or below its region's flushed watermark, keeping the highest-sequence object, driven by the watermarks Mito re-establishes on open.
-4. Metrics for flush latency, object count and size, replay duration; a fault matrix for network errors, unwritable buckets and missing objects.
-5. After a transient create failure whose immediate read-back also failed, reconcile the sequence number before reusing it, so that a create that succeeded without a response is indexed instead of conflicting with the next batch.
-6. Probe the next sequence with a GET from the last known sequence instead of listing the whole prefix at recovery; on a prefix with many objects the probe is cheaper than the listing.
-7. A cost comparison against Raft Engine with `sync_write = true` on a cloud object store, to confirm `max_batch_bytes` and the request cost of the default interval; the local measurements under *Evidence* calibrated only the interval and the acknowledgement mode.
-8. A compatibility fixture that pins object format version 1.
-9. Distributed mode, which needs metasrv-side allocation of node ids and generations, the takeover chain in `WalOptions`, read-only replay of a foreign prefix, and cross-node garbage collection, as sketched under *Alignment with cluster mode*.
+1. Garbage collection of objects whose every segment is at or below its region's flushed watermark, keeping the highest-sequence object, driven by the watermarks Mito re-establishes on open.
+2. Metrics for flush latency, object count and size, replay duration; a fault matrix for network errors, unwritable buckets and missing objects.
+3. After a transient create failure whose immediate read-back also failed, reconcile the sequence number before reusing it, so that a create that succeeded without a response is indexed instead of conflicting with the next batch.
+4. Probe the next sequence with a GET from the last known sequence instead of listing the whole prefix at recovery; on a prefix with many objects the probe is cheaper than the listing.
+5. A cost comparison against Raft Engine with `sync_write = true` on a cloud object store, to confirm `max_batch_bytes` and the request cost of the default interval; the local measurements under *Evidence* calibrated only the interval and the acknowledgement mode.
+6. A compatibility fixture that pins object format version 1.
+7. Distributed mode, which needs metasrv-side allocation of node ids and generations, the takeover chain in `WalOptions`, read-only replay of a foreign prefix, and cross-node garbage collection, as sketched under *Alignment with cluster mode*.
 
 # Unresolved questions
 
