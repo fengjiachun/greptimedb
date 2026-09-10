@@ -65,16 +65,20 @@ done
 curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
 
 # Runs a MinIO client command in the network namespace of the server, so it
-# reaches it without host networking.
+# reaches it without host networking. The credentials reach the inner shell
+# as environment variables and the command as positional parameters, so no
+# value is parsed as shell source.
 mc_run() {
-  docker run --rm --network "container:${MINIO_CONTAINER}" --entrypoint sh "${MC_IMAGE}" -c "
-    mc alias set local http://127.0.0.1:9000 '${MINIO_ACCESS_KEY_ID}' '${MINIO_ACCESS_KEY}' >/dev/null &&
-    $*
-  "
+  docker run --rm --network "container:${MINIO_CONTAINER}" \
+    -e "MC_ACCESS_KEY_ID=${MINIO_ACCESS_KEY_ID}" -e "MC_SECRET_KEY=${MINIO_ACCESS_KEY}" \
+    --entrypoint sh "${MC_IMAGE}" -c '
+    mc alias set local http://127.0.0.1:9000 "${MC_ACCESS_KEY_ID}" "${MC_SECRET_KEY}" >/dev/null && "$@"
+  ' sh "$@"
 }
 
-# The bucket name is inserted into the commands mc_run runs, so it is limited
-# to the characters a bucket name may hold before the first command runs.
+# The bucket name becomes part of the object paths handed to mc, so it is
+# limited to the characters a bucket name may hold before the first command
+# runs.
 if ! [[ "${MINIO_BUCKET}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
   log "invalid bucket name: ${MINIO_BUCKET}"
   exit 1
@@ -84,8 +88,8 @@ fi
 # runs, on this host or another, never share one.
 STORE_ROOT="object-store-wal-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 log "creating bucket ${MINIO_BUCKET} and checking that ${STORE_ROOT} is empty"
-mc_run "mc mb --ignore-existing local/${MINIO_BUCKET}" >/dev/null
-REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/")
+mc_run mc mb --ignore-existing "local/${MINIO_BUCKET}" >/dev/null
+REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/")
 if [ -n "${REMAINING}" ]; then
   log "root ${STORE_ROOT} of bucket ${MINIO_BUCKET} already holds objects:"
   echo "${REMAINING}" >&2
@@ -110,8 +114,8 @@ set -e
 # The root is removed however the test ended, and only the root: the
 # removal is verified by listing it, since removing an empty prefix reports
 # an error.
-mc_run "mc rm --recursive --force local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
-if REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
+mc_run mc rm --recursive --force "local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
+if REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
   CLEANUP="root ${STORE_ROOT} removed and verified empty"
 else
   echo "${REMAINING}" >&2
