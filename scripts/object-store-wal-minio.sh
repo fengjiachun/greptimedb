@@ -226,41 +226,97 @@ collect_evidence() {
     require_line "restart ${restart}" "object_store_wal restart=${restart} wall_ms=[0-9]+"
   done
   # The datanode opens regions once per instance: the first build and two restarts.
-  local opened
-  capture grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true
+  # A reader that fails is a missing field, whatever it printed; grep
+  # reports no match as 1, which is not a failure of the reader.
+  local opened status=0
+  capture grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || status=$?
   opened=${CAPTURED:-0}
-  if [ "${opened}" -lt 3 ]; then
+  if [ "${status}" -gt 1 ]; then
+    MISSING+=("region open timings (the reader failed with status ${status})")
+  elif [ "${opened}" -lt 3 ]; then
     MISSING+=("region open timings (found ${opened}, expected 3)")
   fi
   # The test lists the WAL objects recursively under the configured root prefix
   # and logs every key, which is what shows the layout the store derived below it.
-  capture sh -c 'grep -oE "object_store_wal object=[^ ]+ bytes=[0-9]+" "$1" | sort -u' sh "${LOG_FILE}" || true
+  status=0
+  capture sh -c 'set -o pipefail; grep -oE "object_store_wal object=[^ ]+ bytes=[0-9]+" "$1" | sort -u' sh "${LOG_FILE}" || status=$?
   WAL_OBJECTS=${CAPTURED}
-  if [ -z "${WAL_OBJECTS}" ]; then
+  if [ "${status}" -gt 1 ]; then
+    MISSING+=("WAL object keys (the reader failed with status ${status})")
+  elif [ -z "${WAL_OBJECTS}" ]; then
     MISSING+=("WAL object keys")
   fi
 }
 
-print_manifest() {
+# The manifest's own lines are collected before the verdict, so that a
+# reader or a provenance command that fails counts against the run, and
+# printed after it with nothing left to run.
+IMAGE_ID=unknown
+IMAGE_DIGESTS=""
+BASE_COMMIT=unknown
+PHASE_LINES=""
+REPLAY_LINES=""
+collect_manifest() {
+  local status
   # The image is the one the container runs, which can differ from what the
   # tag resolves to when an older container is reused.
-  local image_id image_digests base_commit
-  capture docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}" 2>/dev/null || true
-  image_id=${CAPTURED:-unknown}
-  capture docker inspect --format '{{join .RepoDigests ","}}' "${image_id}" 2>/dev/null || true
-  image_digests=${CAPTURED}
-  capture git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true
-  base_commit=${CAPTURED:-unknown}
+  status=0
+  capture docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}" 2>/dev/null || status=$?
+  if [ "${status}" -eq 0 ]; then
+    IMAGE_ID=${CAPTURED:-unknown}
+  else
+    MISSING+=("manifest: minio image (docker inspect failed with status ${status})")
+  fi
+  if [ "${IMAGE_ID}" != unknown ]; then
+    status=0
+    capture docker inspect --format '{{join .RepoDigests ","}}' "${IMAGE_ID}" 2>/dev/null || status=$?
+    if [ "${status}" -eq 0 ]; then
+      IMAGE_DIGESTS=${CAPTURED}
+    else
+      MISSING+=("manifest: minio image digests (docker inspect failed with status ${status})")
+    fi
+  fi
+  # The commit checked out while the script ran.
+  status=0
+  capture git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || status=$?
+  if [ "${status}" -eq 0 ]; then
+    BASE_COMMIT=${CAPTURED:-unknown}
+  else
+    MISSING+=("manifest: base commit (git failed with status ${status})")
+  fi
+  status=0
+  capture sh -c 'set -o pipefail; grep -oE "object_store_wal (phase|restart)=[^\"]*" "$1" | sed -E "s/^object_store_wal //"' sh "${LOG_FILE}" || status=$?
+  PHASE_LINES=${CAPTURED}
+  if [ "${status}" -gt 1 ]; then
+    MISSING+=("manifest: phase lines (the reader failed with status ${status})")
+  fi
+  status=0
+  capture sh -c 'set -o pipefail; grep -oE "$2" "$1" | sed -E "s/^/replay: /"' sh "${LOG_FILE}" "${OPEN_PATTERN}" || status=$?
+  REPLAY_LINES=${CAPTURED}
+  if [ "${status}" -gt 1 ]; then
+    MISSING+=("manifest: replay lines (the reader failed with status ${status})")
+  fi
+}
+
+print_manifest() {
+  local line
   echo
   echo "== object store WAL MinIO manifest =="
-  # The commit checked out while the script ran.
-  echo "base commit: ${base_commit}"
-  echo "minio image: ${image_id} (${image_digests:-no repo digest}) in container ${MINIO_CONTAINER}"
+  echo "base commit: ${BASE_COMMIT}"
+  echo "minio image: ${IMAGE_ID} (${IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
   echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT} at ${GT_S3_ENDPOINT_URL}"
-  isolated sh -c 'grep -oE "object_store_wal (phase|restart)=[^\"]*" "$1" | sed -E "s/^object_store_wal //"' sh "${LOG_FILE}" || true
-  isolated sh -c 'grep -oE "$2" "$1" | sed -E "s/^/replay: /"' sh "${LOG_FILE}" "${OPEN_PATTERN}" || true
+  if [ -n "${PHASE_LINES}" ]; then
+    printf '%s\n' "${PHASE_LINES}"
+  fi
+  if [ -n "${REPLAY_LINES}" ]; then
+    printf '%s\n' "${REPLAY_LINES}"
+  fi
   if [ -n "${WAL_OBJECTS}" ]; then
-    printf '%s\n' "${WAL_OBJECTS}" | sed -E 's/^object_store_wal object=/object: /'
+    while IFS= read -r line; do
+      echo "object: ${line#object_store_wal object=}"
+    done <<OBJECTS
+${WAL_OBJECTS}
+OBJECTS
   fi
   for field in ${MISSING[@]+"${MISSING[@]}"}; do
     echo "missing: ${field}"
@@ -289,6 +345,7 @@ finalize() {
   fi
   cleanup_root
   collect_evidence
+  collect_manifest
   # An interruption is only recorded while the test has not ended, so it
   # decides the status; a test that ended keeps its own.
   if [ "${INTERRUPTED}" -eq 1 ]; then
