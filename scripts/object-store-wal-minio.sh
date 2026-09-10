@@ -213,6 +213,39 @@ stop_test() {
 
 # The manifest is evidence, so every field it reports must be present in
 # the log; a missing field fails the run even when the test passed.
+# Prints the lines of its argument once each, in order of first appearance,
+# and prints the lines of a text with a prefix removed from their start and
+# another put in front; both are the shell's own work, so no reader needs a
+# pipeline or a shell other than the running one.
+unique_lines() {
+  local line seen="" out=""
+  while IFS= read -r line; do
+    [ -n "${line}" ] || continue
+    case "${seen}" in
+      *"|${line}|"*) continue ;;
+    esac
+    seen="${seen}|${line}|"
+    out="${out}${line}
+"
+  done <<LINES
+${1}
+LINES
+  printf '%s' "${out%
+}"
+}
+prefix_lines() {
+  local line out=""
+  while IFS= read -r line; do
+    [ -n "${line}" ] || continue
+    out="${out}${1}${line#"${2}"}
+"
+  done <<LINES
+${3}
+LINES
+  printf '%s' "${out%
+}"
+}
+
 MISSING=()
 require_line() {
   if ! isolated grep -qE "${2}" "${LOG_FILE}"; then
@@ -242,8 +275,10 @@ collect_evidence() {
   # The test lists the WAL objects recursively under the configured root prefix
   # and logs every key, which is what shows the layout the store derived below it.
   status=0
-  capture sh -c 'set -o pipefail; grep -oE "object_store_wal object=[^ ]+ bytes=[0-9]+" "$1" | sort -u' sh "${LOG_FILE}" || status=$?
-  WAL_OBJECTS=${CAPTURED}
+  # Every reader is a single grep, so that a status of 1 can only mean no
+  # match; the keys are made unique by the shell itself.
+  capture grep -oE 'object_store_wal object=[^ ]+ bytes=[0-9]+' "${LOG_FILE}" || status=$?
+  WAL_OBJECTS=$(unique_lines "${CAPTURED}")
   if [ "${status}" -gt 1 ]; then
     MISSING+=("WAL object keys (the reader failed with status ${status})")
   elif [ -z "${WAL_OBJECTS}" ]; then
@@ -288,14 +323,16 @@ collect_manifest() {
     MISSING+=("manifest: base commit (git failed with status ${status})")
   fi
   status=0
-  capture sh -c 'set -o pipefail; grep -oE "object_store_wal (phase|restart)=[^\"]*" "$1" | sed -E "s/^object_store_wal //"' sh "${LOG_FILE}" || status=$?
-  PHASE_LINES=${CAPTURED}
+  # The formatting is the shell's own, so a reader is a single grep whose
+  # status of 1 can only mean no match.
+  capture grep -oE 'object_store_wal (phase|restart)=[^"]*' "${LOG_FILE}" || status=$?
+  PHASE_LINES=$(prefix_lines "" "object_store_wal " "${CAPTURED}")
   if [ "${status}" -gt 1 ]; then
     MISSING+=("manifest: phase lines (the reader failed with status ${status})")
   fi
   status=0
-  capture sh -c 'set -o pipefail; grep -oE "$2" "$1" | sed -E "s/^/replay: /"' sh "${LOG_FILE}" "${OPEN_PATTERN}" || status=$?
-  REPLAY_LINES=${CAPTURED}
+  capture grep -oE "${OPEN_PATTERN}" "${LOG_FILE}" || status=$?
+  REPLAY_LINES=$(prefix_lines "replay: " "" "${CAPTURED}")
   if [ "${status}" -gt 1 ]; then
     MISSING+=("manifest: replay lines (the reader failed with status ${status})")
   fi
