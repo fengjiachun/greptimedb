@@ -15,7 +15,7 @@
 //! The log store: a background actor batches appended entries into objects and
 //! reads are served from the object catalog.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use bytes::Bytes;
-use common_wal::config::object_store::{AckMode, ObjectStoreWalConfig};
+use common_telemetry::warn;
+use common_wal::config::object_store::{AckMode, CorruptedSegmentAction, ObjectStoreWalConfig};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
@@ -45,6 +46,7 @@ use crate::error::{
     ObjectStoreWalSnafu, ObjectStoreWalStoppedSnafu, Result, WalObjectHistoryGapSnafu,
     WalObjectSequenceExhaustedSnafu, WalObjectSequenceUnsettledSnafu,
 };
+use crate::metrics::METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL;
 use crate::object_store_wal::batch::{OBJECT_SEQ_LIMIT, OpenBatch, sequence_floor};
 use crate::object_store_wal::catalog::ObjectCatalog;
 use crate::object_store_wal::format::{
@@ -80,14 +82,18 @@ const RECOVERY_TAIL_WINDOW: usize = 64 * 1024;
 /// In the `durable` acknowledgement mode an append returns once its object is
 /// indexed; in the `enqueued` mode it returns on admission and the object is
 /// created in the background. Reads fetch and decode only the segment of the
-/// requested region from every object the catalog lists for it.
+/// requested region from every object the catalog lists for it; a segment
+/// that does not decode is handled as `on_corrupted_segment` says.
 pub struct ObjectStoreLogStore {
     prefix: String,
     ack_mode: AckMode,
+    on_corrupted_segment: CorruptedSegmentAction,
     io: Arc<dyn WalObjectIo>,
     catalog: Arc<RwLock<ObjectCatalog>>,
     /// Largest obsolete entry id per region. Objects are not deleted yet.
     obsolete_entry_ids: ObsoleteEntryIds,
+    /// Segments that reads skipped, per region and by object sequence.
+    wal_holes: WalHoles,
     /// Set once the store hit an error it cannot recover from, such as a
     /// conflicting object; every operation fails with it afterwards.
     terminal_error: TerminalError,
@@ -104,12 +110,26 @@ pub struct ObjectStoreLogStore {
 
 type TerminalError = Arc<Mutex<Option<Arc<Error>>>>;
 type ObsoleteEntryIds = Arc<Mutex<HashMap<RegionId, EntryId>>>;
+type WalHoles = Arc<Mutex<HashMap<RegionId, BTreeMap<u64, WalHole>>>>;
+
+/// A segment a read skipped because it did not decode: the entries of one
+/// region in one object are missing from every read of that region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalHole {
+    /// Key of the object that holds the segment.
+    pub path: String,
+    pub object_seq: u64,
+    /// Entry id range the footer records for the segment.
+    pub min_entry_id: EntryId,
+    pub max_entry_id: EntryId,
+}
 
 impl fmt::Debug for ObjectStoreLogStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObjectStoreLogStore")
             .field("prefix", &self.prefix)
             .field("ack_mode", &self.ack_mode)
+            .field("on_corrupted_segment", &self.on_corrupted_segment)
             .finish_non_exhaustive()
     }
 }
@@ -151,6 +171,7 @@ impl ObjectStoreLogStore {
         let (catalog, next_object_seq, durable_entry_ids) = recover(io.as_ref()).await?;
         let catalog = Arc::new(RwLock::new(catalog));
         let obsolete_entry_ids = ObsoleteEntryIds::default();
+        let wal_holes = WalHoles::default();
         let terminal_error = TerminalError::default();
         let stopped = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
@@ -197,9 +218,11 @@ impl ObjectStoreLogStore {
         Ok(Arc::new(Self {
             prefix: config.prefix.clone(),
             ack_mode: config.ack_mode,
+            on_corrupted_segment: config.on_corrupted_segment,
             io,
             catalog,
             obsolete_entry_ids,
+            wal_holes,
             terminal_error,
             stopped,
             command_tx,
@@ -225,6 +248,21 @@ impl ObjectStoreLogStore {
     fn durable_entry_id_of(&self, region_id: RegionId) -> EntryId {
         let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
         catalog.region_max_entry_id(region_id).unwrap_or(0)
+    }
+
+    /// Returns the segments of the provider's region that reads of this store
+    /// skipped because they did not decode, ordered by object sequence. Holes
+    /// are kept in memory only: a store opened later on the same prefix
+    /// learns of them again from the reads that meet them.
+    pub fn wal_holes(&self, provider: &Provider) -> Result<Vec<WalHole>> {
+        let region_id = self.region_of(provider)?;
+        Ok(self
+            .wal_holes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&region_id)
+            .map(|holes| holes.values().cloned().collect())
+            .unwrap_or_default())
     }
 
     /// Returns the region of `provider`, which must select this store's prefix.
@@ -344,6 +382,30 @@ impl ObjectStoreLogStore {
     pub fn begin_stop(&self) {
         self.stopped.store(true, Ordering::Release);
     }
+
+    /// Returns the key of the object `object_seq` and the byte range the
+    /// segment of the provider's region occupies in it, so a test can damage
+    /// that segment alone, or `None` when the object holds no segment of the
+    /// region.
+    pub fn segment_location(
+        &self,
+        provider: &Provider,
+        object_seq: u64,
+    ) -> Result<Option<(String, Range<u64>)>> {
+        let region_id = self.region_of(provider)?;
+        let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+        Ok(catalog
+            .objects_for_entry_range(region_id, 0, EntryId::MAX)?
+            .into_iter()
+            .find(|(seq, _)| *seq == object_seq)
+            .map(|(_, entry)| {
+                let start = entry.segment_offset;
+                (
+                    self.io.object_path(object_seq),
+                    start..start + entry.segment_len,
+                )
+            }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -410,7 +472,9 @@ impl LogStore for ObjectStoreLogStore {
 
     /// Returns the entries of the provider's region with ids from `entry_id`
     /// on, skipping ids the region has obsoleted. Objects are located through
-    /// the catalog, so `index` is not needed.
+    /// the catalog, so `index` is not needed. A segment that does not decode
+    /// fails the read or is skipped and recorded as a hole, as
+    /// `on_corrupted_segment` says; an I/O failure always fails the read.
     async fn read(
         &self,
         provider: &Provider,
@@ -446,15 +510,20 @@ impl LogStore for ObjectStoreLogStore {
 
         let io = self.io.clone();
         let provider = provider.clone();
+        let on_corrupted_segment = self.on_corrupted_segment;
+        let wal_holes = self.wal_holes.clone();
         Ok(Box::pin(try_stream! {
             for (object_seq, footer_entry) in objects {
-                let bytes = io
-                    .get_range(object_seq, footer_entry.segment_offset, footer_entry.segment_len)
-                    .await?;
-                let records = decode_segment(&bytes, &footer_entry)
-                    .with_context(|_| InvalidWalObjectSnafu {
-                        path: io.object_path(object_seq),
-                    })?;
+                let records = match fetch_segment(io.as_ref(), object_seq, &footer_entry).await {
+                    Ok(records) => records,
+                    Err(error @ Error::InvalidWalObject { .. })
+                        if on_corrupted_segment == CorruptedSegmentAction::Skip =>
+                    {
+                        skip_segment(&wal_holes, &io, object_seq, &footer_entry, &error);
+                        continue;
+                    }
+                    Err(error) => Err(error)?,
+                };
                 let entries = records
                     .into_iter()
                     .filter(|record| record.entry_id >= start_entry_id)
@@ -1517,6 +1586,59 @@ fn shared(error: &Arc<Error>) -> Error {
     ObjectStoreWalSnafu.into_error(error.clone())
 }
 
+/// Fetches and decodes the segment `entry` describes in the object
+/// `object_seq`. A segment that does not decode is fetched once more, since
+/// the download rather than the object may be damaged; when it still does not
+/// decode the error is returned as [`Error::InvalidWalObject`]. A failed fetch
+/// is returned as is.
+async fn fetch_segment(
+    io: &dyn WalObjectIo,
+    object_seq: u64,
+    entry: &FooterEntry,
+) -> Result<Vec<Record>> {
+    let fetch = || io.get_range(object_seq, entry.segment_offset, entry.segment_len);
+    if let Ok(records) = decode_segment(&fetch().await?, entry) {
+        return Ok(records);
+    }
+    decode_segment(&fetch().await?, entry).with_context(|_| InvalidWalObjectSnafu {
+        path: io.object_path(object_seq),
+    })
+}
+
+/// Records the segment `entry` describes in the object `object_seq` as a hole
+/// of its region, once per object, counts the skip and warns about it.
+fn skip_segment(
+    wal_holes: &WalHoles,
+    io: &Arc<dyn WalObjectIo>,
+    object_seq: u64,
+    entry: &FooterEntry,
+    error: &Error,
+) {
+    let hole = WalHole {
+        path: io.object_path(object_seq),
+        object_seq,
+        min_entry_id: entry.min_entry_id,
+        max_entry_id: entry.max_entry_id,
+    };
+    warn!(
+        error;
+        "Skipped a corrupted WAL segment of region {}, object {} (sequence {}), entry ids {}..={}",
+        entry.region_id,
+        hole.path,
+        object_seq,
+        hole.min_entry_id,
+        hole.max_entry_id
+    );
+    METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.inc();
+    wal_holes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(entry.region_id)
+        .or_default()
+        .entry(object_seq)
+        .or_insert(hole);
+}
+
 fn encode_batch(
     object_seq: u64,
     writer_instance: [u8; 16],
@@ -1766,6 +1888,18 @@ mod tests {
     fn enqueued(config: ObjectStoreWalConfig) -> ObjectStoreWalConfig {
         ObjectStoreWalConfig {
             ack_mode: AckMode::Enqueued,
+            ..config
+        }
+    }
+
+    /// The same batching as `config`, handling a corrupted segment as
+    /// `on_corrupted_segment` says.
+    fn on_corruption(
+        on_corrupted_segment: CorruptedSegmentAction,
+        config: ObjectStoreWalConfig,
+    ) -> ObjectStoreWalConfig {
+        ObjectStoreWalConfig {
+            on_corrupted_segment,
             ..config
         }
     }
@@ -3391,6 +3525,18 @@ mod tests {
         (trailer, footer)
     }
 
+    /// Asserts that recovery over `object_store` rejects the object at `path`
+    /// for `reason`, whatever a read does with a corrupted segment.
+    async fn assert_recovery_rejects(object_store: &ObjectStore, path: &str, reason: &str) {
+        for on_corrupted_segment in [CorruptedSegmentAction::Skip, CorruptedSegmentAction::Fail] {
+            let config = on_corruption(on_corrupted_segment, eager());
+            let error = ObjectStoreLogStore::try_new(object_store.clone(), &config)
+                .await
+                .unwrap_err();
+            assert_invalid_object(&error, path, reason);
+        }
+    }
+
     fn assert_invalid_object(error: &Error, path: &str, reason: &str) {
         match error {
             Error::InvalidWalObject {
@@ -3466,10 +3612,7 @@ mod tests {
             let path = object_path(&object_store, 1);
             corrupt_object(&object_store, &path, corrupt).await;
 
-            let error = ObjectStoreLogStore::try_new(object_store, &eager())
-                .await
-                .unwrap_err();
-            assert_invalid_object(&error, &path, reason);
+            assert_recovery_rejects(&object_store, &path, reason).await;
         }
     }
 
@@ -3491,14 +3634,12 @@ mod tests {
         .unwrap();
         io.put_if_absent(5, encoded.bytes).await.unwrap();
 
-        let error = ObjectStoreLogStore::try_new(object_store, &eager())
-            .await
-            .unwrap_err();
-        assert_invalid_object(
-            &error,
+        assert_recovery_rejects(
+            &object_store,
             &io.object_path(5),
             "header sequence 0 does not match key sequence 5",
-        );
+        )
+        .await;
     }
 
     /// Overwrites the byte range of footer entry `index` and refreshes the
@@ -3551,19 +3692,17 @@ mod tests {
             })
             .await;
 
-            let error = ObjectStoreLogStore::try_new(object_store.clone(), &eager())
-                .await
-                .unwrap_err();
-            assert_invalid_object(&error, &path, reason);
+            assert_recovery_rejects(&object_store, &path, reason).await;
             let io = ObjectStoreIo::new(object_store, PREFIX).unwrap();
             let error = recover_by_decoding(&io).await.unwrap_err();
             assert_invalid_object(&error, &path, reason);
         }
     }
 
-    #[tokio::test]
-    async fn test_store_corrupted_segment_fails_the_read_that_decodes_it() {
-        let object_store = memory_store();
+    /// Writes object 0 with one entry of region 1 and one of region 2 and
+    /// object 1 with a second entry of region 2, then flips a byte in the
+    /// segment of region 2 in object 0. Returns the key of object 0.
+    async fn write_corrupted_segment(object_store: &ObjectStore) -> String {
         let region_one = region(1);
         let region_two = region(2);
         let store = open(object_store.clone(), &eager()).await;
@@ -3576,17 +3715,87 @@ mod tests {
             .unwrap();
         append(&store, region_two, "b2").await.unwrap();
         store.stop().await.unwrap();
-        let path = object_path(&object_store, 0);
-        corrupt_object(&object_store, &path, |bytes| {
+        let path = object_path(object_store, 0);
+        corrupt_object(object_store, &path, |bytes| {
             let (_, footer) = footer_of(bytes);
             let segment = &footer[1];
             assert_eq!(region_two, segment.region_id);
             bytes[(segment.segment_offset + segment.segment_len - 1) as usize] ^= 1;
         })
         .await;
+        path
+    }
+
+    #[tokio::test]
+    async fn test_store_skips_a_corrupted_segment_and_records_a_hole() {
+        let object_store = memory_store();
+        let region_one = region(1);
+        let region_two = region(2);
+        let path = write_corrupted_segment(&object_store).await;
+        let skipped = METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get();
+
+        // Recovery indexes the object; a read of the other region and of the
+        // later object of the damaged region are unaffected.
+        let store = open(object_store, &eager()).await;
+        assert_eq!(CorruptedSegmentAction::Skip, store.on_corrupted_segment);
+        assert_eq!(1, latest(&store, region_one));
+        assert_eq!(id(1, 1), latest(&store, region_two));
+        assert_eq!(entries(&[(1, "a1")]), read(&store, region_one, 1).await);
+        assert_eq!(
+            entries(&[(id(1, 1), "b2")]),
+            read(&store, region_two, id(1, 1)).await
+        );
+        assert!(store.wal_holes(&provider(region_two)).unwrap().is_empty());
+        assert_eq!(
+            skipped,
+            METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get()
+        );
+
+        // A read across the damaged segment continues with the next object
+        // and records the hole.
+        assert_eq!(
+            entries(&[(id(1, 1), "b2")]),
+            read(&store, region_two, 1).await
+        );
+        let hole = WalHole {
+            path: path.clone(),
+            object_seq: 0,
+            min_entry_id: 1,
+            max_entry_id: 1,
+        };
+        assert_eq!(
+            vec![hole.clone()],
+            store.wal_holes(&provider(region_two)).unwrap()
+        );
+        assert!(store.wal_holes(&provider(region_one)).unwrap().is_empty());
+        assert_eq!(
+            skipped + 1,
+            METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get()
+        );
+
+        // Every read across the segment skips it again; the hole is one.
+        assert_eq!(
+            entries(&[(id(1, 1), "b2")]),
+            read(&store, region_two, 1).await
+        );
+        assert_eq!(vec![hole], store.wal_holes(&provider(region_two)).unwrap());
+        assert_eq!(
+            skipped + 2,
+            METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_corrupted_segment_fails_the_read_that_decodes_it() {
+        let object_store = memory_store();
+        let region_one = region(1);
+        let region_two = region(2);
+        let path = write_corrupted_segment(&object_store).await;
+        let skipped = METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get();
 
         // Recovery indexes the object; only the corrupted segment is unreadable.
-        let store = open(object_store, &eager()).await;
+        let config = on_corruption(CorruptedSegmentAction::Fail, eager());
+        let store = open(object_store, &config).await;
         assert_eq!(1, latest(&store, region_one));
         assert_eq!(id(1, 1), latest(&store, region_two));
         assert_eq!(entries(&[(1, "a1")]), read(&store, region_one, 1).await);
@@ -3606,6 +3815,48 @@ mod tests {
             &path,
             &format!("segment of region {region_two} checksum mismatch"),
         );
+        assert!(store.wal_holes(&provider(region_two)).unwrap().is_empty());
+        assert_eq!(
+            skipped,
+            METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_reads_a_segment_whose_first_download_was_damaged() {
+        for on_corrupted_segment in [CorruptedSegmentAction::Skip, CorruptedSegmentAction::Fail] {
+            let io = Arc::new(FaultyIo::new());
+            let config = on_corruption(on_corrupted_segment, eager());
+            let store = ObjectStoreLogStore::open(io.clone(), &config)
+                .await
+                .unwrap();
+            let region_one = region(1);
+            let region_two = region(2);
+            store
+                .append_batch(vec![
+                    entry(&store, region_one, "a1"),
+                    entry(&store, region_two, "b1"),
+                ])
+                .await
+                .unwrap();
+            append(&store, region_two, "b2").await.unwrap();
+            let skipped = METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get();
+
+            // The first download of the segment is damaged, the second is
+            // not: the read sees the entries and records no hole.
+            io.damage_next_range_read.store(true, Ordering::Relaxed);
+            assert_eq!(
+                entries(&[(1, "b1"), (id(1, 1), "b2")]),
+                read(&store, region_two, 1).await
+            );
+            assert!(!io.damage_next_range_read.load(Ordering::Relaxed));
+            assert!(store.wal_holes(&provider(region_two)).unwrap().is_empty());
+            assert_eq!(
+                skipped,
+                METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get()
+            );
+            store.stop().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4444,13 +4695,15 @@ mod tests {
     }
 
     /// Object access that fails a conditional create on request, either before
-    /// or after the object was actually written, or every read of one object.
+    /// or after the object was actually written, fails every read of one
+    /// object, or damages the bytes the next range read returns.
     struct FaultyIo {
         inner: ObjectStoreIo,
         fail_next_put: AtomicBool,
         fail_after_next_put: AtomicBool,
         /// Sequence of the object whose reads fail; `u64::MAX` fails none.
         fail_reads_of: AtomicU64,
+        damage_next_range_read: AtomicBool,
     }
 
     impl FaultyIo {
@@ -4464,6 +4717,7 @@ mod tests {
                 fail_next_put: AtomicBool::new(false),
                 fail_after_next_put: AtomicBool::new(false),
                 fail_reads_of: AtomicU64::new(u64::MAX),
+                damage_next_range_read: AtomicBool::new(false),
             }
         }
 
@@ -4501,7 +4755,15 @@ mod tests {
 
         async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
             self.check_read(object_seq)?;
-            self.inner.get_range(object_seq, offset, len).await
+            let bytes = self.inner.get_range(object_seq, offset, len).await?;
+            if self.damage_next_range_read.swap(false, Ordering::Relaxed) {
+                let mut damaged = bytes.to_vec();
+                if let Some(last) = damaged.last_mut() {
+                    *last ^= 1;
+                }
+                return Ok(Bytes::from(damaged));
+            }
+            Ok(bytes)
         }
 
         async fn list(&self) -> Result<Vec<ListedObject>> {

@@ -389,6 +389,12 @@ overwrite_entry_start_id = false
 ## **It's only used when the provider is `experimental_object_store` and `ack_mode` is `enqueued`**.
 #+ max_unpersisted_age = "8s"
 
+## What a read does with a segment whose checksum does not match after fetching it once more.
+## - `skip`: the segment is skipped and recorded as a WAL hole of its region, a metric is incremented and a warning is logged; the other regions of the object are unaffected (the default).
+## - `fail`: the read fails, so the region does not open.
+## **It's only used when the provider is `experimental_object_store`**.
+#+ on_corrupted_segment = "skip"
+
 # The Kafka SASL configuration.
 # **It's only used when the provider is `kafka`**.
 # Available SASL mechanisms:
