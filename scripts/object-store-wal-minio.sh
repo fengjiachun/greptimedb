@@ -134,9 +134,24 @@ cleanup_root() {
 on_signal() {
   if [ -z "${TEST_PID}" ]; then
     INTERRUPTED=1
-  elif pkill -TERM -P "${TEST_PID}" 2>/dev/null; then
+  elif kill -TERM -- "-${TEST_PID}" 2>/dev/null; then
     INTERRUPTED=1
   fi
+}
+
+# The test runs in a process group of its own (job control is on), so
+# stopping it reaches the test binary as well as the runner; the group is
+# waited for until every member is gone, since only the subshell is a child.
+stop_test() {
+  kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
+  wait "${TEST_PID}" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    if ! kill -0 -- "-${TEST_PID}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  kill -KILL -- "-${TEST_PID}" 2>/dev/null || true
 }
 
 # The manifest is evidence, so every field it reports must be present in
@@ -204,8 +219,7 @@ finalize() {
   FINALIZED=1
   set +e
   if [ -n "${TEST_PID}" ]; then
-    pkill -TERM -P "${TEST_PID}" 2>/dev/null
-    wait "${TEST_PID}" 2>/dev/null
+    stop_test
     TEST_PID=""
   fi
   cleanup_root
@@ -234,15 +248,19 @@ trap on_signal INT TERM
 
 log "running ${TEST_NAME}, log in ${LOG_FILE}"
 cd "${ROOT_DIR}"
-# The test runs in the background so that a signal reaches the trap while
-# it runs; the subshell inherits pipefail, so its status is the test's.
+# The test runs in the background, in a process group of its own, so that
+# a signal reaches the trap while it runs and stopping it reaches every
+# process of the test; the subshell inherits pipefail, so its status is the
+# test's.
+set -m
 (
   cargo nextest run -p tests-integration --test main \
     -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
 ) &
 TEST_PID=$!
+set +m
 if [ "${INTERRUPTED}" -eq 1 ]; then
-  pkill -TERM -P "${TEST_PID}" 2>/dev/null || true
+  kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
 fi
 # A signal makes the wait return before the test is reaped, so the wait is
 # repeated until it is; a status above 128 with the test gone is its own.
@@ -250,10 +268,14 @@ while true; do
   if wait "${TEST_PID}"; then
     TEST_STATUS=0
     break
+  else
+    TEST_STATUS=$?
   fi
-  TEST_STATUS=$?
   if [ "${TEST_STATUS}" -le 128 ] || ! kill -0 "${TEST_PID}" 2>/dev/null; then
     break
   fi
 done
+if [ "${INTERRUPTED}" -eq 1 ]; then
+  stop_test
+fi
 TEST_PID=""
