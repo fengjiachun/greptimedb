@@ -224,7 +224,9 @@ finalize() {
   fi
   cleanup_root
   collect_evidence
-  if [ "${INTERRUPTED}" -eq 1 ] && [ -z "${TEST_STATUS}" ]; then
+  # An interruption that stopped the test, or arrived before it, exits 130;
+  # a test that had already ended keeps its own status.
+  if [ "${INTERRUPTED}" -eq 1 ] && { [ -z "${TEST_STATUS}" ] || [ "${TEST_STATUS}" -gt 128 ]; }; then
     STATUS=130
   elif [ -n "${TEST_STATUS}" ] && [ "${TEST_STATUS}" -ne 0 ]; then
     STATUS=${TEST_STATUS}
