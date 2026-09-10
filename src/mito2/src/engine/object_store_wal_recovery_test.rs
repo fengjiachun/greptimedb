@@ -28,7 +28,7 @@ use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
 use common_wal::config::object_store::{AckMode, ObjectStoreWalConfig};
 use common_wal::options::{ObjectStoreWalOptions, WAL_OPTIONS_KEY, WalOptions};
-use log_store::object_store_wal::ObjectStoreLogStore;
+use log_store::object_store_wal::{ObjectStoreLogStore, entry_id};
 use object_store::ObjectStore;
 use object_store::services::Memory;
 use rstest::rstest;
@@ -262,7 +262,8 @@ async fn test_reopen_after_partial_flush_replays_only_unflushed_regions(#[case] 
     let (table_dir_a, schema_a) = create_region(&engine, REGION_A, &[]).await;
     let (table_dir_b, schema_b) = create_region(&engine, REGION_B, &[]).await;
 
-    // Two objects, each holding one entry of both regions.
+    // Two objects, each holding one entry of both regions: the ids of a
+    // region are its position under the sequence of its object.
     let mut writer = SealedWriter::new(&store);
     writer
         .put_and_seal(
@@ -282,18 +283,18 @@ async fn test_reopen_after_partial_flush_replays_only_unflushed_regions(#[case] 
             ],
         )
         .await;
-    assert_eq!(2, latest(&store, REGION_A));
-    assert_eq!(2, latest(&store, REGION_B));
+    assert_eq!(entry_id(1, 1), latest(&store, REGION_A));
+    assert_eq!(entry_id(1, 1), latest(&store, REGION_B));
 
     // Flushing empties the memtables, so the topic latest entry id follows
     // the store.
     flush_region(&engine, REGION_A, None).await;
     assert_eq!(
         EntryIds {
-            flushed_entry_id: 2,
-            last_entry_id: 2,
-            topic_latest_entry_id: 2,
-            manifest_flushed_entry_id: 2,
+            flushed_entry_id: entry_id(1, 1),
+            last_entry_id: entry_id(1, 1),
+            topic_latest_entry_id: entry_id(1, 1),
+            manifest_flushed_entry_id: entry_id(1, 1),
             memtable_rows: 0,
         },
         entry_ids(&engine, REGION_A).await
@@ -319,10 +320,10 @@ async fn test_reopen_after_partial_flush_replays_only_unflushed_regions(#[case] 
     // entry id comes from the store. Region B replays both of its entries.
     assert_eq!(
         EntryIds {
-            flushed_entry_id: 2,
-            last_entry_id: 2,
-            topic_latest_entry_id: 2,
-            manifest_flushed_entry_id: 2,
+            flushed_entry_id: entry_id(1, 1),
+            last_entry_id: entry_id(1, 1),
+            topic_latest_entry_id: entry_id(1, 1),
+            manifest_flushed_entry_id: entry_id(1, 1),
             memtable_rows: 0,
         },
         entry_ids(&engine, REGION_A).await
@@ -330,15 +331,15 @@ async fn test_reopen_after_partial_flush_replays_only_unflushed_regions(#[case] 
     assert_eq!(
         EntryIds {
             flushed_entry_id: 0,
-            last_entry_id: 2,
+            last_entry_id: entry_id(1, 1),
             topic_latest_entry_id: 0,
             manifest_flushed_entry_id: 0,
             memtable_rows: 5,
         },
         entry_ids(&engine, REGION_B).await
     );
-    assert_eq!(2, latest(&store, REGION_A));
-    assert_eq!(2, latest(&store, REGION_B));
+    assert_eq!(entry_id(1, 1), latest(&store, REGION_A));
+    assert_eq!(entry_id(1, 1), latest(&store, REGION_B));
     assert_eq!(rows_a, scan_rows(&engine, REGION_A).await);
     assert_eq!(rows_b, scan_rows(&engine, REGION_B).await);
     assert_eq!(4, engine.get_region_statistic(REGION_A).unwrap().num_rows);
@@ -496,7 +497,7 @@ async fn test_entry_ids_continue_across_two_restarts(#[case] ack_mode: AckMode) 
     let engine = new_engine(&mut env, store.clone()).await;
     let (table_dir, schema) = create_region(&engine, REGION_A, &[]).await;
 
-    // Entry 1 is flushed, entry 2 is not.
+    // The entry of object 0 is flushed, the entry of object 1 is not.
     let mut writer = SealedWriter::new(&store);
     writer
         .put_and_seal(&engine, vec![(REGION_A, rows(&schema, 0, 2))])
@@ -505,13 +506,13 @@ async fn test_entry_ids_continue_across_two_restarts(#[case] ack_mode: AckMode) 
     writer
         .put_and_seal(&engine, vec![(REGION_A, rows(&schema, 2, 4))])
         .await;
-    assert_eq!(2, latest(&store, REGION_A));
+    assert_eq!(entry_id(1, 1), latest(&store, REGION_A));
     engine.stop().await.unwrap();
     drop(engine);
     drop(writer);
     drop(store);
 
-    // First restart replays entry 2 only.
+    // First restart replays the entry of object 1 only.
     let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
@@ -520,7 +521,7 @@ async fn test_entry_ids_continue_across_two_restarts(#[case] ack_mode: AckMode) 
     assert_eq!(
         EntryIds {
             flushed_entry_id: 1,
-            last_entry_id: 2,
+            last_entry_id: entry_id(1, 1),
             topic_latest_entry_id: 1,
             manifest_flushed_entry_id: 1,
             memtable_rows: 2,
@@ -529,25 +530,29 @@ async fn test_entry_ids_continue_across_two_restarts(#[case] ack_mode: AckMode) 
     );
     assert_eq!(4, engine.get_region_statistic(REGION_A).unwrap().num_rows);
 
-    // Entry 3 continues the sequence and is flushed, entry 4 is not.
+    // The sequence continues at object 2, whose entry is flushed; the entry
+    // of object 3 is not.
     let mut writer = SealedWriter::new(&store);
     writer
         .put_and_seal(&engine, vec![(REGION_A, rows(&schema, 4, 6))])
         .await;
-    assert_eq!(3, latest(&store, REGION_A));
-    assert_eq!(3, entry_ids(&engine, REGION_A).await.last_entry_id);
+    assert_eq!(entry_id(2, 1), latest(&store, REGION_A));
+    assert_eq!(
+        entry_id(2, 1),
+        entry_ids(&engine, REGION_A).await.last_entry_id
+    );
     flush_region(&engine, REGION_A, None).await;
     writer
         .put_and_seal(&engine, vec![(REGION_A, rows(&schema, 6, 8))])
         .await;
-    assert_eq!(4, latest(&store, REGION_A));
+    assert_eq!(entry_id(3, 1), latest(&store, REGION_A));
     let rows_before = scan_rows(&engine, REGION_A).await;
     engine.stop().await.unwrap();
     drop(engine);
     drop(writer);
     drop(store);
 
-    // Second restart replays entry 4 only.
+    // Second restart replays the entry of object 3 only.
     let store = open_store_with(&object_store, PREFIX, ack_mode).await;
     let engine = new_engine(&mut env, store.clone()).await;
     open_region(&engine, REGION_A, &table_dir, PREFIX, &[])
@@ -555,15 +560,15 @@ async fn test_entry_ids_continue_across_two_restarts(#[case] ack_mode: AckMode) 
         .unwrap();
     assert_eq!(
         EntryIds {
-            flushed_entry_id: 3,
-            last_entry_id: 4,
-            topic_latest_entry_id: 3,
-            manifest_flushed_entry_id: 3,
+            flushed_entry_id: entry_id(2, 1),
+            last_entry_id: entry_id(3, 1),
+            topic_latest_entry_id: entry_id(2, 1),
+            manifest_flushed_entry_id: entry_id(2, 1),
             memtable_rows: 2,
         },
         entry_ids(&engine, REGION_A).await
     );
-    assert_eq!(4, latest(&store, REGION_A));
+    assert_eq!(entry_id(3, 1), latest(&store, REGION_A));
     assert_eq!(rows_before, scan_rows(&engine, REGION_A).await);
     assert_eq!(8, engine.get_region_statistic(REGION_A).unwrap().num_rows);
     assert_eq!(

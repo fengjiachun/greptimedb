@@ -23,6 +23,7 @@ use store_api::storage::RegionId;
 use crate::error::{
     CorruptedWalObjectSnafu, InvalidWalEntryRangeSnafu, Result, WalObjectSequenceExhaustedSnafu,
 };
+use crate::object_store_wal::batch::{OBJECT_SEQ_LIMIT, sequence_floor};
 use crate::object_store_wal::format::FooterEntry;
 
 /// Indexes objects by sequence and, per region, the objects that hold entries
@@ -174,14 +175,34 @@ impl ObjectCatalog {
     ///
     /// An empty catalog starts at zero, so the first object of a prefix always
     /// takes sequence zero. Otherwise the sequence continues after the largest
-    /// indexed one, which recovery discovers regardless of insertion order.
+    /// indexed one, which recovery discovers regardless of insertion order, and
+    /// is raised further when the largest entry id of a region lies at or above
+    /// the ids that sequence would assign: ids assigned under the earlier
+    /// contiguous scheme carry no object information, and every new id of a
+    /// region must be greater than every id it already has. A sequence at or
+    /// above [`OBJECT_SEQ_LIMIT`] does not fit an entry id and is rejected.
     pub(super) fn next_object_seq(&self) -> Result<u64> {
-        let Some((&last_object_seq, _)) = self.objects.last_key_value() else {
-            return Ok(0);
+        let after_last = match self.objects.last_key_value() {
+            None => 0,
+            Some((&last_object_seq, _)) => last_object_seq
+                .checked_add(1)
+                .context(WalObjectSequenceExhaustedSnafu { last_object_seq })?,
         };
-        last_object_seq
-            .checked_add(1)
-            .context(WalObjectSequenceExhaustedSnafu { last_object_seq })
+        let floor = self
+            .regions
+            .keys()
+            .filter_map(|region_id| self.region_max_entry_id(*region_id))
+            .map(sequence_floor)
+            .max()
+            .unwrap_or(0);
+        let next_object_seq = after_last.max(floor);
+        ensure!(
+            next_object_seq < OBJECT_SEQ_LIMIT,
+            WalObjectSequenceExhaustedSnafu {
+                last_object_seq: next_object_seq - 1,
+            }
+        );
+        Ok(next_object_seq)
     }
 
     /// Iterates over the indexed objects ordered by object sequence.
@@ -208,6 +229,7 @@ fn out_of_order(
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::object_store_wal::batch::entry_id;
 
     #[test]
     fn test_catalog_indexes_objects_and_queries_ranges() {
@@ -291,18 +313,73 @@ mod tests {
     }
 
     #[test]
+    fn test_catalog_raises_object_sequence_above_existing_entry_ids() {
+        let region_one = RegionId::new(1, 1);
+        let region_two = RegionId::new(1, 2);
+        let mut catalog = ObjectCatalog::default();
+
+        // Ids that fit below the ids of the next sequence leave it alone.
+        catalog
+            .insert_object(0, vec![footer_entry(region_one, 1, 3)])
+            .unwrap();
+        catalog
+            .insert_object(
+                1,
+                vec![footer_entry(region_two, entry_id(1, 1), entry_id(1, 2))],
+            )
+            .unwrap();
+        assert_eq!(2, catalog.next_object_seq().unwrap());
+
+        // A contiguous id past them names a later object: the sequence
+        // resumes above it, whichever region holds it.
+        catalog
+            .insert_object(2, vec![footer_entry(region_one, 5_000_000, 5_000_000)])
+            .unwrap();
+        assert_eq!(5, catalog.next_object_seq().unwrap());
+        catalog
+            .insert_object(
+                3,
+                vec![footer_entry(region_two, entry_id(7, 4), entry_id(7, 4))],
+            )
+            .unwrap();
+        assert_eq!(8, catalog.next_object_seq().unwrap());
+    }
+
+    #[test]
     fn test_catalog_rejects_exhausted_object_sequence() {
         let region_id = RegionId::new(1, 1);
+        let assert_exhausted = |catalog: &ObjectCatalog| {
+            let error = catalog.next_object_seq().unwrap_err();
+            assert!(
+                error.to_string().contains("object sequence is exhausted"),
+                "unexpected error: {error}"
+            );
+        };
+
+        // The last sequence that fits an entry id is indexed.
+        let mut catalog = ObjectCatalog::default();
+        catalog
+            .insert_object(OBJECT_SEQ_LIMIT - 2, vec![footer_entry(region_id, 1, 2)])
+            .unwrap();
+        assert_eq!(OBJECT_SEQ_LIMIT - 1, catalog.next_object_seq().unwrap());
+        catalog
+            .insert_object(OBJECT_SEQ_LIMIT - 1, vec![footer_entry(region_id, 3, 4)])
+            .unwrap();
+        assert_exhausted(&catalog);
+
+        // A sequence that does not fit was written by an earlier scheme.
         let mut catalog = ObjectCatalog::default();
         catalog
             .insert_object(u64::MAX, vec![footer_entry(region_id, 1, 2)])
             .unwrap();
+        assert_exhausted(&catalog);
 
-        let error = catalog.next_object_seq().unwrap_err();
-        assert!(
-            error.to_string().contains("object sequence is exhausted"),
-            "unexpected error: {error}"
-        );
+        // An entry id that leaves no sequence above it.
+        let mut catalog = ObjectCatalog::default();
+        catalog
+            .insert_object(0, vec![footer_entry(region_id, u64::MAX, u64::MAX)])
+            .unwrap();
+        assert_exhausted(&catalog);
     }
 
     #[test]
@@ -369,7 +446,7 @@ mod tests {
                 .checked_sub(min_entry_id)
                 .and_then(|count| count.checked_add(1))
                 .unwrap_or(0) as u32,
-            segment_offset: min_entry_id * 100,
+            segment_offset: min_entry_id.wrapping_mul(100),
             segment_len: 100,
             segment_crc32: min_entry_id as u32,
         }
