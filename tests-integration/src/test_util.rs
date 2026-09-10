@@ -153,7 +153,10 @@ fn s3_test_config() -> S3Config {
         connection: S3Connection {
             // A driver that removes exactly what its run wrote sets the root;
             // every run gets a fresh one otherwise.
-            root: env::var("GT_S3_ROOT").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+            root: env::var("GT_S3_ROOT")
+                .ok()
+                .filter(|root| !root.is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             access_key_id: env::var("GT_S3_ACCESS_KEY_ID").unwrap().into(),
             secret_access_key: env::var("GT_S3_ACCESS_KEY").unwrap().into(),
             bucket: env::var("GT_S3_BUCKET").unwrap(),

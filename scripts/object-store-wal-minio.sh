@@ -73,9 +73,16 @@ mc_run() {
   "
 }
 
+# The bucket name is inserted into the commands mc_run runs, so it is limited
+# to the characters a bucket name may hold before the first command runs.
+if ! [[ "${MINIO_BUCKET}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
+  log "invalid bucket name: ${MINIO_BUCKET}"
+  exit 1
+fi
 # Every run stores under its own root of the bucket, so nothing outside the
-# root is read, counted or removed.
-STORE_ROOT="object-store-wal-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# root is read, counted or removed; the root is random so that concurrent
+# runs, on this host or another, never share one.
+STORE_ROOT="object-store-wal-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 log "creating bucket ${MINIO_BUCKET} and checking that ${STORE_ROOT} is empty"
 mc_run "mc mb --ignore-existing local/${MINIO_BUCKET}" >/dev/null
 REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/")
