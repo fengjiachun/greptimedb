@@ -100,8 +100,8 @@ export GT_S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_PORT}"
 # exactly once and verified by listing it (removing an empty prefix reports
 # an error, so the listing is the evidence), and the manifest is printed. A
 # failed test keeps its exit status; an interrupted run exits 130. The
-# functions are defined before the check so that the traps can be installed
-# as the first thing after it.
+# functions are defined before the check because the traps are installed
+# before it.
 ROOT_OWNED=0
 TEST_PID=""
 TEST_STATUS=""
@@ -155,7 +155,7 @@ group_gone() {
     if ! kill -0 -- "-${TEST_PID}" 2>/dev/null; then
       return 0
     fi
-    sleep 0.1
+    sleep 0.1 || true
   done
   ! kill -0 -- "-${TEST_PID}" 2>/dev/null
 }
@@ -233,6 +233,9 @@ finalize() {
   fi
   FINALIZED=1
   set +e
+  if [ -z "${TEST_STATUS}" ] && [ -s "${STATUS_FILE}" ]; then
+    TEST_STATUS=$(cat "${STATUS_FILE}")
+  fi
   # Whatever the wrapper reported, no process of the test may outlive the
   # root: a member of its group still there is stopped first, and if it
   # survives that, the root is left alone.
@@ -328,7 +331,9 @@ while true; do
       break
     fi
   fi
-  sleep 0.1
+  # A signal to the whole foreground group reaches this sleep as well; the
+  # handler decides what it means, the interrupted sleep does not.
+  sleep 0.1 || true
 done
 if wait "${TEST_PID}" 2>/dev/null; then
   WRAPPER_STATUS=0
