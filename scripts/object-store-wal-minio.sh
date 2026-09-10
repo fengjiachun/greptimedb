@@ -92,11 +92,14 @@ isolated() {
 }
 # Captures the output of an isolated command through a file, since a
 # command substitution would run it in a subshell without job control.
+# The status file is allocated later; an inherited value must not be the
+# one the trap removes.
+STATUS_FILE=""
 CAPTURE_FILE=$(mktemp -t object-store-wal-minio-capture.XXXXXX)
 CAPTURED=""
 # Until `finalize` takes over the exit, the temporary files are the only
 # thing to clean up.
-trap 'rm -f "${STATUS_FILE:-}" "${CAPTURE_FILE}"' EXIT
+trap 'rm -f "${STATUS_FILE}" "${CAPTURE_FILE}"' EXIT
 capture() {
   local status=0
   : > "${CAPTURE_FILE}"
