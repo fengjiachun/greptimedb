@@ -296,34 +296,24 @@ if [ "${INTERRUPTED}" -eq 1 ]; then
   kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
 fi
 # A signal makes the wait return with a status above 128 without reaping
-# the wrapper, so such a status is checked by waiting again: a wrapper that
-# is no longer a child was reaped by the first wait, and the status was its
-# own; otherwise the second wait returns it.
-WRAPPER_STATUS=""
-while true; do
-  if wait "${TEST_PID}"; then
-    WRAPPER_STATUS=0
-    break
-  else
-    WRAPPER_STATUS=$?
-  fi
-  if [ "${WRAPPER_STATUS}" -le 128 ]; then
-    break
-  fi
+# the wrapper, so such a status is checked by waiting once more: a wrapper
+# that is no longer a child was reaped by the first wait and the status was
+# its own; otherwise the second wait returns it.
+if wait "${TEST_PID}"; then
+  WRAPPER_STATUS=0
+else
+  WRAPPER_STATUS=$?
+fi
+if [ "${WRAPPER_STATUS}" -gt 128 ]; then
   if wait "${TEST_PID}" 2>/dev/null; then
     WRAPPER_STATUS=0
-    break
   else
     AGAIN=$?
+    if [ "${AGAIN}" -ne 127 ]; then
+      WRAPPER_STATUS=${AGAIN}
+    fi
   fi
-  if [ "${AGAIN}" -eq 127 ]; then
-    break
-  fi
-  WRAPPER_STATUS=${AGAIN}
-  if [ "${AGAIN}" -le 128 ]; then
-    break
-  fi
-done
+fi
 if [ -s "${STATUS_FILE}" ]; then
   TEST_STATUS=$(cat "${STATUS_FILE}")
 else
