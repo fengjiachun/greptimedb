@@ -102,6 +102,7 @@ export GT_S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_PORT}"
 # failed test keeps its exit status; an interrupted run exits 130. The
 # functions are defined before the check so that the traps can be installed
 # as the first thing after it.
+ROOT_OWNED=0
 TEST_PID=""
 TEST_STATUS=""
 # Written by the test wrapper the moment the test exits, independently of
@@ -114,6 +115,10 @@ FINALIZED=0
 
 cleanup_root() {
   if [ -n "${CLEANUP}" ]; then
+    return
+  fi
+  if [ "${ROOT_OWNED}" -eq 0 ]; then
+    CLEANUP="root ${STORE_ROOT} not touched, never found empty by this run"
     return
   fi
   mc_run mc rm --recursive --force "local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
@@ -129,9 +134,7 @@ cleanup_root() {
 # `finalize`. A signal that arrives before the test is registered is
 # remembered and acted on right after; one that arrives once the test has
 # ended changes nothing.
-SIGNALS=0
 on_signal() {
-  SIGNALS=$((SIGNALS + 1))
   if [ -n "${TEST_STATUS}" ] || [ -s "${STATUS_FILE}" ]; then
     return
   fi
@@ -261,6 +264,11 @@ finalize() {
   exit "${STATUS}"
 }
 
+# The traps are installed before the root is checked, so that no statement
+# after a successful check runs unprotected; until the check has passed,
+# `finalize` leaves the root alone.
+trap finalize EXIT
+trap on_signal INT TERM
 log "creating bucket ${MINIO_BUCKET} and checking that ${STORE_ROOT} is empty"
 mc_run mc mb --ignore-existing "local/${MINIO_BUCKET}" >/dev/null
 REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/")
@@ -269,8 +277,7 @@ if [ -n "${REMAINING}" ]; then
   echo "${REMAINING}" >&2
   exit 1
 fi
-trap finalize EXIT
-trap on_signal INT TERM
+ROOT_OWNED=1
 
 log "running ${TEST_NAME}, log in ${LOG_FILE}"
 cd "${ROOT_DIR}"
@@ -297,22 +304,37 @@ set +m
 if [ "${INTERRUPTED}" -eq 1 ]; then
   kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
 fi
-# A trapped signal makes the wait return with a status above 128 without
-# reaping the wrapper, so the wait is repeated whenever a signal was handled
-# while it ran; a status above 128 from a wait no signal interrupted is the
-# wrapper's own.
+# The wrapper is watched rather than waited for, so that a signal never
+# leaves the script blocked and the test's own end is noticed as soon as it
+# records its status. From then on the log copy may drain for a bounded
+# time; a process of the test that keeps the copy from ending is stopped
+# when that time is up, and the recorded status is kept.
+DRAIN_SECONDS=30
+DRAIN_DEADLINE=""
 while true; do
-  SEEN=${SIGNALS}
-  if wait "${TEST_PID}"; then
-    WRAPPER_STATUS=0
-    break
-  else
-    WRAPPER_STATUS=$?
+  STATE=$(ps -o stat= -p "${TEST_PID}" 2>/dev/null | tr -d ' ')
+  case "${STATE}" in
+    "" | Z*) break ;;
+  esac
+  if [ -s "${STATUS_FILE}" ]; then
+    NOW=$(date +%s)
+    if [ -z "${DRAIN_DEADLINE}" ]; then
+      DRAIN_DEADLINE=$((NOW + DRAIN_SECONDS))
+    elif [ "${NOW}" -ge "${DRAIN_DEADLINE}" ]; then
+      log "the test ended ${DRAIN_SECONDS}s ago and its output has not drained, stopping what is left of it"
+      if ! stop_test; then
+        CLEANUP="root ${STORE_ROOT} not removed, a process of the test survived"
+      fi
+      break
+    fi
   fi
-  if [ "${WRAPPER_STATUS}" -le 128 ] || [ "${SIGNALS}" -eq "${SEEN}" ]; then
-    break
-  fi
+  sleep 0.1
 done
+if wait "${TEST_PID}" 2>/dev/null; then
+  WRAPPER_STATUS=0
+else
+  WRAPPER_STATUS=$?
+fi
 if [ -s "${STATUS_FILE}" ]; then
   TEST_STATUS=$(cat "${STATUS_FILE}")
 else
