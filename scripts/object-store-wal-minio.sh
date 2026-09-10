@@ -82,8 +82,9 @@ isolated() {
   while true; do
     if wait "${pid}" 2>/dev/null; then
       return 0
+    else
+      status=$?
     fi
-    status=$?
     if [ "${status}" -le 128 ] || ! kill -0 "${pid}" 2>/dev/null; then
       return "${status}"
     fi
@@ -363,7 +364,9 @@ fi
 DRAIN_SECONDS=30
 DRAIN_DEADLINE=""
 while kill -0 "${TEST_PID}" 2>/dev/null; do
-  STATE=$(ps -o stat= -p "${TEST_PID}" 2>/dev/null | tr -d ' ' || true)
+  # The substitution's own shell can be ended by a signal to the group; an
+  # empty state then counts as alive, like a cut-short ps.
+  STATE=$(ps -o stat= -p "${TEST_PID}" 2>/dev/null | tr -d ' ' || true) || STATE=""
   case "${STATE}" in
     Z*) break ;;
   esac
