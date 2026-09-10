@@ -89,6 +89,17 @@ isolated() {
     fi
   done
 }
+# Captures the output of an isolated command through a file, since a
+# command substitution would run it in a subshell without job control.
+CAPTURE_FILE=$(mktemp -t object-store-wal-minio-capture.XXXXXX)
+CAPTURED=""
+capture() {
+  local status=0
+  : > "${CAPTURE_FILE}"
+  isolated "$@" > "${CAPTURE_FILE}" || status=$?
+  CAPTURED=$(<"${CAPTURE_FILE}")
+  return "${status}"
+}
 mc_run() {
   isolated docker run --rm --network "container:${MINIO_CONTAINER}" \
     -e "MC_ACCESS_KEY_ID=${MINIO_ACCESS_KEY_ID}" -e "MC_SECRET_KEY=${MINIO_ACCESS_KEY}" \
@@ -143,11 +154,13 @@ cleanup_root() {
     return
   fi
   mc_run mc rm --recursive --force "local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
-  if REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
+  if capture mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/" && [ -z "${CAPTURED}" ]; then
     CLEANUP="root ${STORE_ROOT} removed and verified empty"
-  else
-    echo "${REMAINING}" >&2
+  elif [ -n "${CAPTURED}" ]; then
+    echo "${CAPTURED}" >&2
     CLEANUP="root ${STORE_ROOT} still holds objects"
+  else
+    CLEANUP="root ${STORE_ROOT} removed but not verified, the listing failed"
   fi
 }
 
@@ -209,14 +222,15 @@ collect_evidence() {
   done
   # The datanode opens regions once per instance: the first build and two restarts.
   local opened
-  opened=$(isolated grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true)
-  opened=${opened:-0}
+  capture grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true
+  opened=${CAPTURED:-0}
   if [ "${opened}" -lt 3 ]; then
     MISSING+=("region open timings (found ${opened}, expected 3)")
   fi
   # The test lists the WAL objects recursively under the configured root prefix
   # and logs every key, which is what shows the layout the store derived below it.
-  WAL_OBJECTS=$(isolated sh -c 'grep -oE "object_store_wal object=[^ ]+ bytes=[0-9]+" "$1" | sort -u' sh "${LOG_FILE}" || true)
+  capture sh -c 'grep -oE "object_store_wal object=[^ ]+ bytes=[0-9]+" "$1" | sort -u' sh "${LOG_FILE}" || true
+  WAL_OBJECTS=${CAPTURED}
   if [ -z "${WAL_OBJECTS}" ]; then
     MISSING+=("WAL object keys")
   fi
@@ -225,13 +239,17 @@ collect_evidence() {
 print_manifest() {
   # The image is the one the container runs, which can differ from what the
   # tag resolves to when an older container is reused.
-  local image_id image_digests
-  image_id=$(isolated docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}" 2>/dev/null || echo unknown)
-  image_digests=$(isolated docker inspect --format '{{join .RepoDigests ","}}' "${image_id}" 2>/dev/null || true)
+  local image_id image_digests base_commit
+  capture docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}" 2>/dev/null || true
+  image_id=${CAPTURED:-unknown}
+  capture docker inspect --format '{{join .RepoDigests ","}}' "${image_id}" 2>/dev/null || true
+  image_digests=${CAPTURED}
+  capture git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true
+  base_commit=${CAPTURED:-unknown}
   echo
   echo "== object store WAL MinIO manifest =="
   # The commit checked out while the script ran.
-  echo "base commit: $(isolated git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "base commit: ${base_commit}"
   echo "minio image: ${image_id} (${image_digests:-no repo digest}) in container ${MINIO_CONTAINER}"
   echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT} at ${GT_S3_ENDPOINT_URL}"
   isolated sh -c 'grep -oE "object_store_wal (phase|restart)=[^\"]*" "$1" | sed -E "s/^object_store_wal //"' sh "${LOG_FILE}" || true
@@ -285,7 +303,7 @@ finalize() {
     RESULT=FAIL
   fi
   print_manifest
-  rm -f "${STATUS_FILE}"
+  rm -f "${STATUS_FILE}" "${CAPTURE_FILE}"
   exit "${STATUS}"
 }
 
@@ -296,7 +314,8 @@ trap finalize EXIT
 trap on_signal INT TERM
 log "creating bucket ${MINIO_BUCKET} and checking that ${STORE_ROOT} is empty"
 mc_run mc mb --ignore-existing "local/${MINIO_BUCKET}" >/dev/null
-REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/")
+capture mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/"
+REMAINING=${CAPTURED}
 if [ -n "${REMAINING}" ]; then
   log "root ${STORE_ROOT} of bucket ${MINIO_BUCKET} already holds objects:"
   echo "${REMAINING}" >&2
