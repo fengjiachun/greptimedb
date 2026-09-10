@@ -50,4 +50,4 @@ mod io;
 mod store;
 
 pub use batch::entry_id;
-pub use store::ObjectStoreLogStore;
+pub use store::{ObjectStoreLogStore, WalHole};

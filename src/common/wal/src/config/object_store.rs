@@ -36,6 +36,20 @@ pub enum AckMode {
     Enqueued,
 }
 
+/// What a read does with a segment that still does not decode after a
+/// second fetch, because its checksum does not match or its content
+/// disagrees with its footer entry.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CorruptedSegmentAction {
+    /// The segment is skipped and recorded as a hole of its region; the other
+    /// regions of the object are unaffected.
+    #[default]
+    Skip,
+    /// The read fails.
+    Fail,
+}
+
 /// Object store wal configurations for datanode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -63,6 +77,10 @@ pub struct ObjectStoreWalConfig {
     /// upload completes in `enqueued` mode, defaults to 8s.
     #[serde(with = "humantime_serde")]
     pub max_unpersisted_age: Duration,
+    /// What a read does with a segment that still does not decode after a
+    /// second fetch, because its checksum does not match or its content
+    /// disagrees with its footer entry, defaults to `skip`.
+    pub on_corrupted_segment: CorruptedSegmentAction,
 }
 
 impl Default for ObjectStoreWalConfig {
@@ -75,6 +93,7 @@ impl Default for ObjectStoreWalConfig {
             ack_mode: AckMode::Durable,
             max_unpersisted_bytes: ReadableSize::mb(64),
             max_unpersisted_age: Duration::from_secs(8),
+            on_corrupted_segment: CorruptedSegmentAction::Skip,
         }
     }
 }

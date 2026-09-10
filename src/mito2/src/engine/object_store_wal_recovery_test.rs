@@ -26,9 +26,9 @@ use common_base::readable_size::ReadableSize;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
-use common_wal::config::object_store::{AckMode, ObjectStoreWalConfig};
+use common_wal::config::object_store::{AckMode, CorruptedSegmentAction, ObjectStoreWalConfig};
 use common_wal::options::{ObjectStoreWalOptions, WAL_OPTIONS_KEY, WalOptions};
-use log_store::object_store_wal::{ObjectStoreLogStore, entry_id};
+use log_store::object_store_wal::{ObjectStoreLogStore, WalHole, entry_id};
 use object_store::ObjectStore;
 use object_store::services::Memory;
 use rstest::rstest;
@@ -66,6 +66,18 @@ async fn open_store(object_store: &ObjectStore, prefix: &str) -> Arc<ObjectStore
     open_store_with(object_store, prefix, AckMode::Durable).await
 }
 
+/// The configuration of a store under `prefix` that never seals a batch on
+/// its own.
+fn store_config(prefix: &str) -> ObjectStoreWalConfig {
+    ObjectStoreWalConfig {
+        storage_provider: String::new(),
+        prefix: prefix.to_string(),
+        flush_interval: Duration::from_secs(3600),
+        max_batch_bytes: ReadableSize(u64::MAX),
+        ..Default::default()
+    }
+}
+
 /// Opens a store under `prefix` with `ack_mode` that never seals a batch on
 /// its own.
 async fn open_store_with(
@@ -74,12 +86,8 @@ async fn open_store_with(
     ack_mode: AckMode,
 ) -> Arc<ObjectStoreLogStore> {
     let config = ObjectStoreWalConfig {
-        storage_provider: String::new(),
-        prefix: prefix.to_string(),
-        flush_interval: Duration::from_secs(3600),
-        max_batch_bytes: ReadableSize(u64::MAX),
         ack_mode,
-        ..Default::default()
+        ..store_config(prefix)
     };
     ObjectStoreLogStore::try_new(object_store.clone(), &config)
         .await
@@ -389,6 +397,109 @@ async fn test_reopen_after_abrupt_drop_replays_durable_entries_once(#[case] ack_
     assert_eq!(1, latest(&store, REGION_A));
     assert_eq!(rows_before, scan_rows(&engine, REGION_A).await);
     assert_eq!(3, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+}
+
+#[rstest]
+#[case(CorruptedSegmentAction::Skip)]
+#[case(CorruptedSegmentAction::Fail)]
+#[tokio::test]
+async fn test_reopen_with_a_corrupted_segment(
+    #[case] on_corrupted_segment: CorruptedSegmentAction,
+) {
+    let mut env = TestEnv::with_prefix("object-store-wal-corrupted-segment").await;
+    let object_store = memory_store();
+    let store = open_store(&object_store, PREFIX).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (table_dir_a, schema_a) = create_region(&engine, REGION_A, &[]).await;
+    let (table_dir_b, schema_b) = create_region(&engine, REGION_B, &[]).await;
+
+    // Two objects, each holding one entry of both regions; nothing is flushed.
+    let mut writer = SealedWriter::new(&store);
+    writer
+        .put_and_seal(
+            &engine,
+            vec![
+                (REGION_A, rows(&schema_a, 0, 2)),
+                (REGION_B, rows(&schema_b, 0, 3)),
+            ],
+        )
+        .await;
+    writer
+        .put_and_seal(
+            &engine,
+            vec![
+                (REGION_A, rows(&schema_a, 2, 4)),
+                (REGION_B, rows(&schema_b, 3, 5)),
+            ],
+        )
+        .await;
+    let rows_b = scan_rows(&engine, REGION_B).await;
+    engine.stop().await.unwrap();
+
+    // The segment of region A in object 0 is damaged.
+    let (path, segment) = store
+        .segment_location(&provider(REGION_A), 0)
+        .unwrap()
+        .unwrap();
+    let mut bytes = object_store.read(&path).await.unwrap().to_vec();
+    bytes[segment.end as usize - 1] ^= 1;
+    object_store.write(&path, bytes).await.unwrap();
+    drop(engine);
+    drop(writer);
+    drop(store);
+
+    let config = ObjectStoreWalConfig {
+        on_corrupted_segment,
+        ..store_config(PREFIX)
+    };
+    let store = ObjectStoreLogStore::try_new(object_store.clone(), &config)
+        .await
+        .unwrap();
+    let engine = new_engine(&mut env, store.clone()).await;
+
+    // Region B replays both of its entries whatever the damage does to A.
+    open_region(&engine, REGION_B, &table_dir_b, PREFIX, &[])
+        .await
+        .unwrap();
+    assert_eq!(rows_b, scan_rows(&engine, REGION_B).await);
+    assert_eq!(5, engine.get_region_statistic(REGION_B).unwrap().num_rows);
+    assert!(store.wal_holes(&provider(REGION_B)).unwrap().is_empty());
+
+    let opened = open_region(&engine, REGION_A, &table_dir_a, PREFIX, &[]).await;
+    match on_corrupted_segment {
+        // Region A replays the entry of object 1 alone and records the
+        // segment of object 0 as a hole.
+        CorruptedSegmentAction::Skip => {
+            opened.unwrap();
+            assert_eq!(
+                EntryIds {
+                    flushed_entry_id: 0,
+                    last_entry_id: entry_id(1, 1),
+                    topic_latest_entry_id: 0,
+                    manifest_flushed_entry_id: 0,
+                    memtable_rows: 2,
+                },
+                entry_ids(&engine, REGION_A).await
+            );
+            assert_eq!(2, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+            assert_eq!(
+                vec![WalHole {
+                    path,
+                    object_seq: 0,
+                    min_entry_id: 1,
+                    max_entry_id: 1,
+                }],
+                store.wal_holes(&provider(REGION_A)).unwrap()
+            );
+        }
+        // The read fails, so the region does not open.
+        CorruptedSegmentAction::Fail => {
+            let err = opened.unwrap_err();
+            assert_eq!(StatusCode::Unexpected, err.status_code());
+            assert!(!engine.is_region_exists(REGION_A));
+            assert!(store.wal_holes(&provider(REGION_A)).unwrap().is_empty());
+        }
+    }
 }
 
 #[tokio::test]
