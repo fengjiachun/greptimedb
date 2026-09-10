@@ -94,6 +94,9 @@ isolated() {
 # command substitution would run it in a subshell without job control.
 CAPTURE_FILE=$(mktemp -t object-store-wal-minio-capture.XXXXXX)
 CAPTURED=""
+# Until `finalize` takes over the exit, the temporary files are the only
+# thing to clean up.
+trap 'rm -f "${STATUS_FILE:-}" "${CAPTURE_FILE}"' EXIT
 capture() {
   local status=0
   : > "${CAPTURE_FILE}"
