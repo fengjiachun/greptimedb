@@ -103,23 +103,57 @@ export GT_S3_ACCESS_KEY="${MINIO_ACCESS_KEY}"
 export GT_S3_REGION="${MINIO_REGION}"
 export GT_S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_PORT}"
 
-log "running ${TEST_NAME}, log in ${LOG_FILE}"
-cd "${ROOT_DIR}"
-set +e
-cargo nextest run -p tests-integration --test main \
-  -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
-STATUS=${PIPESTATUS[0]}
-set -e
-
 # The root is removed however the test ended, and only the root: the
 # removal is verified by listing it, since removing an empty prefix reports
-# an error.
-mc_run mc rm --recursive --force "local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
-if REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
-  CLEANUP="root ${STORE_ROOT} removed and verified empty"
+# an error. It runs once, whether the test finished or the run was
+# interrupted.
+CLEANUP=""
+cleanup_root() {
+  if [ -n "${CLEANUP}" ]; then
+    return
+  fi
+  mc_run mc rm --recursive --force "local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
+  if REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
+    CLEANUP="root ${STORE_ROOT} removed and verified empty"
+  else
+    echo "${REMAINING}" >&2
+    CLEANUP="root ${STORE_ROOT} still holds objects"
+  fi
+}
+# An interrupted run stops the test before the root is removed, so that no
+# writer is left behind to recreate it.
+TEST_PID=""
+on_interrupt() {
+  trap '' INT TERM
+  if [ -n "${TEST_PID}" ]; then
+    pkill -TERM -P "${TEST_PID}" 2>/dev/null || true
+    wait "${TEST_PID}" 2>/dev/null || true
+  fi
+  cleanup_root
+  log "interrupted, ${CLEANUP}"
+  exit 130
+}
+trap on_interrupt INT TERM
+
+log "running ${TEST_NAME}, log in ${LOG_FILE}"
+cd "${ROOT_DIR}"
+# The test runs in the background so that a signal reaches the trap while
+# it runs; the subshell inherits pipefail, so its status is the test's.
+(
+  cargo nextest run -p tests-integration --test main \
+    -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
+) &
+TEST_PID=$!
+if wait "${TEST_PID}"; then
+  STATUS=0
 else
-  echo "${REMAINING}" >&2
-  CLEANUP="root ${STORE_ROOT} still holds objects"
+  STATUS=$?
+fi
+TEST_PID=""
+trap - INT TERM
+
+cleanup_root
+if [ "${CLEANUP}" != "root ${STORE_ROOT} removed and verified empty" ]; then
   STATUS=1
 fi
 
