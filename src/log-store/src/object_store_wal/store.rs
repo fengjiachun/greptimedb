@@ -1869,6 +1869,10 @@ mod tests {
 
     const PREFIX: &str = "datanodes/1/epochs/2";
     const WAIT: Duration = Duration::from_secs(30);
+    /// Held by every test that reads the process-wide skipped segments
+    /// counter, so that tests running in one process do not interleave
+    /// their increments.
+    static SKIPPED_SEGMENTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn memory_store() -> ObjectStore {
         ObjectStore::new(Memory::default()).unwrap().finish()
@@ -3728,6 +3732,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_skips_a_corrupted_segment_and_records_a_hole() {
+        let _serialized = SKIPPED_SEGMENTS.lock().await;
         let object_store = memory_store();
         let region_one = region(1);
         let region_two = region(2);
@@ -3787,6 +3792,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_corrupted_segment_fails_the_read_that_decodes_it() {
+        let _serialized = SKIPPED_SEGMENTS.lock().await;
         let object_store = memory_store();
         let region_one = region(1);
         let region_two = region(2);
@@ -3824,6 +3830,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_reads_a_segment_whose_first_download_was_damaged() {
+        let _serialized = SKIPPED_SEGMENTS.lock().await;
         for on_corrupted_segment in [CorruptedSegmentAction::Skip, CorruptedSegmentAction::Fail] {
             let io = Arc::new(FaultyIo::new());
             let config = on_corruption(on_corrupted_segment, eager());

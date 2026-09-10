@@ -74,7 +74,7 @@ The operator configures only the prefix root. The store runs under a node prefix
 
 ## Catalog
 
-The catalog is an in-memory index rebuilt at recovery: objects by sequence number, and per region the objects that hold its entries with their entry id ranges. Its invariants are enforced on insertion: a region's entry id ranges are strictly increasing along the object sequence, an object holds at most one segment per region, and an already indexed sequence number is rejected, whether or not the footer matches. The next sequence number is the largest indexed one plus one, checked for overflow; gaps in the sequence are tolerated.
+The catalog is an in-memory index rebuilt at recovery: objects by sequence number, and per region the objects that hold its entries with their entry id ranges. Its invariants are enforced on insertion: a region's entry id ranges are strictly increasing along the object sequence, an object holds at most one segment per region, and an already indexed sequence number is rejected, whether or not the footer matches. The next sequence number is the larger of the largest indexed one plus one and the floor that any region's largest entry id sets, as described under *Entry ids*, checked against the sequence limit; gaps in the sequence are tolerated.
 
 ## Conditional create
 
@@ -102,7 +102,7 @@ Positions start at one, so entry id zero is never assigned: Mito treats zero as 
 
 Two rules keep every new id of a region above every id it already has, on a prefix that already holds objects and across the watermark Mito hands the store. On open, the next object sequence is the larger of the largest indexed sequence plus one and, over every region, the object named by the region's largest existing entry id plus one, that is `(max_entry_id >> 20) + 1`, so that the catalog's strictly increasing ranges hold; sequence gaps are tolerated, and a sequence at or above `2^44` is rejected as exhausted. Objects written under an earlier contiguous scheme are not rewritten: they remain readable, their ids carry no object information, and the rule places them by their high bits just the same.
 
-The second rule is the sequence floor of `obsolete`. Mito calls `obsolete` with the manifest's `flushed_entry_id` when it opens a region, and the actor applies the watermark and a floor derived from that entry id together: the next object sequence is raised to `(entry_id >> 20) + 1` unless it is there already, so that a watermark assigned under another prefix, or one whose object this prefix no longer holds, is never passed by a new id. The floor moves only from a settled state. While a sealed batch is not durable, while the open batch holds ids under the next sequence, or while a rolled-back sequence may have left an object that its conditional create has not yet reconciled, the call is refused with a retryable error and records neither the watermark nor the floor, because skipping such a sequence would leave an object that recovery indexes but this store never did. In the `enqueued` mode an id the store itself handed out needs no floor, even before it is durable: it is never handed out again while the store runs, so every later id of the region is greater. In the current single-prefix layout the floor never needs to move, since every watermark Mito hands the store names an object below the next sequence; the rule exists for the cross-prefix cases under *Alignment with cluster mode*. No additional persisted state is introduced.
+The second rule is the sequence floor of `obsolete`. Mito calls `obsolete` with the manifest's `flushed_entry_id` when it opens a region, and the actor applies the watermark and a floor derived from that entry id together: the next object sequence is raised to `(entry_id >> 20) + 1` unless it is there already, while zero, the watermark of a region without entries, names no object and needs no floor, so that a watermark assigned under another prefix, or one whose object this prefix no longer holds, is never passed by a new id. The floor moves only from a settled state. While a sealed batch is not durable, while the open batch holds ids under the next sequence, or while a rolled-back sequence may have left an object that its conditional create has not yet reconciled, the call is refused with a retryable error and records neither the watermark nor the floor, because skipping such a sequence would leave an object that recovery indexes but this store never did. In the `enqueued` mode an id the store itself handed out needs no floor, even before it is durable: it is never handed out again while the store runs, so every later id of the region is greater. In the current single-prefix layout the floor never needs to move, since every watermark Mito hands the store names an object below the next sequence; the rule exists for the cross-prefix cases under *Alignment with cluster mode*. No additional persisted state is introduced.
 
 *Proposed*: garbage collection does not rely on the `entry_id >> 20` shortcut: whether an object is fully flushed is decided per segment from the footer, an object is deletable only when every segment's maximum entry id is at or below its region's flushed watermark, and the comparison is on the full id, so a watermark that stops in the middle of an object keeps the object. The rule is the same for objects written under either id scheme. Garbage collection never deletes the object with the highest sequence number, so the sequence always resumes above everything that was ever written and no id is ever assigned twice. The raised sequence exists only in memory until an object is written at it, so on a prefix that still holds objects written under the contiguous scheme garbage collection deletes nothing until the first object written under the new scheme is durable; from then on that object, or a later one, is the retained highest-sequence object and the anchor is durable.
 
@@ -181,11 +181,12 @@ max_batch_bytes = "8MB"
 ack_mode = "durable"
 max_unpersisted_bytes = "64MB"
 max_unpersisted_age = "8s"
-# What a read does with a segment whose checksum does not match after
-# fetching it once more. "skip": the segment is skipped and recorded as a
-# WAL hole of its region, counted and logged; the other regions of the
-# object are unaffected (the default). "fail": the read fails, so the
-# region does not open.
+# What a read does with a segment that still does not decode after a
+# second fetch, because its checksum does not match or its content
+# disagrees with its footer entry. "skip": the segment is skipped and
+# recorded as a WAL hole of its region, counted and logged; the other
+# regions of the object are unaffected (the default). "fail": the read
+# fails, so the region does not open.
 on_corrupted_segment = "skip"
 ```
 
