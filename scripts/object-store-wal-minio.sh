@@ -150,7 +150,10 @@ else
   STATUS=$?
 fi
 TEST_PID=""
-trap - INT TERM
+# From here on an interruption is ignored rather than handled: the root is
+# removed, verified and reported in a moment, and stopping that would leave
+# the root behind.
+trap '' INT TERM
 
 cleanup_root
 if [ "${CLEANUP}" != "root ${STORE_ROOT} removed and verified empty" ]; then
