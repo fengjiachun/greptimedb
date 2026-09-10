@@ -68,12 +68,29 @@ curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
 # reaches it without host networking. The credentials reach the inner shell
 # as environment variables and the command as positional parameters, so no
 # value is parsed as shell source.
+# The client runs in a process group of its own, so that a signal sent to
+# the script's whole group, which the script may ignore or handle, does not
+# end the client in the middle of a listing or a removal; a wait the signal
+# cut short is repeated while the client lives.
 mc_run() {
+  local pid status
+  set -m
   docker run --rm --network "container:${MINIO_CONTAINER}" \
     -e "MC_ACCESS_KEY_ID=${MINIO_ACCESS_KEY_ID}" -e "MC_SECRET_KEY=${MINIO_ACCESS_KEY}" \
     --entrypoint sh "${MC_IMAGE}" -c '
     mc alias set local http://127.0.0.1:9000 "${MC_ACCESS_KEY_ID}" "${MC_SECRET_KEY}" >/dev/null && "$@"
-  ' sh "$@"
+  ' sh "$@" &
+  pid=$!
+  set +m
+  while true; do
+    if wait "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    status=$?
+    if [ "${status}" -le 128 ] || ! kill -0 "${pid}" 2>/dev/null; then
+      return "${status}"
+    fi
+  done
 }
 
 # The bucket name becomes part of the object paths handed to mc, so it is
