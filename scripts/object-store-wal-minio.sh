@@ -87,14 +87,6 @@ fi
 # root is read, counted or removed; the root is random so that concurrent
 # runs, on this host or another, never share one.
 STORE_ROOT="object-store-wal-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-log "creating bucket ${MINIO_BUCKET} and checking that ${STORE_ROOT} is empty"
-mc_run mc mb --ignore-existing "local/${MINIO_BUCKET}" >/dev/null
-REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/")
-if [ -n "${REMAINING}" ]; then
-  log "root ${STORE_ROOT} of bucket ${MINIO_BUCKET} already holds objects:"
-  echo "${REMAINING}" >&2
-  exit 1
-fi
 
 export GT_S3_BUCKET="${MINIO_BUCKET}"
 export GT_S3_ROOT="${STORE_ROOT}"
@@ -103,11 +95,13 @@ export GT_S3_ACCESS_KEY="${MINIO_ACCESS_KEY}"
 export GT_S3_REGION="${MINIO_REGION}"
 export GT_S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_PORT}"
 
-# From here on the run ends through `finalize`, however it ends: the test is
-# stopped if it still runs, the root is removed exactly once and verified by
-# listing it (removing an empty prefix reports an error, so the listing is
-# the evidence), and the manifest is printed. A failed test keeps its exit
-# status; an interrupted run exits 130.
+# Once the root has been found empty, the run ends through `finalize`,
+# however it ends: the test is stopped if it still runs, the root is removed
+# exactly once and verified by listing it (removing an empty prefix reports
+# an error, so the listing is the evidence), and the manifest is printed. A
+# failed test keeps its exit status; an interrupted run exits 130. The
+# functions are defined before the check so that the traps can be installed
+# as the first thing after it.
 TEST_PID=""
 TEST_STATUS=""
 INTERRUPTED=0
@@ -130,8 +124,11 @@ cleanup_root() {
 # A signal stops the test if it is running, and the run then ends through
 # `finalize`. A signal that arrives before the test is registered is
 # remembered and acted on right after; one that arrives once the test has
-# finished changes nothing.
+# ended changes nothing.
 on_signal() {
+  if [ -n "${TEST_STATUS}" ]; then
+    return
+  fi
   if [ -z "${TEST_PID}" ]; then
     INTERRUPTED=1
   elif kill -TERM -- "-${TEST_PID}" 2>/dev/null; then
@@ -142,16 +139,26 @@ on_signal() {
 # The test runs in a process group of its own (job control is on), so
 # stopping it reaches the test binary as well as the runner; the group is
 # waited for until every member is gone, since only the subshell is a child.
-stop_test() {
-  kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
-  wait "${TEST_PID}" 2>/dev/null || true
-  for _ in $(seq 1 100); do
+# Returns non-zero if a member survived the KILL, in which case the root
+# must not be touched.
+group_gone() {
+  local i
+  for i in $(seq 1 "${1}"); do
     if ! kill -0 -- "-${TEST_PID}" 2>/dev/null; then
-      break
+      return 0
     fi
     sleep 0.1
   done
+  ! kill -0 -- "-${TEST_PID}" 2>/dev/null
+}
+stop_test() {
+  kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
+  wait "${TEST_PID}" 2>/dev/null || true
+  if group_gone 100; then
+    return 0
+  fi
   kill -KILL -- "-${TEST_PID}" 2>/dev/null || true
+  group_gone 100
 }
 
 # The manifest is evidence, so every field it reports must be present in
@@ -218,9 +225,10 @@ finalize() {
   fi
   FINALIZED=1
   set +e
-  if [ -n "${TEST_PID}" ]; then
-    stop_test
-    TEST_PID=""
+  if [ -n "${TEST_PID}" ] && [ -z "${TEST_STATUS}" ]; then
+    if ! stop_test; then
+      CLEANUP="root ${STORE_ROOT} not removed, a process of the test survived"
+    fi
   fi
   cleanup_root
   collect_evidence
@@ -245,6 +253,15 @@ finalize() {
   print_manifest
   exit "${STATUS}"
 }
+
+log "creating bucket ${MINIO_BUCKET} and checking that ${STORE_ROOT} is empty"
+mc_run mc mb --ignore-existing "local/${MINIO_BUCKET}" >/dev/null
+REMAINING=$(mc_run mc ls --recursive "local/${MINIO_BUCKET}/${STORE_ROOT}/")
+if [ -n "${REMAINING}" ]; then
+  log "root ${STORE_ROOT} of bucket ${MINIO_BUCKET} already holds objects:"
+  echo "${REMAINING}" >&2
+  exit 1
+fi
 trap finalize EXIT
 trap on_signal INT TERM
 
@@ -252,12 +269,14 @@ log "running ${TEST_NAME}, log in ${LOG_FILE}"
 cd "${ROOT_DIR}"
 # The test runs in the background, in a process group of its own, so that
 # a signal reaches the trap while it runs and stopping it reaches every
-# process of the test; the subshell inherits pipefail, so its status is the
-# test's.
+# process of the test. The subshell exits with the test's own status,
+# whatever happened to the log copy.
 set -m
 (
+  set +e
   cargo nextest run -p tests-integration --test main \
     -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
+  exit "${PIPESTATUS[0]}"
 ) &
 TEST_PID=$!
 set +m
@@ -276,8 +295,8 @@ while true; do
   if [ "${TEST_STATUS}" -le 128 ] || ! kill -0 "${TEST_PID}" 2>/dev/null; then
     break
   fi
+  TEST_STATUS=""
 done
-if [ "${INTERRUPTED}" -eq 1 ]; then
-  stop_test
+if [ "${INTERRUPTED}" -eq 1 ] && ! stop_test; then
+  CLEANUP="root ${STORE_ROOT} not removed, a process of the test survived"
 fi
-TEST_PID=""
