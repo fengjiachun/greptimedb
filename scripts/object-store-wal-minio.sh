@@ -68,18 +68,15 @@ curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
 # reaches it without host networking. The credentials reach the inner shell
 # as environment variables and the command as positional parameters, so no
 # value is parsed as shell source.
-# The client runs in a process group of its own, so that a signal sent to
-# the script's whole group, which the script may ignore or handle, does not
-# end the client in the middle of a listing or a removal; a wait the signal
-# cut short is repeated while the client lives.
-mc_run() {
+# Runs a command in a process group of its own, so that a signal sent to the
+# script's whole group, which the script may ignore or handle, does not end
+# the command; a wait the signal cut short is repeated while the command
+# lives. Every command whose result decides the outcome of the run goes
+# through it: the client, and the tools that read the log for the manifest.
+isolated() {
   local pid status
   set -m
-  docker run --rm --network "container:${MINIO_CONTAINER}" \
-    -e "MC_ACCESS_KEY_ID=${MINIO_ACCESS_KEY_ID}" -e "MC_SECRET_KEY=${MINIO_ACCESS_KEY}" \
-    --entrypoint sh "${MC_IMAGE}" -c '
-    mc alias set local http://127.0.0.1:9000 "${MC_ACCESS_KEY_ID}" "${MC_SECRET_KEY}" >/dev/null && "$@"
-  ' sh "$@" &
+  "$@" &
   pid=$!
   set +m
   while true; do
@@ -91,6 +88,13 @@ mc_run() {
       return "${status}"
     fi
   done
+}
+mc_run() {
+  isolated docker run --rm --network "container:${MINIO_CONTAINER}" \
+    -e "MC_ACCESS_KEY_ID=${MINIO_ACCESS_KEY_ID}" -e "MC_SECRET_KEY=${MINIO_ACCESS_KEY}" \
+    --entrypoint sh "${MC_IMAGE}" -c '
+    mc alias set local http://127.0.0.1:9000 "${MC_ACCESS_KEY_ID}" "${MC_SECRET_KEY}" >/dev/null && "$@"
+  ' sh "$@"
 }
 
 # The bucket name becomes part of the object paths handed to mc, so it is
@@ -190,7 +194,7 @@ stop_test() {
 # the log; a missing field fails the run even when the test passed.
 MISSING=()
 require_line() {
-  if ! grep -qE "${2}" "${LOG_FILE}"; then
+  if ! isolated grep -qE "${2}" "${LOG_FILE}"; then
     MISSING+=("${1}")
   fi
 }
@@ -205,13 +209,14 @@ collect_evidence() {
   done
   # The datanode opens regions once per instance: the first build and two restarts.
   local opened
-  opened=$(grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true)
+  opened=$(isolated grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true)
+  opened=${opened:-0}
   if [ "${opened}" -lt 3 ]; then
     MISSING+=("region open timings (found ${opened}, expected 3)")
   fi
   # The test lists the WAL objects recursively under the configured root prefix
   # and logs every key, which is what shows the layout the store derived below it.
-  WAL_OBJECTS=$(grep -oE 'object_store_wal object=[^ ]+ bytes=[0-9]+' "${LOG_FILE}" | sort -u || true)
+  WAL_OBJECTS=$(isolated sh -c 'grep -oE "object_store_wal object=[^ ]+ bytes=[0-9]+" "$1" | sort -u' sh "${LOG_FILE}" || true)
   if [ -z "${WAL_OBJECTS}" ]; then
     MISSING+=("WAL object keys")
   fi
@@ -221,16 +226,16 @@ print_manifest() {
   # The image is the one the container runs, which can differ from what the
   # tag resolves to when an older container is reused.
   local image_id image_digests
-  image_id=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}" 2>/dev/null || echo unknown)
-  image_digests=$(docker inspect --format '{{join .RepoDigests ","}}' "${image_id}" 2>/dev/null || true)
+  image_id=$(isolated docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}" 2>/dev/null || echo unknown)
+  image_digests=$(isolated docker inspect --format '{{join .RepoDigests ","}}' "${image_id}" 2>/dev/null || true)
   echo
   echo "== object store WAL MinIO manifest =="
   # The commit checked out while the script ran.
-  echo "base commit: $(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "base commit: $(isolated git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "minio image: ${image_id} (${image_digests:-no repo digest}) in container ${MINIO_CONTAINER}"
   echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT} at ${GT_S3_ENDPOINT_URL}"
-  grep -oE 'object_store_wal (phase|restart)=[^"]*' "${LOG_FILE}" | sed -E 's/^object_store_wal //' || true
-  grep -oE "${OPEN_PATTERN}" "${LOG_FILE}" | sed -E 's/^/replay: /' || true
+  isolated sh -c 'grep -oE "object_store_wal (phase|restart)=[^\"]*" "$1" | sed -E "s/^object_store_wal //"' sh "${LOG_FILE}" || true
+  isolated sh -c 'grep -oE "$2" "$1" | sed -E "s/^/replay: /"' sh "${LOG_FILE}" "${OPEN_PATTERN}" || true
   if [ -n "${WAL_OBJECTS}" ]; then
     printf '%s\n' "${WAL_OBJECTS}" | sed -E 's/^object_store_wal object=/object: /'
   fi
