@@ -151,7 +151,9 @@ impl StorageType {
 fn s3_test_config() -> S3Config {
     S3Config {
         connection: S3Connection {
-            root: uuid::Uuid::new_v4().to_string(),
+            // A driver that removes exactly what its run wrote sets the root;
+            // every run gets a fresh one otherwise.
+            root: env::var("GT_S3_ROOT").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
             access_key_id: env::var("GT_S3_ACCESS_KEY_ID").unwrap().into(),
             secret_access_key: env::var("GT_S3_ACCESS_KEY").unwrap().into(),
             bucket: env::var("GT_S3_BUCKET").unwrap(),

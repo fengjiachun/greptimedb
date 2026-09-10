@@ -16,10 +16,11 @@
 # Runs the object store WAL restart test of `tests-integration` against a
 # MinIO server started in Docker and prints a manifest of the run.
 #
-# The script reuses a running MinIO container, empties the bucket before the
-# test and fails unless it is empty, exports the `GT_S3_*` environment the
-# S3-backed tests expect, and fails unless the test log carries every field
-# of the manifest.
+# The script reuses a running MinIO container, stores under a root of its
+# own in the bucket so it never touches the objects of other runs or users,
+# exports the `GT_S3_*` environment the S3-backed tests expect, fails unless
+# the test log carries every field of the manifest, and removes exactly its
+# root once the test has run, however it ended.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${0}")" >/dev/null 2>&1 && pwd)
@@ -72,19 +73,20 @@ mc_run() {
   "
 }
 
-log "creating bucket ${MINIO_BUCKET} and removing its objects"
+# Every run stores under its own root of the bucket, so nothing outside the
+# root is read, counted or removed.
+STORE_ROOT="object-store-wal-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+log "creating bucket ${MINIO_BUCKET} and checking that ${STORE_ROOT} is empty"
 mc_run "mc mb --ignore-existing local/${MINIO_BUCKET}" >/dev/null
-# Removing from an empty bucket reports an error, so the outcome is checked
-# by listing the bucket instead of by the exit status of the removal.
-mc_run "mc rm --recursive --force local/${MINIO_BUCKET}" >/dev/null 2>&1 || true
-REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}")
+REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/")
 if [ -n "${REMAINING}" ]; then
-  log "bucket ${MINIO_BUCKET} still holds objects:"
+  log "root ${STORE_ROOT} of bucket ${MINIO_BUCKET} already holds objects:"
   echo "${REMAINING}" >&2
   exit 1
 fi
 
 export GT_S3_BUCKET="${MINIO_BUCKET}"
+export GT_S3_ROOT="${STORE_ROOT}"
 export GT_S3_ACCESS_KEY_ID="${MINIO_ACCESS_KEY_ID}"
 export GT_S3_ACCESS_KEY="${MINIO_ACCESS_KEY}"
 export GT_S3_REGION="${MINIO_REGION}"
@@ -97,6 +99,18 @@ cargo nextest run -p tests-integration --test main \
   -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
 STATUS=${PIPESTATUS[0]}
 set -e
+
+# The root is removed however the test ended, and only the root: the
+# removal is verified by listing it, since removing an empty prefix reports
+# an error.
+mc_run "mc rm --recursive --force local/${MINIO_BUCKET}/${STORE_ROOT}/" >/dev/null 2>&1 || true
+if REMAINING=$(mc_run "mc ls --recursive local/${MINIO_BUCKET}/${STORE_ROOT}/") && [ -z "${REMAINING}" ]; then
+  CLEANUP="root ${STORE_ROOT} removed and verified empty"
+else
+  echo "${REMAINING}" >&2
+  CLEANUP="root ${STORE_ROOT} still holds objects"
+  STATUS=1
+fi
 
 # The manifest is evidence, so every field it reports must be present in
 # the log; a missing field fails the run even when the test passed.
@@ -142,13 +156,14 @@ echo "== object store WAL MinIO manifest =="
 # The commit checked out while the script ran.
 echo "base commit: $(git -C "${ROOT_DIR}" rev-parse HEAD)"
 echo "minio image: ${MINIO_IMAGE_ID} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
-echo "bucket: ${MINIO_BUCKET} at ${GT_S3_ENDPOINT_URL}"
+echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT} at ${GT_S3_ENDPOINT_URL}"
 grep -oE 'object_store_wal (phase|restart)=[^"]*' "${LOG_FILE}" | sed -E 's/^object_store_wal //' || true
 grep -oE "${OPEN_PATTERN}" "${LOG_FILE}" | sed -E 's/^/replay: /' || true
 printf '%s\n' "${WAL_OBJECTS}" | sed -E 's/^object_store_wal object=/object: /'
 for field in ${MISSING[@]+"${MISSING[@]}"}; do
   echo "missing: ${field}"
 done
+echo "cleanup: ${CLEANUP}"
 echo "test exit status: ${STATUS}"
 echo "result: ${RESULT}"
 exit "${STATUS}"
