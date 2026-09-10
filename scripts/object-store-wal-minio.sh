@@ -97,7 +97,11 @@ capture() {
   local status=0
   : > "${CAPTURE_FILE}"
   isolated "$@" > "${CAPTURE_FILE}" || status=$?
-  CAPTURED=$(<"${CAPTURE_FILE}")
+  # Read by the shell itself: a command substitution would fork a subshell
+  # a signal to the group could end before it returns.
+  CAPTURED=""
+  IFS= read -r -d '' CAPTURED < "${CAPTURE_FILE}" || true
+  CAPTURED=${CAPTURED%$'\n'}
   return "${status}"
 }
 mc_run() {
