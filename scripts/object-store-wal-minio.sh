@@ -104,6 +104,10 @@ export GT_S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_PORT}"
 # as the first thing after it.
 TEST_PID=""
 TEST_STATUS=""
+# Written by the test wrapper the moment the test exits, independently of
+# the log copy, so that the test's own status survives whatever happens to
+# the pipeline afterwards.
+STATUS_FILE=$(mktemp -t object-store-wal-minio-status.XXXXXX)
 INTERRUPTED=0
 CLEANUP=""
 FINALIZED=0
@@ -126,13 +130,12 @@ cleanup_root() {
 # remembered and acted on right after; one that arrives once the test has
 # ended changes nothing.
 on_signal() {
-  if [ -n "${TEST_STATUS}" ]; then
+  if [ -n "${TEST_STATUS}" ] || [ -s "${STATUS_FILE}" ]; then
     return
   fi
-  if [ -z "${TEST_PID}" ]; then
-    INTERRUPTED=1
-  elif kill -TERM -- "-${TEST_PID}" 2>/dev/null; then
-    INTERRUPTED=1
+  INTERRUPTED=1
+  if [ -n "${TEST_PID}" ]; then
+    kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
   fi
 }
 
@@ -225,16 +228,17 @@ finalize() {
   fi
   FINALIZED=1
   set +e
-  if [ -n "${TEST_PID}" ] && [ -z "${TEST_STATUS}" ]; then
-    if ! stop_test; then
-      CLEANUP="root ${STORE_ROOT} not removed, a process of the test survived"
-    fi
+  # Whatever the wrapper reported, no process of the test may outlive the
+  # root: a member of its group still there is stopped first, and if it
+  # survives that, the root is left alone.
+  if [ -n "${TEST_PID}" ] && ! group_gone 1 && ! stop_test; then
+    CLEANUP="root ${STORE_ROOT} not removed, a process of the test survived"
   fi
   cleanup_root
   collect_evidence
-  # An interruption that stopped the test, or arrived before it, exits 130;
-  # a test that had already ended keeps its own status.
-  if [ "${INTERRUPTED}" -eq 1 ] && { [ -z "${TEST_STATUS}" ] || [ "${TEST_STATUS}" -gt 128 ]; }; then
+  # An interruption is only recorded while the test has not ended, so it
+  # decides the status; a test that ended keeps its own.
+  if [ "${INTERRUPTED}" -eq 1 ]; then
     STATUS=130
   elif [ -n "${TEST_STATUS}" ] && [ "${TEST_STATUS}" -ne 0 ]; then
     STATUS=${TEST_STATUS}
@@ -251,6 +255,7 @@ finalize() {
     RESULT=FAIL
   fi
   print_manifest
+  rm -f "${STATUS_FILE}"
   exit "${STATUS}"
 }
 
@@ -267,36 +272,60 @@ trap on_signal INT TERM
 
 log "running ${TEST_NAME}, log in ${LOG_FILE}"
 cd "${ROOT_DIR}"
+# An interruption that arrived before the test starts ends the run here.
+if [ "${INTERRUPTED}" -eq 1 ]; then
+  exit 130
+fi
 # The test runs in the background, in a process group of its own, so that
 # a signal reaches the trap while it runs and stopping it reaches every
-# process of the test. The subshell exits with the test's own status,
-# whatever happened to the log copy.
+# process of the test. The wrapper records the test's own status the moment
+# it exits and ends with it, whatever happened to the log copy.
 set -m
 (
   set +e
-  cargo nextest run -p tests-integration --test main \
-    -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
-  exit "${PIPESTATUS[0]}"
+  {
+    cargo nextest run -p tests-integration --test main \
+      -E "test(${TEST_NAME})" --no-capture
+    echo "$?" > "${STATUS_FILE}"
+  } 2>&1 | tee "${LOG_FILE}"
+  exit "$(cat "${STATUS_FILE}" 2>/dev/null || echo 1)"
 ) &
 TEST_PID=$!
 set +m
 if [ "${INTERRUPTED}" -eq 1 ]; then
   kill -TERM -- "-${TEST_PID}" 2>/dev/null || true
 fi
-# A signal makes the wait return before the test is reaped, so the wait is
-# repeated until it is; a status above 128 with the test gone is its own.
+# A signal makes the wait return with a status above 128 without reaping
+# the wrapper, so such a status is checked by waiting again: a wrapper that
+# is no longer a child was reaped by the first wait, and the status was its
+# own; otherwise the second wait returns it.
+WRAPPER_STATUS=""
 while true; do
   if wait "${TEST_PID}"; then
-    TEST_STATUS=0
+    WRAPPER_STATUS=0
     break
   else
-    TEST_STATUS=$?
+    WRAPPER_STATUS=$?
   fi
-  if [ "${TEST_STATUS}" -le 128 ] || ! kill -0 "${TEST_PID}" 2>/dev/null; then
+  if [ "${WRAPPER_STATUS}" -le 128 ]; then
     break
   fi
-  TEST_STATUS=""
+  if wait "${TEST_PID}" 2>/dev/null; then
+    WRAPPER_STATUS=0
+    break
+  else
+    AGAIN=$?
+  fi
+  if [ "${AGAIN}" -eq 127 ]; then
+    break
+  fi
+  WRAPPER_STATUS=${AGAIN}
+  if [ "${AGAIN}" -le 128 ]; then
+    break
+  fi
 done
-if [ "${INTERRUPTED}" -eq 1 ] && ! stop_test; then
-  CLEANUP="root ${STORE_ROOT} not removed, a process of the test survived"
+if [ -s "${STATUS_FILE}" ]; then
+  TEST_STATUS=$(cat "${STATUS_FILE}")
+else
+  TEST_STATUS=${WRAPPER_STATUS}
 fi
