@@ -103,11 +103,17 @@ export GT_S3_ACCESS_KEY="${MINIO_ACCESS_KEY}"
 export GT_S3_REGION="${MINIO_REGION}"
 export GT_S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_PORT}"
 
-# The root is removed however the test ended, and only the root: the
-# removal is verified by listing it, since removing an empty prefix reports
-# an error. It runs once, whether the test finished or the run was
-# interrupted.
+# From here on the run ends through `finalize`, however it ends: the test is
+# stopped if it still runs, the root is removed exactly once and verified by
+# listing it (removing an empty prefix reports an error, so the listing is
+# the evidence), and the manifest is printed. A failed test keeps its exit
+# status; an interrupted run exits 130.
+TEST_PID=""
+TEST_STATUS=""
+INTERRUPTED=0
 CLEANUP=""
+FINALIZED=0
+
 cleanup_root() {
   if [ -n "${CLEANUP}" ]; then
     return
@@ -120,20 +126,111 @@ cleanup_root() {
     CLEANUP="root ${STORE_ROOT} still holds objects"
   fi
 }
-# An interrupted run stops the test before the root is removed, so that no
-# writer is left behind to recreate it.
-TEST_PID=""
-on_interrupt() {
+
+# A signal stops the test if it is running, and the run then ends through
+# `finalize`. A signal that arrives before the test is registered is
+# remembered and acted on right after; one that arrives once the test has
+# finished changes nothing.
+on_signal() {
+  if [ -z "${TEST_PID}" ]; then
+    INTERRUPTED=1
+  elif pkill -TERM -P "${TEST_PID}" 2>/dev/null; then
+    INTERRUPTED=1
+  fi
+}
+
+# The manifest is evidence, so every field it reports must be present in
+# the log; a missing field fails the run even when the test passed.
+MISSING=()
+require_line() {
+  if ! grep -qE "${2}" "${LOG_FILE}"; then
+    MISSING+=("${1}")
+  fi
+}
+OPEN_PATTERN='Opened [0-9]+ regions in [^[:space:]]+'
+WAL_OBJECTS=""
+collect_evidence() {
+  for phase in before-writes after-writes after-restart-1 after-flush after-restart-2; do
+    require_line "phase ${phase}" "object_store_wal phase=${phase} objects=[0-9]+ bytes=[0-9]+"
+  done
+  for restart in 1 2; do
+    require_line "restart ${restart}" "object_store_wal restart=${restart} wall_ms=[0-9]+"
+  done
+  # The datanode opens regions once per instance: the first build and two restarts.
+  local opened
+  opened=$(grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true)
+  if [ "${opened}" -lt 3 ]; then
+    MISSING+=("region open timings (found ${opened}, expected 3)")
+  fi
+  # The test lists the WAL objects recursively under the configured root prefix
+  # and logs every key, which is what shows the layout the store derived below it.
+  WAL_OBJECTS=$(grep -oE 'object_store_wal object=[^ ]+ bytes=[0-9]+' "${LOG_FILE}" | sort -u || true)
+  if [ -z "${WAL_OBJECTS}" ]; then
+    MISSING+=("WAL object keys")
+  fi
+}
+
+print_manifest() {
+  # The image is the one the container runs, which can differ from what the
+  # tag resolves to when an older container is reused.
+  local image_id image_digests
+  image_id=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}" 2>/dev/null || echo unknown)
+  image_digests=$(docker inspect --format '{{join .RepoDigests ","}}' "${image_id}" 2>/dev/null || true)
+  echo
+  echo "== object store WAL MinIO manifest =="
+  # The commit checked out while the script ran.
+  echo "base commit: $(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "minio image: ${image_id} (${image_digests:-no repo digest}) in container ${MINIO_CONTAINER}"
+  echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT} at ${GT_S3_ENDPOINT_URL}"
+  grep -oE 'object_store_wal (phase|restart)=[^"]*' "${LOG_FILE}" | sed -E 's/^object_store_wal //' || true
+  grep -oE "${OPEN_PATTERN}" "${LOG_FILE}" | sed -E 's/^/replay: /' || true
+  if [ -n "${WAL_OBJECTS}" ]; then
+    printf '%s\n' "${WAL_OBJECTS}" | sed -E 's/^object_store_wal object=/object: /'
+  fi
+  for field in ${MISSING[@]+"${MISSING[@]}"}; do
+    echo "missing: ${field}"
+  done
+  echo "cleanup: ${CLEANUP}"
+  echo "test exit status: ${TEST_STATUS:-not run}"
+  echo "result: ${RESULT}"
+}
+
+finalize() {
+  local exit_status=$?
   trap '' INT TERM
+  if [ "${FINALIZED}" -eq 1 ]; then
+    return
+  fi
+  FINALIZED=1
+  set +e
   if [ -n "${TEST_PID}" ]; then
-    pkill -TERM -P "${TEST_PID}" 2>/dev/null || true
-    wait "${TEST_PID}" 2>/dev/null || true
+    pkill -TERM -P "${TEST_PID}" 2>/dev/null
+    wait "${TEST_PID}" 2>/dev/null
+    TEST_PID=""
   fi
   cleanup_root
-  log "interrupted, ${CLEANUP}"
-  exit 130
+  collect_evidence
+  if [ "${INTERRUPTED}" -eq 1 ] && [ -z "${TEST_STATUS}" ]; then
+    STATUS=130
+  elif [ -n "${TEST_STATUS}" ] && [ "${TEST_STATUS}" -ne 0 ]; then
+    STATUS=${TEST_STATUS}
+  elif [ -z "${TEST_STATUS}" ] && [ "${exit_status}" -ne 0 ]; then
+    STATUS=${exit_status}
+  elif [ "${CLEANUP}" != "root ${STORE_ROOT} removed and verified empty" ] || [ "${#MISSING[@]}" -ne 0 ]; then
+    STATUS=1
+  else
+    STATUS=0
+  fi
+  if [ "${STATUS}" -eq 0 ]; then
+    RESULT=PASS
+  else
+    RESULT=FAIL
+  fi
+  print_manifest
+  exit "${STATUS}"
 }
-trap on_interrupt INT TERM
+trap finalize EXIT
+trap on_signal INT TERM
 
 log "running ${TEST_NAME}, log in ${LOG_FILE}"
 cd "${ROOT_DIR}"
@@ -144,74 +241,19 @@ cd "${ROOT_DIR}"
     -E "test(${TEST_NAME})" --no-capture 2>&1 | tee "${LOG_FILE}"
 ) &
 TEST_PID=$!
-if wait "${TEST_PID}"; then
-  STATUS=0
-else
-  STATUS=$?
+if [ "${INTERRUPTED}" -eq 1 ]; then
+  pkill -TERM -P "${TEST_PID}" 2>/dev/null || true
 fi
-TEST_PID=""
-# From here on an interruption is ignored rather than handled: the root is
-# removed, verified and reported in a moment, and stopping that would leave
-# the root behind.
-trap '' INT TERM
-
-cleanup_root
-if [ "${CLEANUP}" != "root ${STORE_ROOT} removed and verified empty" ]; then
-  STATUS=1
-fi
-
-# The manifest is evidence, so every field it reports must be present in
-# the log; a missing field fails the run even when the test passed.
-MISSING=()
-require_line() {
-  if ! grep -qE "${2}" "${LOG_FILE}"; then
-    MISSING+=("${1}")
+# A signal makes the wait return before the test is reaped, so the wait is
+# repeated until it is; a status above 128 with the test gone is its own.
+while true; do
+  if wait "${TEST_PID}"; then
+    TEST_STATUS=0
+    break
   fi
-}
-for phase in before-writes after-writes after-restart-1 after-flush after-restart-2; do
-  require_line "phase ${phase}" "object_store_wal phase=${phase} objects=[0-9]+ bytes=[0-9]+"
+  TEST_STATUS=$?
+  if [ "${TEST_STATUS}" -le 128 ] || ! kill -0 "${TEST_PID}" 2>/dev/null; then
+    break
+  fi
 done
-for restart in 1 2; do
-  require_line "restart ${restart}" "object_store_wal restart=${restart} wall_ms=[0-9]+"
-done
-# The datanode opens regions once per instance: the first build and two restarts.
-OPEN_PATTERN='Opened [0-9]+ regions in [^[:space:]]+'
-OPENED=$(grep -cE "${OPEN_PATTERN}" "${LOG_FILE}" || true)
-if [ "${OPENED}" -lt 3 ]; then
-  MISSING+=("region open timings (found ${OPENED}, expected 3)")
-fi
-# The test lists the WAL objects recursively under the configured root prefix
-# and logs every key, which is what shows the layout the store derived below it.
-WAL_OBJECTS=$(grep -oE 'object_store_wal object=[^ ]+ bytes=[0-9]+' "${LOG_FILE}" | sort -u || true)
-if [ -z "${WAL_OBJECTS}" ]; then
-  MISSING+=("WAL object keys")
-fi
-
-if [ "${STATUS}" -eq 0 ] && [ "${#MISSING[@]}" -eq 0 ]; then
-  RESULT=PASS
-else
-  RESULT=FAIL
-  STATUS=1
-fi
-
-# The image is the one the container runs, which can differ from what the
-# tag resolves to when an older container is reused.
-MINIO_IMAGE_ID=$(docker inspect --format '{{.Image}}' "${MINIO_CONTAINER}")
-MINIO_IMAGE_DIGESTS=$(docker inspect --format '{{join .RepoDigests ","}}' "${MINIO_IMAGE_ID}")
-
-echo
-echo "== object store WAL MinIO manifest =="
-# The commit checked out while the script ran.
-echo "base commit: $(git -C "${ROOT_DIR}" rev-parse HEAD)"
-echo "minio image: ${MINIO_IMAGE_ID} (${MINIO_IMAGE_DIGESTS:-no repo digest}) in container ${MINIO_CONTAINER}"
-echo "bucket: ${MINIO_BUCKET} root ${STORE_ROOT} at ${GT_S3_ENDPOINT_URL}"
-grep -oE 'object_store_wal (phase|restart)=[^"]*' "${LOG_FILE}" | sed -E 's/^object_store_wal //' || true
-grep -oE "${OPEN_PATTERN}" "${LOG_FILE}" | sed -E 's/^/replay: /' || true
-printf '%s\n' "${WAL_OBJECTS}" | sed -E 's/^object_store_wal object=/object: /'
-for field in ${MISSING[@]+"${MISSING[@]}"}; do
-  echo "missing: ${field}"
-done
-echo "cleanup: ${CLEANUP}"
-echo "test exit status: ${STATUS}"
-echo "result: ${RESULT}"
-exit "${STATUS}"
+TEST_PID=""
