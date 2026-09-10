@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use bytes::Bytes;
-use common_telemetry::warn;
+use common_telemetry::{debug, warn};
 use common_wal::config::object_store::{AckMode, CorruptedSegmentAction, ObjectStoreWalConfig};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -46,7 +46,10 @@ use crate::error::{
     ObjectStoreWalSnafu, ObjectStoreWalStoppedSnafu, Result, WalObjectHistoryGapSnafu,
     WalObjectSequenceExhaustedSnafu, WalObjectSequenceUnsettledSnafu,
 };
-use crate::metrics::METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL;
+use crate::metrics::{
+    METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL, METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL,
+    METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL,
+};
 use crate::object_store_wal::batch::{OBJECT_SEQ_LIMIT, OpenBatch, sequence_floor};
 use crate::object_store_wal::catalog::ObjectCatalog;
 use crate::object_store_wal::format::{
@@ -83,14 +86,18 @@ const RECOVERY_TAIL_WINDOW: usize = 64 * 1024;
 /// indexed; in the `enqueued` mode it returns on admission and the object is
 /// created in the background. Reads fetch and decode only the segment of the
 /// requested region from every object the catalog lists for it; a segment
-/// that does not decode is handled as `on_corrupted_segment` says.
+/// that does not decode is handled as `on_corrupted_segment` says. After an
+/// obsolete watermark moves, the actor deletes the objects whose every
+/// segment is at or below the watermark of its region, except the object with
+/// the highest sequence, see [`ObjectCatalog::deletable_objects`].
 pub struct ObjectStoreLogStore {
     prefix: String,
     ack_mode: AckMode,
     on_corrupted_segment: CorruptedSegmentAction,
     io: Arc<dyn WalObjectIo>,
     catalog: Arc<RwLock<ObjectCatalog>>,
-    /// Largest obsolete entry id per region. Objects are not deleted yet.
+    /// Largest obsolete entry id per region, which reads hide and garbage
+    /// collection deletes objects below.
     obsolete_entry_ids: ObsoleteEntryIds,
     /// Segments that reads skipped, per region and by object sequence.
     wal_holes: WalHoles,
@@ -106,6 +113,8 @@ pub struct ObjectStoreLogStore {
     creates_held: watch::Sender<bool>,
     #[cfg(any(test, feature = "testing"))]
     creates_fail: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "testing"))]
+    deletes_in_flight: watch::Receiver<usize>,
 }
 
 type TerminalError = Arc<Mutex<Option<Arc<Error>>>>;
@@ -181,6 +190,8 @@ impl ObjectStoreLogStore {
         let (creates_held_tx, creates_held_rx) = watch::channel(false);
         #[cfg(any(test, feature = "testing"))]
         let creates_fail = Arc::new(AtomicBool::new(false));
+        #[cfg(any(test, feature = "testing"))]
+        let (deletes_in_flight_tx, deletes_in_flight_rx) = watch::channel(0);
 
         let actor = Actor {
             io: io.clone(),
@@ -204,6 +215,8 @@ impl ObjectStoreLogStore {
             stop_error: None,
             next_object_seq: Some(next_object_seq),
             unresolved_object_seq: None,
+            deleting: BTreeSet::new(),
+            deletes: FuturesUnordered::new(),
             writer_instance: uuid::Uuid::new_v4().into_bytes(),
             flush_interval: config.flush_interval,
             #[cfg(any(test, feature = "testing"))]
@@ -212,6 +225,8 @@ impl ObjectStoreLogStore {
             creates_held: creates_held_rx,
             #[cfg(any(test, feature = "testing"))]
             creates_fail: creates_fail.clone(),
+            #[cfg(any(test, feature = "testing"))]
+            deletes_in_flight: deletes_in_flight_tx,
         };
         common_runtime::spawn_global(actor.run());
 
@@ -232,6 +247,8 @@ impl ObjectStoreLogStore {
             creates_held: creates_held_tx,
             #[cfg(any(test, feature = "testing"))]
             creates_fail,
+            #[cfg(any(test, feature = "testing"))]
+            deletes_in_flight: deletes_in_flight_rx,
         }))
     }
 
@@ -383,6 +400,19 @@ impl ObjectStoreLogStore {
         self.stopped.store(true, Ordering::Release);
     }
 
+    /// Waits until no object delete is in flight, so a test can observe the
+    /// objects a collection left. A collection runs when `obsolete` succeeds
+    /// and its deletes are in flight by the time that call returns.
+    pub async fn wait_for_garbage_collection(&self) -> Result<()> {
+        self.deletes_in_flight
+            .clone()
+            .wait_for(|count| *count == 0)
+            .await
+            .ok()
+            .map(|_| ())
+            .context(ObjectStoreWalStoppedSnafu)
+    }
+
     /// Returns the key of the object `object_seq` and the byte range the
     /// segment of the provider's region occupies in it, so a test can damage
     /// that segment alone, or `None` when the object holds no segment of the
@@ -474,7 +504,9 @@ impl LogStore for ObjectStoreLogStore {
     /// on, skipping ids the region has obsoleted. Objects are located through
     /// the catalog, so `index` is not needed. A segment that does not decode
     /// fails the read or is skipped and recorded as a hole, as
-    /// `on_corrupted_segment` says; an I/O failure always fails the read.
+    /// `on_corrupted_segment` says; an I/O failure fails the read unless the
+    /// object was collected after the read listed it, in which case it is
+    /// skipped: every entry it held is at or below a watermark.
     async fn read(
         &self,
         provider: &Provider,
@@ -509,6 +541,7 @@ impl LogStore for ObjectStoreLogStore {
         };
 
         let io = self.io.clone();
+        let catalog = self.catalog.clone();
         let provider = provider.clone();
         let on_corrupted_segment = self.on_corrupted_segment;
         let wal_holes = self.wal_holes.clone();
@@ -516,6 +549,14 @@ impl LogStore for ObjectStoreLogStore {
             for (object_seq, footer_entry) in objects {
                 let records = match fetch_segment(io.as_ref(), object_seq, &footer_entry).await {
                     Ok(records) => records,
+                    Err(error) if !is_indexed(&catalog, object_seq) => {
+                        debug!(
+                            "Skipped WAL object {} (sequence {}), collected after the read listed it: {error}",
+                            io.object_path(object_seq),
+                            object_seq
+                        );
+                        continue;
+                    }
                     Err(error @ Error::InvalidWalObject { .. })
                         if on_corrupted_segment == CorruptedSegmentAction::Skip =>
                     {
@@ -762,6 +803,7 @@ impl SealedBatch {
 }
 
 type CreateOutcome = (u64, Result<PutResult>);
+type DeleteOutcome = (u64, Result<()>);
 
 /// The actor that owns the open batch and the sealed batches until they are
 /// durable.
@@ -787,6 +829,12 @@ type CreateOutcome = (u64, Result<PutResult>);
 /// exists. After `stop` began nothing is admitted and no create starts, except
 /// that the `enqueued` mode uploads its backlog; creates in flight run to
 /// completion and acknowledge if they succeed.
+///
+/// The actor also collects garbage: after an obsolete watermark is recorded
+/// it deletes, in the background, the objects the catalog and the watermarks
+/// allow, and unindexes each once its delete succeeded. A failed delete is
+/// counted and repeated at the next collection; deletes in flight when stop
+/// begins run to completion, and no collection starts afterwards.
 struct Actor {
     io: Arc<dyn WalObjectIo>,
     catalog: Arc<RwLock<ObjectCatalog>>,
@@ -827,6 +875,10 @@ struct Actor {
     /// reused in order, so the conditional create at each reconciles it; no
     /// sequence is skipped until an object at or above it is indexed.
     unresolved_object_seq: Option<u64>,
+    /// Objects whose delete is in flight, so a collection does not delete
+    /// one twice.
+    deleting: BTreeSet<u64>,
+    deletes: FuturesUnordered<BoxFuture<'static, DeleteOutcome>>,
     writer_instance: [u8; 16],
     flush_interval: Duration,
     #[cfg(any(test, feature = "testing"))]
@@ -835,6 +887,8 @@ struct Actor {
     creates_held: watch::Receiver<bool>,
     #[cfg(any(test, feature = "testing"))]
     creates_fail: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "testing"))]
+    deletes_in_flight: watch::Sender<usize>,
 }
 
 impl Actor {
@@ -855,6 +909,9 @@ impl Actor {
                 }
                 Some((object_seq, result)) = self.creates.next(), if !self.creates.is_empty() => {
                     self.on_create_completed(object_seq, result);
+                }
+                Some((object_seq, result)) = self.deletes.next(), if !self.deletes.is_empty() => {
+                    self.on_delete_completed(object_seq, result);
                 }
                 command = self.command_rx.recv() => match command {
                     Some(Command::Append { entries, response }) => {
@@ -1403,8 +1460,9 @@ impl Actor {
     }
 
     /// Makes sure no id of the region at or below `entry_id` is assigned
-    /// from now on, then records the obsolete watermark of the region;
-    /// neither is done when the sequence cannot be raised.
+    /// from now on, then records the obsolete watermark of the region and
+    /// collects the objects the watermarks release; nothing is done when the
+    /// sequence cannot be raised.
     fn handle_obsolete(
         &mut self,
         region_id: RegionId,
@@ -1415,7 +1473,70 @@ impl Actor {
         let result = self.raise_sequence_floor(region_id, entry_id).map(|_| {
             record_obsolete(&self.obsolete_entry_ids, region_id, watermark);
         });
+        if result.is_ok() {
+            self.collect_garbage();
+        }
         let _ = response.send(result);
+    }
+
+    /// Starts deleting the objects the catalog and the obsolete watermarks
+    /// allow, see [`ObjectCatalog::deletable_objects`]. The deletes run in
+    /// the background so they never hold up admission, sealing, uploads or
+    /// acknowledgements; an object is unindexed once its delete succeeded.
+    /// Nothing is collected once stop began or the store is poisoned.
+    fn collect_garbage(&mut self) {
+        if self.is_stopped() || terminal(&self.terminal_error).is_some() {
+            return;
+        }
+        let obsolete_entry_ids = self
+            .obsolete_entry_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let deletable = self
+            .catalog
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .deletable_objects(&obsolete_entry_ids);
+        for object_seq in deletable {
+            // Still in flight from an earlier collection.
+            if !self.deleting.insert(object_seq) {
+                continue;
+            }
+            let io = self.io.clone();
+            self.deletes.push(Box::pin(async move {
+                (object_seq, io.delete(object_seq).await)
+            }));
+        }
+        #[cfg(any(test, feature = "testing"))]
+        self.deletes_in_flight.send_replace(self.deleting.len());
+    }
+
+    /// Unindexes the object `object_seq` once its delete succeeded. A failed
+    /// delete leaves the object indexed, so the next collection deletes it
+    /// again.
+    fn on_delete_completed(&mut self, object_seq: u64, result: Result<()>) {
+        self.deleting.remove(&object_seq);
+        match result {
+            Ok(()) => {
+                self.catalog
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove_object(object_seq);
+                METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.inc();
+            }
+            Err(error) => {
+                warn!(
+                    error;
+                    "Failed to delete WAL object {} (sequence {}), it is deleted again at the next collection",
+                    self.io.object_path(object_seq),
+                    object_seq
+                );
+                METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.inc();
+            }
+        }
+        #[cfg(any(test, feature = "testing"))]
+        self.deletes_in_flight.send_replace(self.deleting.len());
     }
 
     /// Moves the sequence of the next object above the object that holds
@@ -1526,9 +1647,14 @@ impl Actor {
     }
 
     /// Answers the callers of `stop` once every sealed batch is settled and
-    /// every create has completed. Returns true when the actor is done.
+    /// every create and delete has completed. Returns true when the actor is
+    /// done.
     fn finish_stop(&mut self) -> bool {
-        if self.stop.is_empty() || !self.sealed.is_empty() || !self.creates.is_empty() {
+        if self.stop.is_empty()
+            || !self.sealed.is_empty()
+            || !self.creates.is_empty()
+            || !self.deletes.is_empty()
+        {
             return false;
         }
         for waiter in self.durable_waiters.drain(..) {
@@ -1584,6 +1710,13 @@ fn set_terminal(terminal_error: &TerminalError, error: Error) -> Arc<Error> {
 /// Wraps an error that several callers receive.
 fn shared(error: &Arc<Error>) -> Error {
     ObjectStoreWalSnafu.into_error(error.clone())
+}
+
+fn is_indexed(catalog: &RwLock<ObjectCatalog>, object_seq: u64) -> bool {
+    catalog
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains_object(object_seq)
 }
 
 /// Fetches and decodes the segment `entry` describes in the object
@@ -1824,6 +1957,8 @@ pub(crate) trait WalObjectIo: Send + Sync {
 
     async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes>;
 
+    async fn delete(&self, object_seq: u64) -> Result<()>;
+
     async fn list(&self) -> Result<Vec<ListedObject>>;
 
     fn object_path(&self, object_seq: u64) -> String;
@@ -1841,6 +1976,10 @@ impl WalObjectIo for ObjectStoreIo {
 
     async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
         ObjectStoreIo::get_range(self, object_seq, offset, len).await
+    }
+
+    async fn delete(&self, object_seq: u64) -> Result<()> {
+        ObjectStoreIo::delete(self, object_seq).await
     }
 
     async fn list(&self) -> Result<Vec<ListedObject>> {
@@ -1873,6 +2012,10 @@ mod tests {
     /// counter, so that tests running in one process do not interleave
     /// their increments.
     static SKIPPED_SEGMENTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Held by every test whose store collects an object, so that the tests
+    /// reading the process-wide delete counters see only their own
+    /// increments.
+    static GARBAGE_COLLECTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn memory_store() -> ObjectStore {
         ObjectStore::new(Memory::default()).unwrap().finish()
@@ -1998,6 +2141,36 @@ mod tests {
         match error {
             Error::ObjectStoreWal { source, .. } => source,
             other => panic!("expected a shared error, actual {other:?}"),
+        }
+    }
+
+    /// Moves the watermark of `region_id` to `entry_id` and waits for the
+    /// collection it triggers.
+    async fn obsolete_and_collect(store: &ObjectStoreLogStore, region_id: RegionId, entry_id: u64) {
+        store
+            .obsolete(&provider(region_id), region_id, entry_id)
+            .await
+            .unwrap();
+        timeout(WAIT, store.wait_for_garbage_collection())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    fn is_indexed(store: &ObjectStoreLogStore, object_seq: u64) -> bool {
+        super::is_indexed(&store.catalog, object_seq)
+    }
+
+    /// Polls until the listed objects are `expected`, so a test can observe an
+    /// object an in-flight create wrote before the store indexed it.
+    async fn wait_for_objects(io: &dyn WalObjectIo, expected: &[u64]) {
+        let deadline = Instant::now() + WAIT;
+        while object_seqs(io).await != expected {
+            assert!(
+                Instant::now() < deadline,
+                "objects never became {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -2329,17 +2502,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_obsolete_hides_entries_from_read_only() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
         let store = open(memory_store(), &eager()).await;
         let region_id = region(1);
         for data in ["a1", "a2", "a3"] {
             append(&store, region_id, data).await.unwrap();
         }
 
+        // The objects below the watermark are collected, the highest is kept.
         let third = entries(&[(id(2, 1), "a3")]);
-        store
-            .obsolete(&provider(region_id), region_id, id(1, 1))
-            .await
-            .unwrap();
+        obsolete_and_collect(&store, region_id, id(1, 1)).await;
+        assert_eq!(vec![2], object_seqs(store.io.as_ref()).await);
         assert_eq!(third, read(&store, region_id, 1).await);
         assert_eq!(third, read(&store, region_id, id(2, 1)).await);
         assert_eq!(id(2, 1), latest(&store, region_id));
@@ -2367,9 +2540,9 @@ mod tests {
             .unwrap();
         assert!(read(&store, region_id, 1).await.is_empty());
         assert_eq!(id(2, 1), latest(&store, region_id));
-        // Obsoleting everything does not move the sequence.
+        // Obsoleting everything neither moves the sequence nor collects.
         append(&store, region_id, "a4").await.unwrap();
-        assert_eq!(vec![0, 1, 2, 3], object_seqs(store.io.as_ref()).await);
+        assert_eq!(vec![2, 3], object_seqs(store.io.as_ref()).await);
     }
 
     #[tokio::test]
@@ -2878,6 +3051,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_obsolete_raises_the_sequence_floor() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
         let store = open(memory_store(), &manual()).await;
         let region_one = region(1);
         let region_two = region(2);
@@ -2945,14 +3119,14 @@ mod tests {
             response.last_entry_ids
         );
         assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
-        store
-            .obsolete(&provider(region_two), region_two, id(3, 7))
-            .await
-            .unwrap();
+        obsolete_and_collect(&store, region_two, id(3, 7)).await;
         assert_eq!(
             Some(&id(3, 7)),
             store.obsolete_entry_ids.lock().unwrap().get(&region_two)
         );
+        // Object 0 held only entry 1 of region one, at its watermark, and
+        // object 1 was the highest: only object 0 was collected.
+        assert_eq!(vec![1], object_seqs(store.io.as_ref()).await);
         let (fourth, count) = spawn_append(region_two, "b1");
         store.wait_for_admitted_appends(count).await.unwrap();
         store.seal_open_batch().await.unwrap();
@@ -2962,7 +3136,7 @@ mod tests {
             response.last_entry_ids
         );
         assert!(id(4, 1) > id(3, 7));
-        assert_eq!(vec![0, 1, 4], object_seqs(store.io.as_ref()).await);
+        assert_eq!(vec![1, 4], object_seqs(store.io.as_ref()).await);
         // The watermark hides nothing of this prefix; the region has no
         // entry at or below it.
         assert_eq!(
@@ -4701,9 +4875,352 @@ mod tests {
         store.stop().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn test_store_collects_objects_below_the_watermarks() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let store = open(memory_store(), &enqueued(manual())).await;
+        let region_one = region(1);
+        let region_two = region(2);
+        // Object 0 holds one entry of each region, object 1 two entries of
+        // region one, object 2 one of region two and object 3 one of region
+        // one.
+        store
+            .append_batch(vec![
+                entry(&store, region_one, "a1"),
+                entry(&store, region_two, "b1"),
+            ])
+            .await
+            .unwrap();
+        store.seal_open_batch().await.unwrap();
+        store
+            .append_batch(vec![
+                entry(&store, region_one, "a2"),
+                entry(&store, region_one, "a3"),
+            ])
+            .await
+            .unwrap();
+        store.seal_open_batch().await.unwrap();
+        append(&store, region_two, "b2").await.unwrap();
+        store.seal_open_batch().await.unwrap();
+        append(&store, region_one, "a4").await.unwrap();
+        store.seal_open_batch().await.unwrap();
+        assert_eq!(vec![0, 1, 2, 3], object_seqs(store.io.as_ref()).await);
+        let deleted = METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get();
+        let failed = METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get();
+
+        // A watermark inside object 1 keeps it, and object 0 holds a segment
+        // of a region without a watermark.
+        obsolete_and_collect(&store, region_one, id(1, 1)).await;
+        assert_eq!(vec![0, 1, 2, 3], object_seqs(store.io.as_ref()).await);
+        // A watermark at the last id of its segment releases object 1.
+        obsolete_and_collect(&store, region_one, id(1, 2)).await;
+        assert_eq!(vec![0, 2, 3], object_seqs(store.io.as_ref()).await);
+        // Object 0 goes once both regions are at or above their segments;
+        // object 2 lies above the watermark of region two.
+        obsolete_and_collect(&store, region_two, id(0, 1)).await;
+        assert_eq!(vec![2, 3], object_seqs(store.io.as_ref()).await);
+        obsolete_and_collect(&store, region_two, id(2, 1)).await;
+        assert_eq!(vec![3], object_seqs(store.io.as_ref()).await);
+        // The highest-sequence object is kept whatever the watermark.
+        obsolete_and_collect(&store, region_one, id(3, 1)).await;
+        assert_eq!(vec![3], object_seqs(store.io.as_ref()).await);
+        assert!(is_indexed(&store, 3) && !is_indexed(&store, 2));
+        assert_eq!(
+            deleted + 3,
+            METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get()
+        );
+        assert_eq!(failed, METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get());
+
+        // Reads never needed the collected objects; the largest id of a
+        // region outlives its last object, so a durability wait for it
+        // returns and the watermark of the `enqueued` mode is not clamped
+        // below it.
+        assert!(read(&store, region_one, 0).await.is_empty());
+        assert!(read(&store, region_two, 0).await.is_empty());
+        assert_eq!(id(3, 1), latest(&store, region_one));
+        assert_eq!(id(2, 1), latest(&store, region_two));
+        timeout(WAIT, store.wait_durable(&provider(region_two), id(2, 1)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            vec![provider(region_one)],
+            store.list_namespaces().await.unwrap()
+        );
+        let response = append(&store, region_two, "b3").await.unwrap();
+        assert_eq!(
+            HashMap::from([(region_two, id(4, 1))]),
+            response.last_entry_ids
+        );
+        store.seal_open_batch().await.unwrap();
+        assert_eq!(vec![3, 4], object_seqs(store.io.as_ref()).await);
+        assert_eq!(
+            entries(&[(id(4, 1), "b3")]),
+            read(&store, region_two, 0).await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_keeps_an_object_that_is_created_but_not_indexed() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let (io, mut parked) = ParkedIo::parking_creates();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        let first = {
+            let store = store.clone();
+            tokio::spawn(async move { append(&store, region_id, "a1").await })
+        };
+        let (_, release) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+        release.send(()).unwrap();
+        timeout(WAIT, first).await.unwrap().unwrap().unwrap();
+
+        // Object 2 is created while object 1 is still in flight, so it is
+        // not indexed yet.
+        let appends = spawn_appends(&store, region_id, 2).await;
+        let mut releases = HashMap::new();
+        for _ in 0..2 {
+            let (object_seq, release) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+            releases.insert(object_seq, release);
+        }
+        releases.remove(&2).unwrap().send(()).unwrap();
+        wait_for_objects(io.as_ref(), &[0, 2]).await;
+        assert_eq!(id(0, 1), latest(&store, region_id));
+
+        // Object 0 is the highest indexed object: it is kept although an
+        // object above it exists.
+        obsolete_and_collect(&store, region_id, id(0, 1)).await;
+        assert_eq!(vec![0, 2], object_seqs(io.as_ref()).await);
+
+        // Once objects 1 and 2 are indexed the next collection releases it.
+        releases.remove(&1).unwrap().send(()).unwrap();
+        for append in appends {
+            timeout(WAIT, append).await.unwrap().unwrap().unwrap();
+        }
+        assert_eq!(id(2, 1), latest(&store, region_id));
+        obsolete_and_collect(&store, region_id, id(0, 1)).await;
+        assert_eq!(vec![1, 2], object_seqs(io.as_ref()).await);
+        obsolete_and_collect(&store, region_id, id(2, 1)).await;
+        assert_eq!(vec![2], object_seqs(io.as_ref()).await);
+    }
+
+    #[tokio::test]
+    async fn test_store_holds_collection_on_a_prefix_with_contiguous_ids() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let object_store = memory_store();
+        let region_one = region(1);
+        let region_two = region(2);
+        put_object(&object_store, 0, region_one, &[1, 2]).await;
+        put_object(&object_store, 1, region_one, &[4_999_999, 5_000_000]).await;
+        put_object(&object_store, 2, region_two, &[1]).await;
+        let store = open(object_store.clone(), &eager()).await;
+
+        // Every object is below its watermark, but id 5_000_000 names object
+        // 4, beyond the highest object: object 2 alone could not resume the
+        // sequence above every id ever written, so nothing is collected.
+        obsolete_and_collect(&store, region_one, 5_000_000).await;
+        obsolete_and_collect(&store, region_two, 1).await;
+        assert_eq!(vec![0, 1, 2], object_seqs(store.io.as_ref()).await);
+
+        // The first object written at the raised sequence is durable: from
+        // then on it is the retained anchor and the old objects go.
+        let response = append(&store, region_two, "b").await.unwrap();
+        assert_eq!(
+            HashMap::from([(region_two, id(5, 1))]),
+            response.last_entry_ids
+        );
+        assert_eq!(vec![0, 1, 2, 5], object_seqs(store.io.as_ref()).await);
+        obsolete_and_collect(&store, region_two, id(5, 1)).await;
+        assert_eq!(vec![5], object_seqs(store.io.as_ref()).await);
+        assert_eq!(5_000_000, latest(&store, region_one));
+        assert!(read(&store, region_one, 0).await.is_empty());
+        store.stop().await.unwrap();
+
+        // Recovery resumes after the retained object, above every old id.
+        let store = open(object_store, &eager()).await;
+        assert_eq!(0, latest(&store, region_one));
+        assert_eq!(id(5, 1), latest(&store, region_two));
+        let response = append(&store, region_one, "a").await.unwrap();
+        assert_eq!(
+            HashMap::from([(region_one, id(6, 1))]),
+            response.last_entry_ids
+        );
+        assert!(id(6, 1) > 5_000_000);
+        assert_eq!(vec![5, 6], object_seqs(store.io.as_ref()).await);
+        assert_eq!(
+            entries(&[(id(6, 1), "a")]),
+            read(&store, region_one, 0).await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_read_started_before_collection_skips_a_deleted_object() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let object_store = memory_store();
+        let store = open(object_store.clone(), &eager()).await;
+        let region_id = region(1);
+        for data in ["a1", "a2", "a3"] {
+            append(&store, region_id, data).await.unwrap();
+        }
+
+        // The stream lists objects 0 to 2 before objects 0 and 1 are
+        // collected, and skips them when it gets there.
+        let stream = store.read(&provider(region_id), 1, None).await.unwrap();
+        obsolete_and_collect(&store, region_id, id(1, 1)).await;
+        assert_eq!(vec![2], object_seqs(store.io.as_ref()).await);
+        let read_entries = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|entry| (entry.entry_id(), entry.into_bytes()))
+            .collect::<Vec<_>>();
+        assert_eq!(entries(&[(id(2, 1), "a3")]), read_entries);
+
+        // An object that is missing while still indexed fails the read.
+        append(&store, region_id, "a4").await.unwrap();
+        assert_eq!(vec![2, 3], object_seqs(store.io.as_ref()).await);
+        object_store
+            .delete(&object_path(&object_store, 2))
+            .await
+            .unwrap();
+        assert!(is_indexed(&store, 2));
+        let error = store
+            .read(&provider(region_id), id(1, 1) + 1, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::WalObjectStore { operation: "read", path, .. }
+                if path == &object_path(&object_store, 2)),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_retries_a_failed_delete_at_the_next_collection() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let io = Arc::new(FaultyIo::new());
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        append(&store, region_id, "a1").await.unwrap();
+        append(&store, region_id, "a2").await.unwrap();
+        let deleted = METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get();
+        let failed = METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get();
+
+        // The delete fails: the object stays, indexed, and the failure is
+        // counted.
+        io.fail_next_delete.store(true, Ordering::Relaxed);
+        obsolete_and_collect(&store, region_id, id(0, 1)).await;
+        assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+        assert!(is_indexed(&store, 0));
+        assert_eq!(deleted, METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get());
+        assert_eq!(
+            failed + 1,
+            METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get()
+        );
+
+        // The next collection deletes it.
+        obsolete_and_collect(&store, region_id, id(0, 1)).await;
+        assert_eq!(vec![1], object_seqs(io.as_ref()).await);
+        assert!(!is_indexed(&store, 0));
+        assert_eq!(
+            deleted + 1,
+            METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get()
+        );
+        assert_eq!(
+            failed + 1,
+            METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_does_not_collect_after_stop_began() {
+        let store = open(memory_store(), &eager()).await;
+        let region_id = region(1);
+        append(&store, region_id, "a1").await.unwrap();
+        append(&store, region_id, "a2").await.unwrap();
+
+        // Stop began but the actor has not exited: the watermark is
+        // recorded and nothing is collected.
+        store.begin_stop();
+        obsolete_and_collect(&store, region_id, id(0, 1)).await;
+        assert_eq!(
+            Some(&id(0, 1)),
+            store.obsolete_entry_ids.lock().unwrap().get(&region_id)
+        );
+        assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
+        store.stop().await.unwrap();
+        assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
+
+        // After the actor exited a watermark is recorded alone.
+        store
+            .obsolete(&provider(region_id), region_id, id(1, 1))
+            .await
+            .unwrap();
+        assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
+        assert!(read(&store, region_id, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_store_stop_waits_for_a_delete_in_flight() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let (io, mut gates, mut delete_gates) = GatedIo::gating_deletes();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        for data in ["a1", "a2"] {
+            let pending = {
+                let store = store.clone();
+                tokio::spawn(async move { append(&store, region_id, data).await })
+            };
+            timeout(WAIT, gates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .send(true)
+                .unwrap();
+            timeout(WAIT, pending).await.unwrap().unwrap().unwrap();
+        }
+
+        // The delete of object 0 is blocked when stop is requested: stop
+        // waits for it, and the object is unindexed before stop returns.
+        store
+            .obsolete(&provider(region_id), region_id, id(0, 1))
+            .await
+            .unwrap();
+        let delete_gate = timeout(WAIT, delete_gates.recv()).await.unwrap().unwrap();
+        let stop = {
+            let store = store.clone();
+            tokio::spawn(async move { store.stop().await })
+        };
+        while !store.stopped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!stop.is_finished());
+        assert!(is_indexed(&store, 0));
+
+        delete_gate.send(true).unwrap();
+        timeout(WAIT, stop).await.unwrap().unwrap().unwrap();
+        assert!(!is_indexed(&store, 0));
+        assert_eq!(vec![1], object_seqs(io.as_ref()).await);
+        assert!(delete_gates.try_recv().is_err());
+    }
+
     /// Object access that fails a conditional create on request, either before
     /// or after the object was actually written, fails every read of one
-    /// object, or damages the bytes the next range read returns.
+    /// object, damages the bytes the next range read returns, or fails the
+    /// next delete.
     struct FaultyIo {
         inner: ObjectStoreIo,
         fail_next_put: AtomicBool,
@@ -4711,6 +5228,7 @@ mod tests {
         /// Sequence of the object whose reads fail; `u64::MAX` fails none.
         fail_reads_of: AtomicU64,
         damage_next_range_read: AtomicBool,
+        fail_next_delete: AtomicBool,
     }
 
     impl FaultyIo {
@@ -4725,6 +5243,7 @@ mod tests {
                 fail_after_next_put: AtomicBool::new(false),
                 fail_reads_of: AtomicU64::new(u64::MAX),
                 damage_next_range_read: AtomicBool::new(false),
+                fail_next_delete: AtomicBool::new(false),
             }
         }
 
@@ -4773,6 +5292,13 @@ mod tests {
             Ok(bytes)
         }
 
+        async fn delete(&self, object_seq: u64) -> Result<()> {
+            if self.fail_next_delete.swap(false, Ordering::Relaxed) {
+                return injected_failure("delete", self.inner.object_path(object_seq));
+            }
+            self.inner.delete(object_seq).await
+        }
+
         async fn list(&self) -> Result<Vec<ListedObject>> {
             self.inner.list().await
         }
@@ -4782,27 +5308,42 @@ mod tests {
         }
     }
 
-    /// Object access whose conditional creates block until the test decides
-    /// whether they proceed or fail with a transient error.
+    type Gates = mpsc::UnboundedReceiver<oneshot::Sender<bool>>;
+
+    /// Object access whose conditional creates, and on request deletes, block
+    /// until the test decides whether they proceed or fail with a transient
+    /// error.
     struct GatedIo {
         inner: ObjectStoreIo,
         gates: mpsc::UnboundedSender<oneshot::Sender<bool>>,
+        delete_gates: Option<mpsc::UnboundedSender<oneshot::Sender<bool>>>,
     }
 
     impl GatedIo {
-        fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<oneshot::Sender<bool>>) {
+        fn new() -> (Arc<Self>, Gates) {
             Self::over(memory_store())
         }
 
-        fn over(
-            object_store: ObjectStore,
-        ) -> (Arc<Self>, mpsc::UnboundedReceiver<oneshot::Sender<bool>>) {
+        fn over(object_store: ObjectStore) -> (Arc<Self>, Gates) {
             let (gates, gate_rx) = mpsc::unbounded_channel();
             let io = Self {
                 inner: ObjectStoreIo::new(object_store, PREFIX).unwrap(),
                 gates,
+                delete_gates: None,
             };
             (Arc::new(io), gate_rx)
+        }
+
+        /// Gates deletes as well as creates.
+        fn gating_deletes() -> (Arc<Self>, Gates, Gates) {
+            let (gates, gate_rx) = mpsc::unbounded_channel();
+            let (delete_gates, delete_gate_rx) = mpsc::unbounded_channel();
+            let io = Self {
+                inner: ObjectStoreIo::new(memory_store(), PREFIX).unwrap(),
+                gates,
+                delete_gates: Some(delete_gates),
+            };
+            (Arc::new(io), gate_rx, delete_gate_rx)
         }
     }
 
@@ -4824,6 +5365,17 @@ mod tests {
 
         async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
             self.inner.get_range(object_seq, offset, len).await
+        }
+
+        async fn delete(&self, object_seq: u64) -> Result<()> {
+            if let Some(delete_gates) = &self.delete_gates {
+                let (gate, opened) = oneshot::channel();
+                delete_gates.send(gate).unwrap();
+                if !opened.await.unwrap() {
+                    return injected_failure("delete", self.inner.object_path(object_seq));
+                }
+            }
+            self.inner.delete(object_seq).await
         }
 
         async fn list(&self) -> Result<Vec<ListedObject>> {
@@ -4914,6 +5466,10 @@ mod tests {
             self.inner.get_range(object_seq, offset, len).await
         }
 
+        async fn delete(&self, object_seq: u64) -> Result<()> {
+            self.inner.delete(object_seq).await
+        }
+
         async fn list(&self) -> Result<Vec<ListedObject>> {
             self.inner.list().await
         }
@@ -4955,6 +5511,10 @@ mod tests {
         async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
             self.reads.lock().unwrap().push((object_seq, offset, len));
             self.inner.get_range(object_seq, offset, len).await
+        }
+
+        async fn delete(&self, object_seq: u64) -> Result<()> {
+            self.inner.delete(object_seq).await
         }
 
         async fn list(&self) -> Result<Vec<ListedObject>> {

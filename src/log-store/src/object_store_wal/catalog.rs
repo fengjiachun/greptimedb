@@ -14,10 +14,11 @@
 
 //! In-memory index over the footers of the objects of one WAL prefix.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
 
 use snafu::{OptionExt, ensure};
+use store_api::logstore::EntryId;
 use store_api::storage::RegionId;
 
 use crate::error::{
@@ -31,7 +32,18 @@ use crate::object_store_wal::format::FooterEntry;
 #[derive(Debug, Default)]
 pub(super) struct ObjectCatalog {
     objects: BTreeMap<u64, Vec<FooterEntry>>,
-    regions: BTreeMap<RegionId, BTreeMap<u64, FooterEntry>>,
+    regions: BTreeMap<RegionId, RegionObjects>,
+}
+
+/// The objects that hold entries of one region, by sequence, and the largest
+/// entry id the region ever had indexed. The id outlives the removal of the
+/// object that held it, so that within one run of the store a durability wait
+/// or an obsolete watermark keeps its reference point after the object was
+/// collected; a store opened later learns only what is listed.
+#[derive(Debug, Default)]
+struct RegionObjects {
+    objects: BTreeMap<u64, FooterEntry>,
+    max_entry_id: EntryId,
 }
 
 impl ObjectCatalog {
@@ -90,6 +102,7 @@ impl ObjectCatalog {
             let Some(region_objects) = self.regions.get(&entry.region_id) else {
                 continue;
             };
+            let region_objects = &region_objects.objects;
             if let Some((&previous_seq, previous)) = region_objects.range(..object_seq).next_back()
             {
                 ensure!(
@@ -125,13 +138,66 @@ impl ObjectCatalog {
         }
 
         for entry in &footer {
-            self.regions
-                .entry(entry.region_id)
-                .or_default()
-                .insert(object_seq, entry.clone());
+            let region = self.regions.entry(entry.region_id).or_default();
+            region.max_entry_id = region.max_entry_id.max(entry.max_entry_id);
+            region.objects.insert(object_seq, entry.clone());
         }
         self.objects.insert(object_seq, footer);
         Ok(())
+    }
+
+    /// Removes the object `object_seq` from the index once it was deleted.
+    /// The largest entry id of every region it held is kept.
+    pub(super) fn remove_object(&mut self, object_seq: u64) {
+        let Some(footer) = self.objects.remove(&object_seq) else {
+            return;
+        };
+        for entry in footer {
+            if let Some(region) = self.regions.get_mut(&entry.region_id) {
+                region.objects.remove(&object_seq);
+            }
+        }
+    }
+
+    /// Returns true while the object `object_seq` is indexed.
+    pub(super) fn contains_object(&self, object_seq: u64) -> bool {
+        self.objects.contains_key(&object_seq)
+    }
+
+    /// Returns, in sequence order, the objects garbage collection may delete
+    /// given the obsolete watermark of every region in `obsolete_entry_ids`.
+    ///
+    /// An object is deletable when every segment it holds has its maximum
+    /// entry id at or below the watermark of its region; a region without a
+    /// watermark keeps its objects, and the comparison is on the full id, so a
+    /// watermark that stops inside an object keeps the object. The object with
+    /// the highest sequence is never deletable, so that the sequence resumes
+    /// above everything ever written. Nothing is deletable while an entry id
+    /// assigned under the earlier contiguous scheme names an object beyond
+    /// the highest indexed one: the highest object alone must resume the
+    /// sequence, which it does only once an object is durable at the raised
+    /// sequence.
+    pub(super) fn deletable_objects(
+        &self,
+        obsolete_entry_ids: &HashMap<RegionId, EntryId>,
+    ) -> Vec<u64> {
+        let Some((&last_object_seq, _)) = self.objects.last_key_value() else {
+            return Vec::new();
+        };
+        if self.entry_id_floor() > last_object_seq.saturating_add(1) {
+            return Vec::new();
+        }
+        self.objects
+            .range(..last_object_seq)
+            .filter(|(_, footer)| {
+                footer.iter().all(|entry| {
+                    obsolete_entry_ids
+                        .get(&entry.region_id)
+                        .is_some_and(|obsolete| entry.max_entry_id <= *obsolete)
+                })
+            })
+            .map(|(&object_seq, _)| object_seq)
+            .collect()
     }
 
     /// Returns the objects that hold entries of `region_id` overlapping
@@ -151,10 +217,11 @@ impl ObjectCatalog {
             }
         );
 
-        let Some(objects) = self.regions.get(&region_id) else {
+        let Some(region) = self.regions.get(&region_id) else {
             return Ok(Vec::new());
         };
-        Ok(objects
+        Ok(region
+            .objects
             .iter()
             .filter(|(_, entry)| {
                 entry.max_entry_id >= start_entry_id && entry.min_entry_id <= end_entry_id
@@ -163,12 +230,22 @@ impl ObjectCatalog {
             .collect())
     }
 
-    /// Returns the largest entry id indexed for `region_id`.
+    /// Returns the largest entry id ever indexed for `region_id`, which is
+    /// kept after the object holding it was removed.
     pub(super) fn region_max_entry_id(&self, region_id: RegionId) -> Option<u64> {
         self.regions
-            .get(&region_id)?
-            .last_key_value()
-            .map(|(_, entry)| entry.max_entry_id)
+            .get(&region_id)
+            .map(|region| region.max_entry_id)
+    }
+
+    /// Returns the smallest sequence whose ids are greater than the largest
+    /// entry id of every region, see [`sequence_floor`].
+    fn entry_id_floor(&self) -> u64 {
+        self.regions
+            .values()
+            .map(|region| sequence_floor(region.max_entry_id))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns the sequence to assign to the next object written after recovery.
@@ -188,14 +265,7 @@ impl ObjectCatalog {
                 .checked_add(1)
                 .context(WalObjectSequenceExhaustedSnafu { last_object_seq })?,
         };
-        let floor = self
-            .regions
-            .keys()
-            .filter_map(|region_id| self.region_max_entry_id(*region_id))
-            .map(sequence_floor)
-            .max()
-            .unwrap_or(0);
-        let next_object_seq = after_last.max(floor);
+        let next_object_seq = after_last.max(self.entry_id_floor());
         ensure!(
             next_object_seq < OBJECT_SEQ_LIMIT,
             WalObjectSequenceExhaustedSnafu {
@@ -346,6 +416,126 @@ mod tests {
     }
 
     #[test]
+    fn test_catalog_deletable_objects_follow_the_watermarks() {
+        let region_one = RegionId::new(1, 1);
+        let region_two = RegionId::new(2, 1);
+        let mut catalog = ObjectCatalog::default();
+        catalog
+            .insert_object(
+                0,
+                vec![
+                    footer_entry(region_one, entry_id(0, 1), entry_id(0, 1)),
+                    footer_entry(region_two, entry_id(0, 1), entry_id(0, 1)),
+                ],
+            )
+            .unwrap();
+        catalog
+            .insert_object(
+                1,
+                vec![footer_entry(region_one, entry_id(1, 1), entry_id(1, 2))],
+            )
+            .unwrap();
+        catalog
+            .insert_object(
+                2,
+                vec![footer_entry(region_two, entry_id(2, 1), entry_id(2, 1))],
+            )
+            .unwrap();
+        catalog
+            .insert_object(
+                3,
+                vec![footer_entry(region_one, entry_id(3, 1), entry_id(3, 1))],
+            )
+            .unwrap();
+
+        // Without watermarks nothing is deletable.
+        assert!(catalog.deletable_objects(&HashMap::new()).is_empty());
+        // A watermark inside object 1 keeps it; object 0 holds a segment of
+        // a region without a watermark.
+        let mut obsolete = HashMap::from([(region_one, entry_id(1, 1))]);
+        assert!(catalog.deletable_objects(&obsolete).is_empty());
+        // A watermark at the last id of the segment releases object 1.
+        obsolete.insert(region_one, entry_id(1, 2));
+        assert_eq!(vec![1], catalog.deletable_objects(&obsolete));
+        // Object 0 needs both regions at or above its segments; object 2 is
+        // above the watermark of region two.
+        obsolete.insert(region_two, entry_id(0, 1));
+        assert_eq!(vec![0, 1], catalog.deletable_objects(&obsolete));
+        // The highest-sequence object is kept whatever the watermarks.
+        obsolete.insert(region_one, EntryId::MAX);
+        obsolete.insert(region_two, EntryId::MAX);
+        assert_eq!(vec![0, 1, 2], catalog.deletable_objects(&obsolete));
+
+        // Removing objects keeps the largest entry id of every region, so a
+        // region whose last object is gone still reports it.
+        for object_seq in [0, 1, 2] {
+            catalog.remove_object(object_seq);
+        }
+        catalog.remove_object(7);
+        assert_eq!(vec![3], object_seqs_of(&catalog));
+        assert!(!catalog.contains_object(2));
+        assert!(catalog.contains_object(3));
+        assert_eq!(
+            Some(entry_id(3, 1)),
+            catalog.region_max_entry_id(region_one)
+        );
+        assert_eq!(
+            Some(entry_id(2, 1)),
+            catalog.region_max_entry_id(region_two)
+        );
+        assert!(
+            catalog
+                .objects_for_entry_range(region_two, 0, EntryId::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(catalog.deletable_objects(&obsolete).is_empty());
+        assert_eq!(4, catalog.next_object_seq().unwrap());
+    }
+
+    #[test]
+    fn test_catalog_holds_deletion_while_contiguous_ids_name_a_later_object() {
+        let region_one = RegionId::new(1, 1);
+        let region_two = RegionId::new(2, 1);
+        let mut catalog = ObjectCatalog::default();
+        // Objects of the contiguous scheme: id 5_000_000 names object 4, so
+        // the sequence resumes at 5 although object 2 is the highest.
+        catalog
+            .insert_object(0, vec![footer_entry(region_one, 1, 2)])
+            .unwrap();
+        catalog
+            .insert_object(1, vec![footer_entry(region_one, 4_999_999, 5_000_000)])
+            .unwrap();
+        catalog
+            .insert_object(2, vec![footer_entry(region_two, 1, 1)])
+            .unwrap();
+        assert_eq!(5, catalog.next_object_seq().unwrap());
+
+        // Every object is below its watermark, but object 2 alone could not
+        // resume the sequence above 5_000_000: nothing is deletable.
+        let obsolete = HashMap::from([(region_one, 5_000_000), (region_two, 1)]);
+        assert!(catalog.deletable_objects(&obsolete).is_empty());
+
+        // An object durable at the raised sequence resumes it on its own, so
+        // the old objects go and it is kept, even under a watermark at its
+        // own entry.
+        catalog
+            .insert_object(
+                5,
+                vec![footer_entry(region_two, entry_id(5, 1), entry_id(5, 1))],
+            )
+            .unwrap();
+        assert_eq!(vec![0, 1, 2], catalog.deletable_objects(&obsolete));
+        let obsolete = HashMap::from([(region_one, 5_000_000), (region_two, entry_id(5, 1))]);
+        assert_eq!(vec![0, 1, 2], catalog.deletable_objects(&obsolete));
+        for object_seq in [0, 1, 2] {
+            catalog.remove_object(object_seq);
+        }
+        assert_eq!(vec![5], object_seqs_of(&catalog));
+        assert_eq!(6, catalog.next_object_seq().unwrap());
+    }
+
+    #[test]
     fn test_catalog_rejects_exhausted_object_sequence() {
         let region_id = RegionId::new(1, 1);
         let assert_exhausted = |catalog: &ObjectCatalog| {
@@ -454,6 +644,13 @@ mod tests {
 
     fn object_seqs(objects: &[(u64, &FooterEntry)]) -> Vec<u64> {
         objects.iter().map(|(object_seq, _)| *object_seq).collect()
+    }
+
+    fn object_seqs_of(catalog: &ObjectCatalog) -> Vec<u64> {
+        catalog
+            .objects_in_order()
+            .map(|(object_seq, _)| object_seq)
+            .collect()
     }
 
     fn assert_corrupted(result: Result<()>, expected_reason: &str) {

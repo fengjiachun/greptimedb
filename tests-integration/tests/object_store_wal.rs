@@ -128,8 +128,10 @@ impl WalObjects {
         }
     }
 
-    /// Returns the object count and their total size in bytes.
-    async fn count_and_bytes(&self) -> (usize, u64) {
+    /// Returns the object count and their total size in bytes. Every key is
+    /// logged when `log_keys` is set, so the driver script can show the
+    /// layout the store derived below the root prefix.
+    async fn count_and_bytes(&self, log_keys: bool) -> (usize, u64) {
         let entries = self
             .store
             .list_with(&self.path)
@@ -150,18 +152,31 @@ impl WalObjects {
                 .content_length();
             count += 1;
             bytes += len;
-            // Every key is logged so the driver script can show the layout
-            // the store derived below the root prefix.
-            info!("object_store_wal object={} bytes={len}", entry.path());
+            if log_keys {
+                info!("object_store_wal object={} bytes={len}", entry.path());
+            }
         }
         (count, bytes)
     }
 
     /// Logs the objects of a phase for the driver script to collect.
     async fn record(&self, phase: &str) -> (usize, u64) {
-        let (count, bytes) = self.count_and_bytes().await;
+        let (count, bytes) = self.count_and_bytes(true).await;
         info!("object_store_wal phase={phase} objects={count} bytes={bytes}");
         (count, bytes)
+    }
+
+    /// Waits until at most `expected` objects remain: the store deletes the
+    /// objects a flush releases in the background, after the flush returned.
+    async fn wait_for_collection(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.count_and_bytes(false).await.0 > expected {
+            assert!(
+                Instant::now() < deadline,
+                "the WAL objects were not collected down to {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -275,10 +290,15 @@ async fn test_standalone_object_store_wal_survives_restarts_on_s3() {
     let (replayed_objects, _) = wal_objects.record("after-restart-1").await;
     assert_eq!(objects, replayed_objects);
 
+    // The flush moves the region's watermark past every object: the store
+    // collects all of them but the highest, which anchors the sequence.
     execute_sql(standalone.fe_instance(), "ADMIN FLUSH_TABLE('cpu')").await;
-    wal_objects.record("after-flush").await;
+    wal_objects.wait_for_collection(1).await;
+    let (remaining, _) = wal_objects.record("after-flush").await;
+    assert_eq!(1, remaining);
 
-    // The flushed rows come back from the SST and nothing is replayed twice.
+    // The flushed rows come back from the SST and nothing is replayed twice;
+    // the retained object is the highest, so opening the region keeps it.
     let (standalone, elapsed) = restart(&builder, standalone).await;
     info!("object_store_wal restart=2 wall_ms={}", elapsed.as_millis());
     let rows = execute_sql(standalone.fe_instance(), query)
@@ -287,5 +307,6 @@ async fn test_standalone_object_store_wal_survives_restarts_on_s3() {
         .pretty_print()
         .await;
     assert_eq!(expected, rows);
-    wal_objects.record("after-restart-2").await;
+    let (remaining, _) = wal_objects.record("after-restart-2").await;
+    assert_eq!(1, remaining);
 }
