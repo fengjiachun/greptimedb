@@ -311,19 +311,21 @@ fi
 # leaves the script blocked and the test's own end is noticed as soon as it
 # records its status. From then on the log copy may drain for a bounded
 # time; a process of the test that keeps the copy from ending is stopped
-# when that time is up, and the recorded status is kept.
+# when that time is up, and the recorded status is kept. Liveness comes
+# from the builtin kill, which no signal can interrupt; ps only tells a
+# zombie apart, and a ps that a signal cut short leaves the wrapper counted
+# as alive until the next look. The clock is the shell's own.
 DRAIN_SECONDS=30
 DRAIN_DEADLINE=""
-while true; do
+while kill -0 "${TEST_PID}" 2>/dev/null; do
   STATE=$(ps -o stat= -p "${TEST_PID}" 2>/dev/null | tr -d ' ' || true)
   case "${STATE}" in
-    "" | Z*) break ;;
+    Z*) break ;;
   esac
   if [ -s "${STATUS_FILE}" ]; then
-    NOW=$(date +%s)
     if [ -z "${DRAIN_DEADLINE}" ]; then
-      DRAIN_DEADLINE=$((NOW + DRAIN_SECONDS))
-    elif [ "${NOW}" -ge "${DRAIN_DEADLINE}" ]; then
+      DRAIN_DEADLINE=$((SECONDS + DRAIN_SECONDS))
+    elif [ "${SECONDS}" -ge "${DRAIN_DEADLINE}" ]; then
       log "the test ended ${DRAIN_SECONDS}s ago and its output has not drained, stopping what is left of it"
       if ! stop_test; then
         CLEANUP="root ${STORE_ROOT} not removed, a process of the test survived"
