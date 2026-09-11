@@ -68,10 +68,12 @@ const MAX_IN_FLIGHT_CREATES: usize = 4;
 const MAX_IN_FLIGHT_DELETES: usize = 4;
 /// Number of objects one collection inspects in the catalog before it stops
 /// and leaves a cursor for the next one. It bounds the work a collection does
-/// on the actor whatever the prefix holds, while being wide enough that a
-/// prefix of ten thousand objects is swept in ten passes rather than in
-/// hundreds: every flush starts a pass and every delete that succeeded
-/// continues one, and a pass costs a range over a thousand footers.
+/// on the actor whatever the prefix holds: a pass costs a range over at most
+/// this many footers, and nothing it reads besides them grows with the
+/// prefix. It is wide enough to cross a stretch of objects that are all
+/// retained in few passes, which matters because such a pass accepts no
+/// candidate and so schedules nothing: it advances by one pass per
+/// `obsolete`.
 const DELETE_SCAN_LIMIT: usize = 1024;
 /// Delay before a create that failed transiently is attempted again in the
 /// `enqueued` acknowledgement mode, where no caller is left to retry it.
@@ -1636,18 +1638,22 @@ impl Actor {
     /// until after it was unindexed, so a read that listed it never meets it
     /// as an indexed object the object store has already removed.
     ///
-    /// A collection is bounded twice: it inspects at most
-    /// [`DELETE_SCAN_LIMIT`] objects of the catalog, and it keeps at most
-    /// [`MAX_IN_FLIGHT_DELETES`] deletes in flight, the way creates are
-    /// capped. It resumes at the cursor the last one left and wraps at the
-    /// end of the catalog, so a prefix that accumulated a large WAL is swept
-    /// in bounded passes, a stretch of objects that are all retained is not
+    /// A collection is one bounded pass: it inspects at most
+    /// [`DELETE_SCAN_LIMIT`] objects of the catalog and schedules at most
+    /// [`MAX_IN_FLIGHT_DELETES`] deletes, the bound creates have. It resumes
+    /// at the cursor the last one left and wraps at the object that is
+    /// always kept, so a prefix that accumulated a large WAL is swept in
+    /// bounded passes, a stretch of objects that are all retained is not
     /// walked again by every pass, and objects whose delete failed are
     /// retried on a later sweep instead of holding up the objects behind
-    /// them. Every flush starts a pass through `obsolete` and every delete
-    /// that succeeded starts one, so a backlog drains without waiting for
-    /// the next watermark. Nothing is collected once stop began or the store
-    /// is poisoned.
+    /// them.
+    ///
+    /// A pass runs on an `obsolete` and on every delete that succeeded, so a
+    /// stretch that yields candidates keeps itself going, four deletes at a
+    /// time. A pass that accepts nothing schedules nothing and leaves the
+    /// next one to the following `obsolete`, and so does a delete that
+    /// failed. Nothing is collected once stop began or the store is
+    /// poisoned.
     fn collect_garbage(&mut self) {
         if self.is_stopped() || terminal(&self.terminal_error).is_some() {
             return;
@@ -1656,21 +1662,23 @@ impl Actor {
         if free == 0 {
             return;
         }
-        let obsolete_entry_ids = self
-            .obsolete_entry_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let scan = self
-            .catalog
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .deletable_objects(
+        let scan = {
+            // The watermarks are read where they are for the length of the
+            // pass rather than copied, which a pass must not do: the map
+            // holds an entry per region and the pass is bounded. Wherever
+            // both are held, the watermarks are taken before the catalog.
+            let obsolete_entry_ids = self
+                .obsolete_entry_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let catalog = self.catalog.read().unwrap_or_else(PoisonError::into_inner);
+            catalog.deletable_objects(
                 &obsolete_entry_ids,
                 self.collect_cursor,
                 free,
                 DELETE_SCAN_LIMIT,
-            );
+            )
+        };
         self.collect_cursor = scan.resume_from;
         for object_seq in scan.objects {
             // Still in flight from an earlier pass that the cursor wrapped
@@ -1689,11 +1697,11 @@ impl Actor {
     /// settles its attempt; a read that listed the object sees it as
     /// collected throughout, since the object store may have removed it as
     /// soon as the delete started. A delete that succeeded starts the next
-    /// collection, so a backlog larger than the in-flight cap drains without
-    /// waiting for the next watermark. A failed delete leaves the object
-    /// indexed and starts nothing: it is deleted again by the next
-    /// collection, which a watermark starts, so a delete that keeps failing
-    /// is not repeated in a loop.
+    /// pass from the cursor, so a stretch of collectable objects drains at
+    /// the rate the deletes complete rather than at the rate watermarks
+    /// move. A failed delete leaves the object indexed and starts nothing:
+    /// it is deleted again by a later sweep, which a watermark starts, so a
+    /// delete that keeps failing is not repeated in a loop.
     fn on_delete_completed(&mut self, object_seq: u64, result: Result<()>) {
         let deleted = result.is_ok();
         match result {

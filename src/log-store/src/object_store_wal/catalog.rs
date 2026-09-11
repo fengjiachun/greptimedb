@@ -33,6 +33,15 @@ use crate::object_store_wal::format::FooterEntry;
 pub(super) struct ObjectCatalog {
     objects: BTreeMap<u64, Vec<FooterEntry>>,
     regions: BTreeMap<RegionId, RegionObjects>,
+    /// The smallest object sequence whose ids are greater than every entry id
+    /// ever indexed, see [`sequence_floor`].
+    ///
+    /// It is maintained as objects are indexed rather than derived from the
+    /// regions, so that reading it costs nothing however many regions the
+    /// prefix has held, and it is kept when an object is removed: an id a
+    /// collected object carried still has to stay below every id assigned
+    /// afterwards.
+    entry_id_floor: u64,
 }
 
 /// The objects that hold entries of one region, by sequence, and the largest
@@ -152,6 +161,7 @@ impl ObjectCatalog {
             let region = self.regions.entry(entry.region_id).or_default();
             region.max_entry_id = region.max_entry_id.max(entry.max_entry_id);
             region.objects.insert(object_seq, entry.clone());
+            self.entry_id_floor = self.entry_id_floor.max(sequence_floor(entry.max_entry_id));
         }
         self.objects.insert(object_seq, footer);
         Ok(())
@@ -209,7 +219,7 @@ impl ObjectCatalog {
         let Some((&last_object_seq, _)) = self.objects.last_key_value() else {
             return scan;
         };
-        if self.entry_id_floor() > last_object_seq.saturating_add(1) {
+        if self.entry_id_floor > last_object_seq.saturating_add(1) {
             return scan;
         }
         // A cursor at or past the object that is always kept has nothing left
@@ -279,16 +289,6 @@ impl ObjectCatalog {
             .map(|region| region.max_entry_id)
     }
 
-    /// Returns the smallest sequence whose ids are greater than the largest
-    /// entry id of every region, see [`sequence_floor`].
-    fn entry_id_floor(&self) -> u64 {
-        self.regions
-            .values()
-            .map(|region| sequence_floor(region.max_entry_id))
-            .max()
-            .unwrap_or(0)
-    }
-
     /// Returns the sequence to assign to the next object written after recovery.
     ///
     /// An empty catalog starts at zero, so the first object of a prefix always
@@ -306,7 +306,7 @@ impl ObjectCatalog {
                 .checked_add(1)
                 .context(WalObjectSequenceExhaustedSnafu { last_object_seq })?,
         };
-        let next_object_seq = after_last.max(self.entry_id_floor());
+        let next_object_seq = after_last.max(self.entry_id_floor);
         ensure!(
             next_object_seq < OBJECT_SEQ_LIMIT,
             WalObjectSequenceExhaustedSnafu {
@@ -623,6 +623,64 @@ mod tests {
             (20..29).collect::<Vec<u64>>(),
             deletable(&catalog, &obsolete)
         );
+    }
+
+    #[test]
+    fn test_catalog_scan_does_not_grow_with_the_regions_the_prefix_held() {
+        // The same objects to scan under a prefix that held one region and
+        // under one that held two hundred, every one of whose objects was
+        // collected: what a pass costs must not follow that history.
+        let live = RegionId::new(9, 9);
+        let obsolete = HashMap::from([(live, entry_id(9, 1))]);
+        let mut scans = Vec::new();
+        for historical_regions in [1u32, 200] {
+            let mut catalog = ObjectCatalog::default();
+            // Objects 0 and 1 hold a segment of every region that has since
+            // lost all of its objects.
+            for object_seq in 0..2 {
+                let footer = (0..historical_regions)
+                    .map(|number| {
+                        footer_entry(
+                            RegionId::new(1, number),
+                            entry_id(object_seq, 1),
+                            entry_id(object_seq, 1),
+                        )
+                    })
+                    .collect();
+                catalog.insert_object(object_seq, footer).unwrap();
+            }
+            for object_seq in 2..12 {
+                catalog
+                    .insert_object(
+                        object_seq,
+                        vec![footer_entry(
+                            live,
+                            entry_id(object_seq, 1),
+                            entry_id(object_seq, 1),
+                        )],
+                    )
+                    .unwrap();
+            }
+            catalog.remove_object(0);
+            catalog.remove_object(1);
+            assert_eq!(historical_regions as usize + 1, catalog.regions.len());
+
+            // The floor is a value the catalog keeps, not one it derives from
+            // the regions, and an id of a collected object still holds it up.
+            assert_eq!(12, catalog.entry_id_floor);
+            assert_eq!(12, catalog.next_object_seq().unwrap());
+            scans.push(catalog.deletable_objects(&obsolete, 0, 4, 8));
+        }
+        // The history changes neither what a pass accepts nor where it
+        // resumes, and the scan bound alone says how much it inspected.
+        assert_eq!(
+            DeletableObjects {
+                objects: vec![2, 3, 4, 5],
+                resume_from: 6,
+            },
+            scans[0]
+        );
+        assert_eq!(scans[0], scans[1]);
     }
 
     #[test]
