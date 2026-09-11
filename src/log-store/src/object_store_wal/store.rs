@@ -61,6 +61,11 @@ const COMMAND_BUFFER: usize = 1024;
 const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 /// Number of conditional creates that run at a time.
 const MAX_IN_FLIGHT_CREATES: usize = 4;
+/// Number of object deletes a collection runs at a time. A collection takes
+/// no more candidates than this from the catalog and leaves the rest to the
+/// next one, so the first collection on a prefix that accumulated a large WAL
+/// costs a bounded number of requests.
+const MAX_IN_FLIGHT_DELETES: usize = 4;
 /// Delay before a create that failed transiently is attempted again in the
 /// `enqueued` acknowledgement mode, where no caller is left to retry it.
 const CREATE_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -118,90 +123,111 @@ pub struct ObjectStoreLogStore {
 
 type TerminalError = Arc<Mutex<Option<Arc<Error>>>>;
 
-/// The objects a collection is deleting, with a version that changes whenever
-/// one leaves the set, so a read can wait for a delete to settle.
+/// The delete attempts a collection has in flight, one per object.
 ///
-/// The actor puts an object in before its delete starts and takes it out only
-/// after a delete that succeeded unindexed it, so an object that is absent
-/// here was either never collected or is already unindexed. [`is_collected`]
-/// depends on that order.
+/// The actor registers an attempt before its delete starts, unindexes the
+/// object if the delete succeeded, and only then settles the attempt and takes
+/// it out, so an object without an attempt was either never collected or is
+/// already unindexed. [`is_collected`] depends on that order.
+///
+/// A read holds the handle of the attempt it observed rather than the sequence
+/// of the object, so an attempt that settles releases the reads that were
+/// waiting for it even when the same object is already being retried: the
+/// retry is a different attempt with a handle of its own.
 #[derive(Debug, Default)]
 struct DeletingObjects {
-    objects: Mutex<BTreeSet<u64>>,
-    /// Bumped whenever an object leaves the set.
-    settled: Mutex<Option<watch::Sender<u64>>>,
+    /// The settlement flag of the attempt in flight per object sequence.
+    attempts: Mutex<BTreeMap<u64, watch::Sender<bool>>>,
     /// Parks a read between the two observations of [`is_collected`], so a
     /// test can decide what happens in that window.
     #[cfg(any(test, feature = "testing"))]
     read_gap: Mutex<Option<mpsc::UnboundedSender<oneshot::Sender<()>>>>,
 }
 
+/// The completion of one delete attempt, taken together with the lookup that
+/// found it so that it names that attempt alone.
+#[derive(Debug)]
+struct AttemptHandle(watch::Receiver<bool>);
+
+impl AttemptHandle {
+    /// Returns once the attempt has settled: its delete succeeded or failed,
+    /// or the actor exited and abandoned it. A sender dropped without a
+    /// settlement ends the wait as well, so no read is left behind.
+    async fn settled(mut self) {
+        let _ = self.0.wait_for(|settled| *settled).await;
+    }
+}
+
 impl DeletingObjects {
     fn new() -> Arc<Self> {
-        let (settled, _) = watch::channel(0);
-        Arc::new(Self {
-            settled: Mutex::new(Some(settled)),
-            ..Default::default()
-        })
+        Arc::new(Self::default())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<u64>> {
-        self.objects.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, watch::Sender<bool>>> {
+        self.attempts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Registers `object_seq` as being deleted and returns whether it was not
-    /// registered already.
-    fn insert(&self, object_seq: u64) -> bool {
-        self.lock().insert(object_seq)
+    /// Registers a delete attempt for `object_seq` and returns whether it was
+    /// registered, which it is not while an earlier attempt is in flight.
+    fn start(&self, object_seq: u64) -> bool {
+        let mut attempts = self.lock();
+        if attempts.contains_key(&object_seq) {
+            return false;
+        }
+        let (settled, _) = watch::channel(false);
+        attempts.insert(object_seq, settled);
+        true
     }
 
-    /// Takes `object_seq` out of the set and wakes the reads waiting for it.
-    fn remove(&self, object_seq: u64) {
-        self.lock().remove(&object_seq);
-        if let Some(settled) = self
-            .settled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-        {
-            settled.send_modify(|version| *version = version.wrapping_add(1));
+    /// Settles the attempt of `object_seq` and takes it out, releasing the
+    /// reads that hold its handle. The actor calls this after a delete that
+    /// succeeded unindexed the object and after one that failed left it
+    /// indexed, so a read that wakes up reads the outcome from the catalog.
+    fn finish(&self, object_seq: u64) {
+        if let Some(settled) = self.lock().remove(&object_seq) {
+            settled.send_replace(true);
         }
     }
 
-    fn contains(&self, object_seq: u64) -> bool {
-        self.lock().contains(&object_seq)
+    /// Settles and takes out every attempt in flight, which the actor does
+    /// when it exits with deletes it will never complete: their objects stay
+    /// present and indexed, and the reads waiting for them report the error
+    /// they met instead of waiting for a collection that will not happen.
+    fn abandon_all(&self) {
+        for (_, settled) in std::mem::take(&mut *self.lock()) {
+            settled.send_replace(true);
+        }
     }
 
-    fn subscribe(&self) -> Option<watch::Receiver<u64>> {
-        self.settled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(watch::Sender::subscribe)
+    /// Returns the handle of the attempt in flight for `object_seq`, taken
+    /// together with the lookup, or `None` when no delete of it is in flight.
+    fn attempt(&self, object_seq: u64) -> Option<AttemptHandle> {
+        self.lock()
+            .get(&object_seq)
+            .map(|settled| AttemptHandle(settled.subscribe()))
     }
 
-    /// Waits until the delete of `object_seq` has settled, that is until the
-    /// actor took the object out of the set, which it does after a delete
-    /// that succeeded unindexed it and after one that failed left it indexed.
-    async fn wait_until_settled(&self, object_seq: u64) {
-        self.wait_until(|| !self.contains(object_seq)).await;
+    /// Returns how many deletes are in flight.
+    fn len(&self) -> usize {
+        self.lock().len()
     }
 
-    /// Waits until no delete is in flight.
+    /// Waits until no delete is in flight. New attempts can only come from a
+    /// collection, which an `obsolete` starts, so a caller that made none is
+    /// answered once the attempts it waited for have settled.
     #[cfg(any(test, feature = "testing"))]
     async fn wait_until_empty(&self) {
-        self.wait_until(|| self.lock().is_empty()).await;
-    }
-
-    async fn wait_until(&self, settled: impl Fn() -> bool) {
-        // Subscribing before the first check is what makes this free of a
-        // lost wakeup: a change between the check and the wait is reported.
-        let Some(mut changed) = self.subscribe() else {
-            return;
-        };
-        while !settled() {
-            if changed.changed().await.is_err() {
+        loop {
+            let in_flight = self
+                .lock()
+                .values()
+                .map(|settled| AttemptHandle(settled.subscribe()))
+                .collect::<Vec<_>>();
+            if in_flight.is_empty() {
                 return;
+            }
+            for attempt in in_flight {
+                attempt.settled().await;
             }
         }
     }
@@ -1041,7 +1067,9 @@ impl Actor {
                         self.handle_seal(response);
                     }
                     // Every sender is gone: the store was dropped without
-                    // `stop`. The creates in flight are dropped with the actor.
+                    // `stop`. The creates in flight are dropped with the
+                    // actor, and so are the deletes, whose attempts the
+                    // teardown settles.
                     None => return,
                 },
             }
@@ -1593,12 +1621,24 @@ impl Actor {
     /// allow, see [`ObjectCatalog::deletable_objects`]. The deletes run in
     /// the background so they never hold up admission, sealing, uploads or
     /// acknowledgements; an object is unindexed once its delete succeeded.
-    /// An object is in the in-flight set from before its delete starts until
-    /// after it was unindexed, so a read that listed it never meets it as an
-    /// indexed object the object store has already removed.
-    /// Nothing is collected once stop began or the store is poisoned.
+    /// An object has an attempt registered from before its delete starts
+    /// until after it was unindexed, so a read that listed it never meets it
+    /// as an indexed object the object store has already removed.
+    ///
+    /// At most [`MAX_IN_FLIGHT_DELETES`] deletes run at a time, the way
+    /// creates are capped, and no more candidates than that are taken from
+    /// the catalog: the first collection on a prefix that accumulated a large
+    /// WAL costs one bounded scan and a bounded number of requests rather
+    /// than one request per object. What is left over stays in the catalog
+    /// and is taken by the next collection, which every flush starts, and a
+    /// delete that succeeded starts one itself, so a backlog drains without
+    /// waiting for the next watermark. Nothing is collected once stop began
+    /// or the store is poisoned.
     fn collect_garbage(&mut self) {
         if self.is_stopped() || terminal(&self.terminal_error).is_some() {
+            return;
+        }
+        if self.deleting.len() >= MAX_IN_FLIGHT_DELETES {
             return;
         }
         let obsolete_entry_ids = self
@@ -1610,10 +1650,13 @@ impl Actor {
             .catalog
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .deletable_objects(&obsolete_entry_ids);
+            .deletable_objects(&obsolete_entry_ids, MAX_IN_FLIGHT_DELETES);
         for object_seq in deletable {
+            if self.deleting.len() >= MAX_IN_FLIGHT_DELETES {
+                break;
+            }
             // Still in flight from an earlier collection.
-            if !self.deleting.insert(object_seq) {
+            if !self.deleting.start(object_seq) {
                 continue;
             }
             let io = self.io.clone();
@@ -1623,12 +1666,17 @@ impl Actor {
         }
     }
 
-    /// Unindexes the object `object_seq` once its delete succeeded, then takes
-    /// it out of the in-flight set; a read that listed the object sees it as
+    /// Unindexes the object `object_seq` once its delete succeeded, then
+    /// settles its attempt; a read that listed the object sees it as
     /// collected throughout, since the object store may have removed it as
-    /// soon as the delete started. A failed delete leaves the object indexed,
-    /// so the next collection deletes it again.
+    /// soon as the delete started. A delete that succeeded starts the next
+    /// collection, so a backlog larger than the in-flight cap drains without
+    /// waiting for the next watermark. A failed delete leaves the object
+    /// indexed and starts nothing: it is deleted again by the next
+    /// collection, which a watermark starts, so a delete that keeps failing
+    /// is not repeated in a loop.
     fn on_delete_completed(&mut self, object_seq: u64, result: Result<()>) {
+        let deleted = result.is_ok();
         match result {
             Ok(()) => {
                 self.catalog
@@ -1647,9 +1695,12 @@ impl Actor {
                 METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.inc();
             }
         }
-        // Last, so a read that finds the object gone from the set sees the
-        // outcome the delete had, see [`is_collected`].
-        self.deleting.remove(object_seq);
+        // Settled last, so a read that the attempt releases reads the outcome
+        // of this delete from the catalog, see [`is_collected`].
+        self.deleting.finish(object_seq);
+        if deleted {
+            self.collect_garbage();
+        }
     }
 
     /// Moves the sequence of the next object above the object that holds
@@ -1803,6 +1854,18 @@ impl Actor {
     }
 }
 
+impl Drop for Actor {
+    /// Settles every delete the actor still had in flight. The read streams
+    /// of the store outlive it, and one of them may be waiting for an attempt
+    /// this actor will never complete, either because the store was dropped
+    /// without `stop` or because the runtime dropped the task. Their objects
+    /// stay present and indexed, so the reads report the error they met.
+    /// `stop` settles its deletes by completing them, and leaves none here.
+    fn drop(&mut self) {
+        self.deleting.abandon_all();
+    }
+}
+
 fn terminal(terminal_error: &TerminalError) -> Option<Arc<Error>> {
     terminal_error
         .lock()
@@ -1849,7 +1912,10 @@ fn is_indexed(catalog: &RwLock<ObjectCatalog>, object_seq: u64) -> bool {
 /// An object that is being deleted is not yet decided, so the caller waits for
 /// that one delete to settle rather than assume it succeeds: a delete that
 /// fails leaves the object present and indexed, and the error the read met is
-/// then reported as any other, corruption included. The wait is bounded by one
+/// then reported as any other, corruption included. The wait is for the
+/// attempt the lookup found, taken with it, so a retry of the same object is a
+/// different attempt that never holds the read up, and the actor settles every
+/// attempt it abandons when it exits. The wait is therefore bounded by one
 /// object store request. Every object a collection picked holds only entries
 /// at or below the watermark of their region, which a read never returns, so
 /// skipping one never loses an entry.
@@ -1858,8 +1924,8 @@ async fn is_collected(
     deleting: &DeletingObjects,
     object_seq: u64,
 ) -> bool {
-    if deleting.contains(object_seq) {
-        deleting.wait_until_settled(object_seq).await;
+    if let Some(attempt) = deleting.attempt(object_seq) {
+        attempt.settled().await;
     }
     #[cfg(any(test, feature = "testing"))]
     deleting.pass_read_gap().await;
@@ -5500,6 +5566,186 @@ mod tests {
             .unwrap();
         assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
         assert!(read(&store, region_id, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_store_read_waits_for_its_own_attempt_not_for_the_sequence() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let (io, mut parked) = FaultyIo::holding_deletes();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        append(&store, region_id, "a1").await.unwrap();
+        append(&store, region_id, "a2").await.unwrap();
+
+        // The read is polled by the test alone, so the failure and the retry
+        // below both land while it is waiting for the first attempt.
+        let stream = store.read(&provider(region_id), 1, None).await.unwrap();
+        store
+            .obsolete(&provider(region_id), region_id, id(0, 1))
+            .await
+            .unwrap();
+        let (_, first) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+        io.fail_reads_of.store(0, Ordering::Relaxed);
+        let read = collect_stream(stream);
+        tokio::pin!(read);
+        for _ in 0..16 {
+            assert!(futures::poll!(read.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+
+        // The first attempt fails, which leaves the object indexed, and a
+        // second collection retries it under a new attempt that is parked in
+        // turn. The read has not been polled in between.
+        first.send(false).unwrap();
+        timeout(WAIT, store.wait_for_garbage_collection())
+            .await
+            .unwrap();
+        assert!(is_indexed(&store, 0));
+        store
+            .obsolete(&provider(region_id), region_id, id(0, 1))
+            .await
+            .unwrap();
+        let (retried_seq, second) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+        assert_eq!(0, retried_seq);
+
+        // The attempt the read holds has settled, so the retry of the same
+        // object does not hold it up: it reads the catalog, finds the object
+        // indexed and reports the error it met. Waiting for the sequence
+        // instead of the attempt would wait for the retry, and for every
+        // attempt after it.
+        let mut finished = None;
+        for _ in 0..1024 {
+            if let std::task::Poll::Ready(result) = futures::poll!(read.as_mut()) {
+                finished = Some(result);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let error = finished
+            .expect("the read is still waiting for the retry of the object it met")
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::WalObjectStore { operation: "read", path, .. }
+                if path == &io.object_path(0)),
+            "unexpected error: {error:?}"
+        );
+        second.send(true).unwrap();
+        timeout(WAIT, store.wait_for_garbage_collection())
+            .await
+            .unwrap();
+        assert!(!is_indexed(&store, 0));
+    }
+
+    #[tokio::test]
+    async fn test_store_dropped_without_stop_settles_the_deletes_it_abandons() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let (io, mut parked) = FaultyIo::holding_deletes();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        append(&store, region_id, "a1").await.unwrap();
+        append(&store, region_id, "a2").await.unwrap();
+
+        // The read meets object 0 while its delete is parked, so it waits for
+        // that attempt.
+        let stream = store.read(&provider(region_id), 1, None).await.unwrap();
+        store
+            .obsolete(&provider(region_id), region_id, id(0, 1))
+            .await
+            .unwrap();
+        let (_, _release) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+        io.fail_reads_of.store(0, Ordering::Relaxed);
+        let read = tokio::spawn(collect_stream(stream));
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!read.is_finished());
+
+        // The store is dropped without `stop`: the actor loses its commands,
+        // exits and drops the parked delete. The stream outlives it and must
+        // not wait for an attempt that will never complete; the object is
+        // still there and indexed, so the error it met is returned.
+        drop(store);
+        let error = timeout(WAIT, read).await.unwrap().unwrap().unwrap_err();
+        assert!(
+            matches!(&error, Error::WalObjectStore { operation: "read", path, .. }
+                if path == &io.object_path(0)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+    }
+
+    #[tokio::test]
+    async fn test_store_bounds_the_deletes_of_one_collection() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let (io, mut parked) = FaultyIo::holding_deletes();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        // Twice the cap of collectable objects, plus the one that is kept.
+        let objects = 2 * MAX_IN_FLIGHT_DELETES;
+        for index in 0..=objects {
+            append(&store, region_id, &format!("a{index}"))
+                .await
+                .unwrap();
+        }
+        let all = (0..=objects as u64).collect::<Vec<_>>();
+        assert_eq!(all, object_seqs(io.as_ref()).await);
+
+        // Every object below the last is collectable, but the collection
+        // takes only the cap and answers the caller of `obsolete` at once.
+        timeout(
+            WAIT,
+            store.obsolete(&provider(region_id), region_id, id(objects as u64 - 1, 1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut releases = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_DELETES {
+            releases.push(timeout(WAIT, parked.recv()).await.unwrap().unwrap());
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(parked.try_recv().is_err(), "more deletes than the cap ran");
+        assert_eq!(
+            (0..MAX_IN_FLIGHT_DELETES as u64).collect::<Vec<_>>(),
+            releases.iter().map(|(seq, _)| *seq).collect::<Vec<_>>()
+        );
+        assert_eq!(all, object_seqs(io.as_ref()).await);
+
+        // Appends are admitted and acknowledged while the deletes are parked.
+        let response = timeout(WAIT, append(&store, region_id, "while-deleting"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Some(&id(objects as u64 + 1, 1)),
+            response.last_entry_ids.get(&region_id)
+        );
+
+        // Each delete that succeeds refills the collection, so the rest of
+        // the backlog drains without another watermark, still within the cap.
+        for (_, release) in releases {
+            release.send(true).unwrap();
+        }
+        for _ in 0..MAX_IN_FLIGHT_DELETES {
+            let (_, release) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+            release.send(true).unwrap();
+        }
+        timeout(WAIT, store.wait_for_garbage_collection())
+            .await
+            .unwrap();
+        assert!(parked.try_recv().is_err());
+        assert_eq!(
+            vec![objects as u64, objects as u64 + 1],
+            object_seqs(io.as_ref()).await
+        );
     }
 
     #[tokio::test]

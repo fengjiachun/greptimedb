@@ -164,8 +164,11 @@ impl ObjectCatalog {
         self.objects.contains_key(&object_seq)
     }
 
-    /// Returns, in sequence order, the objects garbage collection may delete
-    /// given the obsolete watermark of every region in `obsolete_entry_ids`.
+    /// Returns, in sequence order, at most `limit` objects garbage collection
+    /// may delete given the obsolete watermark of every region in
+    /// `obsolete_entry_ids`. The limit bounds what one collection scans and
+    /// allocates on a prefix that holds many collectable objects; the rest
+    /// stay indexed for the next collection.
     ///
     /// An object is deletable when every segment it holds has its maximum
     /// entry id at or below the watermark of its region; a region without a
@@ -180,6 +183,7 @@ impl ObjectCatalog {
     pub(super) fn deletable_objects(
         &self,
         obsolete_entry_ids: &HashMap<RegionId, EntryId>,
+        limit: usize,
     ) -> Vec<u64> {
         let Some((&last_object_seq, _)) = self.objects.last_key_value() else {
             return Vec::new();
@@ -197,6 +201,7 @@ impl ObjectCatalog {
                 })
             })
             .map(|(&object_seq, _)| object_seq)
+            .take(limit)
             .collect()
     }
 
@@ -449,22 +454,29 @@ mod tests {
             .unwrap();
 
         // Without watermarks nothing is deletable.
-        assert!(catalog.deletable_objects(&HashMap::new()).is_empty());
+        assert!(
+            catalog
+                .deletable_objects(&HashMap::new(), usize::MAX)
+                .is_empty()
+        );
         // A watermark inside object 1 keeps it; object 0 holds a segment of
         // a region without a watermark.
         let mut obsolete = HashMap::from([(region_one, entry_id(1, 1))]);
-        assert!(catalog.deletable_objects(&obsolete).is_empty());
+        assert!(catalog.deletable_objects(&obsolete, usize::MAX).is_empty());
         // A watermark at the last id of the segment releases object 1.
         obsolete.insert(region_one, entry_id(1, 2));
-        assert_eq!(vec![1], catalog.deletable_objects(&obsolete));
+        assert_eq!(vec![1], catalog.deletable_objects(&obsolete, usize::MAX));
         // Object 0 needs both regions at or above its segments; object 2 is
         // above the watermark of region two.
         obsolete.insert(region_two, entry_id(0, 1));
-        assert_eq!(vec![0, 1], catalog.deletable_objects(&obsolete));
+        assert_eq!(vec![0, 1], catalog.deletable_objects(&obsolete, usize::MAX));
         // The highest-sequence object is kept whatever the watermarks.
         obsolete.insert(region_one, EntryId::MAX);
         obsolete.insert(region_two, EntryId::MAX);
-        assert_eq!(vec![0, 1, 2], catalog.deletable_objects(&obsolete));
+        assert_eq!(
+            vec![0, 1, 2],
+            catalog.deletable_objects(&obsolete, usize::MAX)
+        );
 
         // Removing objects keeps the largest entry id of every region, so a
         // region whose last object is gone still reports it.
@@ -489,7 +501,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(catalog.deletable_objects(&obsolete).is_empty());
+        assert!(catalog.deletable_objects(&obsolete, usize::MAX).is_empty());
         assert_eq!(4, catalog.next_object_seq().unwrap());
     }
 
@@ -514,7 +526,7 @@ mod tests {
         // Every object is below its watermark, but object 2 alone could not
         // resume the sequence above 5_000_000: nothing is deletable.
         let obsolete = HashMap::from([(region_one, 5_000_000), (region_two, 1)]);
-        assert!(catalog.deletable_objects(&obsolete).is_empty());
+        assert!(catalog.deletable_objects(&obsolete, usize::MAX).is_empty());
 
         // An object durable at the raised sequence resumes it on its own, so
         // the old objects go and it is kept, even under a watermark at its
@@ -525,9 +537,15 @@ mod tests {
                 vec![footer_entry(region_two, entry_id(5, 1), entry_id(5, 1))],
             )
             .unwrap();
-        assert_eq!(vec![0, 1, 2], catalog.deletable_objects(&obsolete));
+        assert_eq!(
+            vec![0, 1, 2],
+            catalog.deletable_objects(&obsolete, usize::MAX)
+        );
         let obsolete = HashMap::from([(region_one, 5_000_000), (region_two, entry_id(5, 1))]);
-        assert_eq!(vec![0, 1, 2], catalog.deletable_objects(&obsolete));
+        assert_eq!(
+            vec![0, 1, 2],
+            catalog.deletable_objects(&obsolete, usize::MAX)
+        );
         for object_seq in [0, 1, 2] {
             catalog.remove_object(object_seq);
         }
