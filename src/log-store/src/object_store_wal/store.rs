@@ -66,6 +66,13 @@ const MAX_IN_FLIGHT_CREATES: usize = 4;
 /// next one, so the first collection on a prefix that accumulated a large WAL
 /// costs a bounded number of requests.
 const MAX_IN_FLIGHT_DELETES: usize = 4;
+/// Number of objects one collection inspects in the catalog before it stops
+/// and leaves a cursor for the next one. It bounds the work a collection does
+/// on the actor whatever the prefix holds, while being wide enough that a
+/// prefix of ten thousand objects is swept in ten passes rather than in
+/// hundreds: every flush starts a pass and every delete that succeeded
+/// continues one, and a pass costs a range over a thousand footers.
+const DELETE_SCAN_LIMIT: usize = 1024;
 /// Delay before a create that failed transiently is attempted again in the
 /// `enqueued` acknowledgement mode, where no caller is left to retry it.
 const CREATE_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -354,6 +361,7 @@ impl ObjectStoreLogStore {
             next_object_seq: Some(next_object_seq),
             unresolved_object_seq: None,
             deleting: deleting.clone(),
+            collect_cursor: 0,
             deletes: FuturesUnordered::new(),
             writer_instance: uuid::Uuid::new_v4().into_bytes(),
             flush_interval: config.flush_interval,
@@ -1016,6 +1024,9 @@ struct Actor {
     /// one twice and a read can wait for the outcome of one it met, see
     /// [`is_collected`].
     deleting: Arc<DeletingObjects>,
+    /// Sequence the next collection starts its scan at, see
+    /// [`collect_garbage`](Self::collect_garbage).
+    collect_cursor: u64,
     deletes: FuturesUnordered<BoxFuture<'static, DeleteOutcome>>,
     writer_instance: [u8; 16],
     flush_interval: Duration,
@@ -1625,20 +1636,24 @@ impl Actor {
     /// until after it was unindexed, so a read that listed it never meets it
     /// as an indexed object the object store has already removed.
     ///
-    /// At most [`MAX_IN_FLIGHT_DELETES`] deletes run at a time, the way
-    /// creates are capped, and no more candidates than that are taken from
-    /// the catalog: the first collection on a prefix that accumulated a large
-    /// WAL costs one bounded scan and a bounded number of requests rather
-    /// than one request per object. What is left over stays in the catalog
-    /// and is taken by the next collection, which every flush starts, and a
-    /// delete that succeeded starts one itself, so a backlog drains without
-    /// waiting for the next watermark. Nothing is collected once stop began
-    /// or the store is poisoned.
+    /// A collection is bounded twice: it inspects at most
+    /// [`DELETE_SCAN_LIMIT`] objects of the catalog, and it keeps at most
+    /// [`MAX_IN_FLIGHT_DELETES`] deletes in flight, the way creates are
+    /// capped. It resumes at the cursor the last one left and wraps at the
+    /// end of the catalog, so a prefix that accumulated a large WAL is swept
+    /// in bounded passes, a stretch of objects that are all retained is not
+    /// walked again by every pass, and objects whose delete failed are
+    /// retried on a later sweep instead of holding up the objects behind
+    /// them. Every flush starts a pass through `obsolete` and every delete
+    /// that succeeded starts one, so a backlog drains without waiting for
+    /// the next watermark. Nothing is collected once stop began or the store
+    /// is poisoned.
     fn collect_garbage(&mut self) {
         if self.is_stopped() || terminal(&self.terminal_error).is_some() {
             return;
         }
-        if self.deleting.len() >= MAX_IN_FLIGHT_DELETES {
+        let free = MAX_IN_FLIGHT_DELETES.saturating_sub(self.deleting.len());
+        if free == 0 {
             return;
         }
         let obsolete_entry_ids = self
@@ -1646,16 +1661,20 @@ impl Actor {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let deletable = self
+        let scan = self
             .catalog
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .deletable_objects(&obsolete_entry_ids, MAX_IN_FLIGHT_DELETES);
-        for object_seq in deletable {
-            if self.deleting.len() >= MAX_IN_FLIGHT_DELETES {
-                break;
-            }
-            // Still in flight from an earlier collection.
+            .deletable_objects(
+                &obsolete_entry_ids,
+                self.collect_cursor,
+                free,
+                DELETE_SCAN_LIMIT,
+            );
+        self.collect_cursor = scan.resume_from;
+        for object_seq in scan.objects {
+            // Still in flight from an earlier pass that the cursor wrapped
+            // past; the free slots it holds are already accounted for.
             if !self.deleting.start(object_seq) {
                 continue;
             }
@@ -5746,6 +5765,77 @@ mod tests {
             vec![objects as u64, objects as u64 + 1],
             object_seqs(io.as_ref()).await
         );
+    }
+
+    #[tokio::test]
+    async fn test_store_failing_deletes_do_not_block_the_objects_behind_them() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let (io, mut parked) = FaultyIo::holding_deletes();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        // Twice the cap of collectable objects, plus the one that is kept.
+        let objects = 2 * MAX_IN_FLIGHT_DELETES;
+        for index in 0..=objects {
+            append(&store, region_id, &format!("a{index}"))
+                .await
+                .unwrap();
+        }
+        let watermark = id(objects as u64 - 1, 1);
+        let all = (0..=objects as u64).collect::<Vec<_>>();
+
+        // The first pass takes the first four objects and every one of their
+        // deletes fails, so they stay present and indexed.
+        store
+            .obsolete(&provider(region_id), region_id, watermark)
+            .await
+            .unwrap();
+        let mut attempted = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_DELETES {
+            let (object_seq, release) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+            attempted.push(object_seq);
+            release.send(false).unwrap();
+        }
+        assert_eq!(
+            (0..MAX_IN_FLIGHT_DELETES as u64).collect::<Vec<_>>(),
+            attempted
+        );
+        timeout(WAIT, store.wait_for_garbage_collection())
+            .await
+            .unwrap();
+        assert_eq!(all, object_seqs(io.as_ref()).await);
+
+        // The next pass continues after them instead of taking the same four
+        // again, so the objects behind the failures are attempted and go.
+        store
+            .obsolete(&provider(region_id), region_id, watermark)
+            .await
+            .unwrap();
+        let mut attempted = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_DELETES {
+            let (object_seq, release) = timeout(WAIT, parked.recv()).await.unwrap().unwrap();
+            attempted.push(object_seq);
+            release.send(true).unwrap();
+        }
+        assert_eq!(
+            (MAX_IN_FLIGHT_DELETES as u64..objects as u64).collect::<Vec<_>>(),
+            attempted
+        );
+
+        // Their successful deletes wrap the sweep, which retries the four that
+        // failed; every delete succeeds from now on, so only the object that
+        // is always kept is left.
+        let drain = tokio::spawn(async move {
+            while let Some((_, release)) = parked.recv().await {
+                let _ = release.send(true);
+            }
+        });
+        wait_for_objects(io.as_ref(), &[objects as u64]).await;
+        timeout(WAIT, store.wait_for_garbage_collection())
+            .await
+            .unwrap();
+        drain.abort();
     }
 
     #[tokio::test]

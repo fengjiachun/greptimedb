@@ -46,6 +46,17 @@ struct RegionObjects {
     max_entry_id: EntryId,
 }
 
+/// One pass of [`ObjectCatalog::deletable_objects`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct DeletableObjects {
+    /// The objects the pass accepted, in sequence order.
+    pub(super) objects: Vec<u64>,
+    /// The sequence the next pass starts at, zero once a pass reached the end
+    /// of the catalog, so that a sweep wraps and objects a pass left behind
+    /// are seen again.
+    pub(super) resume_from: u64,
+}
+
 impl ObjectCatalog {
     /// Indexes the footer of the object `object_seq`. Objects may be inserted
     /// in any order, which lets recovery index them as it discovers them.
@@ -164,11 +175,18 @@ impl ObjectCatalog {
         self.objects.contains_key(&object_seq)
     }
 
-    /// Returns, in sequence order, at most `limit` objects garbage collection
-    /// may delete given the obsolete watermark of every region in
-    /// `obsolete_entry_ids`. The limit bounds what one collection scans and
-    /// allocates on a prefix that holds many collectable objects; the rest
-    /// stay indexed for the next collection.
+    /// Scans the catalog for objects garbage collection may delete, starting
+    /// at `resume_from` and inspecting at most `scan_limit` objects, and
+    /// returns at most `limit` of them together with the sequence the next
+    /// pass starts at, see [`DeletableObjects`].
+    ///
+    /// Both bounds are what keeps a collection off the critical path of the
+    /// actor: the scan bound caps the work of one pass however many objects
+    /// the prefix holds, and the candidate bound caps the requests it starts.
+    /// Because a pass resumes where the last one stopped and wraps at the
+    /// end, a prefix is swept in passes that cost a bounded amount each, and
+    /// objects whose delete failed are retried on a later sweep rather than
+    /// holding up the objects behind them.
     ///
     /// An object is deletable when every segment it holds has its maximum
     /// entry id at or below the watermark of its region; a region without a
@@ -183,26 +201,44 @@ impl ObjectCatalog {
     pub(super) fn deletable_objects(
         &self,
         obsolete_entry_ids: &HashMap<RegionId, EntryId>,
+        resume_from: u64,
         limit: usize,
-    ) -> Vec<u64> {
+        scan_limit: usize,
+    ) -> DeletableObjects {
+        let mut scan = DeletableObjects::default();
         let Some((&last_object_seq, _)) = self.objects.last_key_value() else {
-            return Vec::new();
+            return scan;
         };
         if self.entry_id_floor() > last_object_seq.saturating_add(1) {
-            return Vec::new();
+            return scan;
         }
-        self.objects
-            .range(..last_object_seq)
-            .filter(|(_, footer)| {
-                footer.iter().all(|entry| {
-                    obsolete_entry_ids
-                        .get(&entry.region_id)
-                        .is_some_and(|obsolete| entry.max_entry_id <= *obsolete)
-                })
-            })
-            .map(|(&object_seq, _)| object_seq)
-            .take(limit)
-            .collect()
+        // A cursor at or past the object that is always kept has nothing left
+        // to scan, so the sweep wraps.
+        if resume_from >= last_object_seq {
+            return scan;
+        }
+        for (inspected, (&object_seq, footer)) in
+            self.objects.range(resume_from..last_object_seq).enumerate()
+        {
+            // Stopping before this object rather than after the last one
+            // inspected is what makes the pass resumable: the next one starts
+            // here, and nothing between the two passes is skipped.
+            if inspected == scan_limit || scan.objects.len() == limit {
+                scan.resume_from = object_seq;
+                return scan;
+            }
+            let deletable = footer.iter().all(|entry| {
+                obsolete_entry_ids
+                    .get(&entry.region_id)
+                    .is_some_and(|obsolete| entry.max_entry_id <= *obsolete)
+            });
+            if deletable {
+                scan.objects.push(object_seq);
+            }
+        }
+        // The pass reached the object that is always kept, so the next one
+        // starts at the beginning and sees the objects this one left behind.
+        scan
     }
 
     /// Returns the objects that hold entries of `region_id` overlapping
@@ -454,29 +490,22 @@ mod tests {
             .unwrap();
 
         // Without watermarks nothing is deletable.
-        assert!(
-            catalog
-                .deletable_objects(&HashMap::new(), usize::MAX)
-                .is_empty()
-        );
+        assert!(deletable(&catalog, &HashMap::new()).is_empty());
         // A watermark inside object 1 keeps it; object 0 holds a segment of
         // a region without a watermark.
         let mut obsolete = HashMap::from([(region_one, entry_id(1, 1))]);
-        assert!(catalog.deletable_objects(&obsolete, usize::MAX).is_empty());
+        assert!(deletable(&catalog, &obsolete).is_empty());
         // A watermark at the last id of the segment releases object 1.
         obsolete.insert(region_one, entry_id(1, 2));
-        assert_eq!(vec![1], catalog.deletable_objects(&obsolete, usize::MAX));
+        assert_eq!(vec![1], deletable(&catalog, &obsolete));
         // Object 0 needs both regions at or above its segments; object 2 is
         // above the watermark of region two.
         obsolete.insert(region_two, entry_id(0, 1));
-        assert_eq!(vec![0, 1], catalog.deletable_objects(&obsolete, usize::MAX));
+        assert_eq!(vec![0, 1], deletable(&catalog, &obsolete));
         // The highest-sequence object is kept whatever the watermarks.
         obsolete.insert(region_one, EntryId::MAX);
         obsolete.insert(region_two, EntryId::MAX);
-        assert_eq!(
-            vec![0, 1, 2],
-            catalog.deletable_objects(&obsolete, usize::MAX)
-        );
+        assert_eq!(vec![0, 1, 2], deletable(&catalog, &obsolete));
 
         // Removing objects keeps the largest entry id of every region, so a
         // region whose last object is gone still reports it.
@@ -501,8 +530,99 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(catalog.deletable_objects(&obsolete, usize::MAX).is_empty());
+        assert!(deletable(&catalog, &obsolete).is_empty());
         assert_eq!(4, catalog.next_object_seq().unwrap());
+    }
+
+    #[test]
+    fn test_catalog_scan_is_bounded_and_resumes_where_it_stopped() {
+        let retained = RegionId::new(1, 1);
+        let collectible = RegionId::new(2, 1);
+        let mut catalog = ObjectCatalog::default();
+        let insert = |catalog: &mut ObjectCatalog, object_seq, region_id| {
+            catalog
+                .insert_object(
+                    object_seq,
+                    vec![footer_entry(
+                        region_id,
+                        entry_id(object_seq, 1),
+                        entry_id(object_seq, 1),
+                    )],
+                )
+                .unwrap();
+        };
+        // Twenty objects of a region that never gets a watermark, then nine
+        // of a region that does, then the object that is always kept.
+        for object_seq in 0..20 {
+            insert(&mut catalog, object_seq, retained);
+        }
+        for object_seq in 20..30 {
+            insert(&mut catalog, object_seq, collectible);
+        }
+        let obsolete = HashMap::from([(collectible, entry_id(29, 1))]);
+
+        // A pass inspects at most the scan bound and says where to resume,
+        // whether or not it accepted anything, so the objects of the region
+        // without a watermark are walked once per sweep, not once per pass.
+        let mut pass = catalog.deletable_objects(&obsolete, 0, 4, 8);
+        assert_eq!(
+            DeletableObjects {
+                objects: Vec::new(),
+                resume_from: 8,
+            },
+            pass
+        );
+        pass = catalog.deletable_objects(&obsolete, pass.resume_from, 4, 8);
+        assert_eq!(
+            DeletableObjects {
+                objects: Vec::new(),
+                resume_from: 16,
+            },
+            pass
+        );
+
+        // The pass that reaches the collectible objects stops at the scan
+        // bound with what it accepted so far.
+        pass = catalog.deletable_objects(&obsolete, pass.resume_from, 4, 8);
+        assert_eq!(
+            DeletableObjects {
+                objects: vec![20, 21, 22, 23],
+                resume_from: 24,
+            },
+            pass
+        );
+
+        // The next one continues after them rather than at the beginning,
+        // and stops at the candidate bound this time.
+        pass = catalog.deletable_objects(&obsolete, pass.resume_from, 4, 8);
+        assert_eq!(
+            DeletableObjects {
+                objects: vec![24, 25, 26, 27],
+                resume_from: 28,
+            },
+            pass
+        );
+
+        // Object 29 is the one that is always kept, so the pass that reaches
+        // it ends the sweep and wraps.
+        pass = catalog.deletable_objects(&obsolete, pass.resume_from, 4, 8);
+        assert_eq!(
+            DeletableObjects {
+                objects: vec![28],
+                resume_from: 0,
+            },
+            pass
+        );
+        // A cursor past everything wraps as well.
+        assert_eq!(
+            DeletableObjects::default(),
+            catalog.deletable_objects(&obsolete, 1_000, 4, 8)
+        );
+        // The bounds do not change which objects are deletable.
+        assert_eq!(
+            (20..29).collect::<Vec<u64>>(),
+            deletable(&catalog, &obsolete)
+        );
     }
 
     #[test]
@@ -526,7 +646,7 @@ mod tests {
         // Every object is below its watermark, but object 2 alone could not
         // resume the sequence above 5_000_000: nothing is deletable.
         let obsolete = HashMap::from([(region_one, 5_000_000), (region_two, 1)]);
-        assert!(catalog.deletable_objects(&obsolete, usize::MAX).is_empty());
+        assert!(deletable(&catalog, &obsolete).is_empty());
 
         // An object durable at the raised sequence resumes it on its own, so
         // the old objects go and it is kept, even under a watermark at its
@@ -537,15 +657,9 @@ mod tests {
                 vec![footer_entry(region_two, entry_id(5, 1), entry_id(5, 1))],
             )
             .unwrap();
-        assert_eq!(
-            vec![0, 1, 2],
-            catalog.deletable_objects(&obsolete, usize::MAX)
-        );
+        assert_eq!(vec![0, 1, 2], deletable(&catalog, &obsolete));
         let obsolete = HashMap::from([(region_one, 5_000_000), (region_two, entry_id(5, 1))]);
-        assert_eq!(
-            vec![0, 1, 2],
-            catalog.deletable_objects(&obsolete, usize::MAX)
-        );
+        assert_eq!(vec![0, 1, 2], deletable(&catalog, &obsolete));
         for object_seq in [0, 1, 2] {
             catalog.remove_object(object_seq);
         }
@@ -662,6 +776,14 @@ mod tests {
 
     fn object_seqs(objects: &[(u64, &FooterEntry)]) -> Vec<u64> {
         objects.iter().map(|(object_seq, _)| *object_seq).collect()
+    }
+
+    /// The whole deletable set in one unbounded pass, for the tests that do
+    /// not exercise the bounds.
+    fn deletable(catalog: &ObjectCatalog, obsolete: &HashMap<RegionId, EntryId>) -> Vec<u64> {
+        catalog
+            .deletable_objects(obsolete, 0, usize::MAX, usize::MAX)
+            .objects
     }
 
     fn object_seqs_of(catalog: &ObjectCatalog) -> Vec<u64> {
