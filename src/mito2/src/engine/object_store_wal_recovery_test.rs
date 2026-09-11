@@ -702,6 +702,208 @@ async fn wal_objects(object_store: &ObjectStore) -> Vec<String> {
         .collect()
 }
 
+/// Returns the sequences of the WAL objects under the prefix, in order.
+async fn wal_object_seqs(object_store: &ObjectStore) -> Vec<u64> {
+    let mut seqs = wal_objects(object_store)
+        .await
+        .into_iter()
+        .map(|path| {
+            path.rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".wal"))
+                .and_then(|seq| seq.parse().ok())
+                .unwrap_or_else(|| panic!("unexpected WAL object key {path}"))
+        })
+        .collect::<Vec<u64>>();
+    seqs.sort_unstable();
+    seqs
+}
+
+/// Waits for the collection the last `obsolete` started.
+async fn wait_for_collection(store: &ObjectStoreLogStore) {
+    tokio::time::timeout(WAIT, store.wait_for_garbage_collection())
+        .await
+        .expect("collection must complete");
+}
+
+#[rstest]
+#[case(AckMode::Durable)]
+#[case(AckMode::Enqueued)]
+#[tokio::test]
+async fn test_flush_collects_objects_below_the_watermark(#[case] ack_mode: AckMode) {
+    let mut env = TestEnv::with_prefix("object-store-wal-collection").await;
+    let object_store = memory_store();
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (table_dir_a, schema_a) = create_region(&engine, REGION_A, &[]).await;
+    let (table_dir_b, schema_b) = create_region(&engine, REGION_B, &[]).await;
+
+    // Object 0 holds an entry of both regions, object 1 one of region A and
+    // object 2 one of region B.
+    let mut writer = SealedWriter::new(&store);
+    writer
+        .put_and_seal(
+            &engine,
+            vec![
+                (REGION_A, rows(&schema_a, 0, 2)),
+                (REGION_B, rows(&schema_b, 0, 3)),
+            ],
+        )
+        .await;
+    writer
+        .put_and_seal(&engine, vec![(REGION_A, rows(&schema_a, 2, 4))])
+        .await;
+    writer
+        .put_and_seal(&engine, vec![(REGION_B, rows(&schema_b, 3, 5))])
+        .await;
+    assert_eq!(vec![0, 1, 2], wal_object_seqs(&object_store).await);
+    assert_eq!(entry_id(1, 1), latest(&store, REGION_A));
+    assert_eq!(entry_id(2, 1), latest(&store, REGION_B));
+
+    // Flushing region A moves its watermark to the entry of object 1. That
+    // object held nothing else and goes; object 0 holds an entry of region
+    // B, which has no watermark, and object 2 is the highest: both stay.
+    flush_region(&engine, REGION_A, None).await;
+    wait_for_collection(&store).await;
+    assert_eq!(vec![0, 2], wal_object_seqs(&object_store).await);
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: entry_id(1, 1),
+            last_entry_id: entry_id(1, 1),
+            topic_latest_entry_id: entry_id(1, 1),
+            manifest_flushed_entry_id: entry_id(1, 1),
+            memtable_rows: 0,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    let rows_a = scan_rows(&engine, REGION_A).await;
+    let rows_b = scan_rows(&engine, REGION_B).await;
+    engine.stop().await.unwrap();
+    drop(engine);
+    drop(writer);
+    drop(store);
+
+    // Region A replays nothing above its watermark; region B replays its
+    // entries of objects 0 and 2. Opening re-establishes both watermarks
+    // and collects nothing: object 0 is still needed by region B and object
+    // 2 is the highest. The largest id the store lists for region A is now
+    // the entry of object 0, which only the pruning hint consumes.
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    open_region(&engine, REGION_A, &table_dir_a, PREFIX, &[])
+        .await
+        .unwrap();
+    open_region(&engine, REGION_B, &table_dir_b, PREFIX, &[])
+        .await
+        .unwrap();
+    wait_for_collection(&store).await;
+    assert_eq!(vec![0, 2], wal_object_seqs(&object_store).await);
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: entry_id(1, 1),
+            last_entry_id: entry_id(1, 1),
+            topic_latest_entry_id: entry_id(0, 1),
+            manifest_flushed_entry_id: entry_id(1, 1),
+            memtable_rows: 0,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: 0,
+            last_entry_id: entry_id(2, 1),
+            topic_latest_entry_id: 0,
+            manifest_flushed_entry_id: 0,
+            memtable_rows: 5,
+        },
+        entry_ids(&engine, REGION_B).await
+    );
+    assert_eq!(rows_a, scan_rows(&engine, REGION_A).await);
+    assert_eq!(rows_b, scan_rows(&engine, REGION_B).await);
+    assert_eq!(4, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+    assert_eq!(5, engine.get_region_statistic(REGION_B).unwrap().num_rows);
+
+    // The sequence resumes after the retained object, so every new id is
+    // above every id either region had, including those of object 1.
+    let mut writer = SealedWriter::new(&store);
+    writer
+        .put_and_seal(
+            &engine,
+            vec![
+                (REGION_A, rows(&schema_a, 4, 6)),
+                (REGION_B, rows(&schema_b, 5, 7)),
+            ],
+        )
+        .await;
+    assert_eq!(vec![0, 2, 3], wal_object_seqs(&object_store).await);
+    assert_eq!(
+        entry_id(3, 1),
+        entry_ids(&engine, REGION_A).await.last_entry_id
+    );
+    assert_eq!(
+        entry_id(3, 1),
+        entry_ids(&engine, REGION_B).await.last_entry_id
+    );
+
+    // Flushing region B puts both regions above the segments of objects 0
+    // and 2; object 3 is the highest and holds the unflushed entry of A.
+    flush_region(&engine, REGION_B, None).await;
+    wait_for_collection(&store).await;
+    assert_eq!(vec![3], wal_object_seqs(&object_store).await);
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: entry_id(3, 1),
+            last_entry_id: entry_id(3, 1),
+            topic_latest_entry_id: entry_id(3, 1),
+            manifest_flushed_entry_id: entry_id(3, 1),
+            memtable_rows: 0,
+        },
+        entry_ids(&engine, REGION_B).await
+    );
+    let rows_a = scan_rows(&engine, REGION_A).await;
+    let rows_b = scan_rows(&engine, REGION_B).await;
+    engine.stop().await.unwrap();
+    drop(engine);
+    drop(writer);
+    drop(store);
+
+    // Region A replays its entry of object 3, region B nothing.
+    let store = open_store_with(&object_store, PREFIX, ack_mode).await;
+    let engine = new_engine(&mut env, store.clone()).await;
+    open_region(&engine, REGION_A, &table_dir_a, PREFIX, &[])
+        .await
+        .unwrap();
+    open_region(&engine, REGION_B, &table_dir_b, PREFIX, &[])
+        .await
+        .unwrap();
+    wait_for_collection(&store).await;
+    assert_eq!(vec![3], wal_object_seqs(&object_store).await);
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: entry_id(1, 1),
+            last_entry_id: entry_id(3, 1),
+            topic_latest_entry_id: entry_id(1, 1),
+            manifest_flushed_entry_id: entry_id(1, 1),
+            memtable_rows: 2,
+        },
+        entry_ids(&engine, REGION_A).await
+    );
+    assert_eq!(
+        EntryIds {
+            flushed_entry_id: entry_id(3, 1),
+            last_entry_id: entry_id(3, 1),
+            topic_latest_entry_id: entry_id(3, 1),
+            manifest_flushed_entry_id: entry_id(3, 1),
+            memtable_rows: 0,
+        },
+        entry_ids(&engine, REGION_B).await
+    );
+    assert_eq!(rows_a, scan_rows(&engine, REGION_A).await);
+    assert_eq!(rows_b, scan_rows(&engine, REGION_B).await);
+    assert_eq!(6, engine.get_region_statistic(REGION_A).unwrap().num_rows);
+    assert_eq!(7, engine.get_region_statistic(REGION_B).unwrap().num_rows);
+}
+
 /// Requests a flush of the region in the background and returns its handle;
 /// the result is up to the caller.
 fn spawn_flush(

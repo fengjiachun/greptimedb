@@ -127,6 +127,16 @@ impl ObjectStoreIo {
             })
     }
 
+    /// Deletes the object `object_seq`. Deleting an object that does not
+    /// exist succeeds, so a retry after a lost response is a no-op.
+    pub(super) async fn delete(&self, object_seq: u64) -> Result<()> {
+        let path = self.object_path(object_seq);
+        self.store.delete(&path).await.context(WalObjectStoreSnafu {
+            operation: "delete",
+            path,
+        })
+    }
+
     /// Lists the objects under the prefix, ordered by object sequence. Keys
     /// that do not follow the object layout are ignored.
     pub(super) async fn list(&self) -> Result<Vec<ListedObject>> {
@@ -332,6 +342,25 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert_eq!(original, io.get(7).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_io_delete_removes_the_object_and_tolerates_a_missing_one() {
+        let io = memory_io();
+        io.put_if_absent(3, Bytes::from_static(b"wal"))
+            .await
+            .unwrap();
+        io.put_if_absent(4, Bytes::from_static(b"kept"))
+            .await
+            .unwrap();
+
+        io.delete(3).await.unwrap();
+        assert_eq!(vec![4], object_seqs(io.list().await.unwrap()));
+        assert!(io.get(3).await.is_err());
+        // A repeated delete, as after a lost response, changes nothing.
+        io.delete(3).await.unwrap();
+        io.delete(7).await.unwrap();
+        assert_eq!(vec![4], object_seqs(io.list().await.unwrap()));
     }
 
     #[tokio::test]

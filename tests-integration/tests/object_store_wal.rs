@@ -21,9 +21,9 @@ use common_telemetry::info;
 use common_wal::config::DatanodeWalConfig;
 use common_wal::config::object_store::ObjectStoreWalConfig;
 use frontend::instance::Instance;
-use object_store::ObjectStore;
 use object_store::config::ObjectStoreConfig;
 use object_store::services::S3;
+use object_store::{ErrorKind, ObjectStore};
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::QueryContext;
 use tests_integration::standalone::{GreptimeDbStandalone, GreptimeDbStandaloneBuilder};
@@ -128,31 +128,35 @@ impl WalObjects {
         }
     }
 
-    /// Returns the object count and their total size in bytes.
-    async fn count_and_bytes(&self) -> (usize, u64) {
-        let entries = self
-            .store
+    /// Returns the keys of the objects under the root prefix.
+    async fn keys(&self) -> Vec<String> {
+        self.store
             .list_with(&self.path)
             .recursive(true)
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|entry| !entry.metadata().is_dir())
+            .map(|entry| entry.path().to_string())
+            .collect()
+    }
+
+    /// Returns the object count and their total size in bytes, logging every
+    /// key so the driver script can show the layout the store derived below
+    /// the root prefix. A key the store collects between the listing and its
+    /// stat is left out of both, since it no longer belongs to the phase.
+    async fn count_and_bytes(&self) -> (usize, u64) {
         let mut count = 0;
         let mut bytes = 0;
-        for entry in entries {
-            if entry.metadata().is_dir() {
-                continue;
-            }
-            let len = self
-                .store
-                .stat(entry.path())
-                .await
-                .unwrap()
-                .content_length();
+        for key in self.keys().await {
+            let len = match self.store.stat(&key).await {
+                Ok(metadata) => metadata.content_length(),
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => panic!("failed to stat {key}: {error}"),
+            };
             count += 1;
             bytes += len;
-            // Every key is logged so the driver script can show the layout
-            // the store derived below the root prefix.
-            info!("object_store_wal object={} bytes={len}", entry.path());
+            info!("object_store_wal object={key} bytes={len}");
         }
         (count, bytes)
     }
@@ -162,6 +166,21 @@ impl WalObjects {
         let (count, bytes) = self.count_and_bytes().await;
         info!("object_store_wal phase={phase} objects={count} bytes={bytes}");
         (count, bytes)
+    }
+
+    /// Waits until at most `expected` objects remain: the store deletes the
+    /// objects a flush releases in the background, after the flush returned.
+    /// Only the listing is consulted, so a key that disappears while the wait
+    /// runs never fails it.
+    async fn wait_for_collection(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.keys().await.len() > expected {
+            assert!(
+                Instant::now() < deadline,
+                "the WAL objects were not collected down to {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -275,10 +294,15 @@ async fn test_standalone_object_store_wal_survives_restarts_on_s3() {
     let (replayed_objects, _) = wal_objects.record("after-restart-1").await;
     assert_eq!(objects, replayed_objects);
 
+    // The flush moves the region's watermark past every object: the store
+    // collects all of them but the highest, which anchors the sequence.
     execute_sql(standalone.fe_instance(), "ADMIN FLUSH_TABLE('cpu')").await;
-    wal_objects.record("after-flush").await;
+    wal_objects.wait_for_collection(1).await;
+    let (remaining, _) = wal_objects.record("after-flush").await;
+    assert_eq!(1, remaining);
 
-    // The flushed rows come back from the SST and nothing is replayed twice.
+    // The flushed rows come back from the SST and nothing is replayed twice;
+    // the retained object is the highest, so opening the region keeps it.
     let (standalone, elapsed) = restart(&builder, standalone).await;
     info!("object_store_wal restart=2 wall_ms={}", elapsed.as_millis());
     let rows = execute_sql(standalone.fe_instance(), query)
@@ -287,5 +311,6 @@ async fn test_standalone_object_store_wal_survives_restarts_on_s3() {
         .pretty_print()
         .await;
     assert_eq!(expected, rows);
-    wal_objects.record("after-restart-2").await;
+    let (remaining, _) = wal_objects.record("after-restart-2").await;
+    assert_eq!(1, remaining);
 }
