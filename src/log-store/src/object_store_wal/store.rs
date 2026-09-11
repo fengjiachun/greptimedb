@@ -61,9 +61,9 @@ const COMMAND_BUFFER: usize = 1024;
 const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 /// Number of conditional creates that run at a time.
 const MAX_IN_FLIGHT_CREATES: usize = 4;
-/// Number of object deletes a collection runs at a time. A collection takes
-/// no more candidates than this from the catalog and leaves the rest to the
-/// next one, so the first collection on a prefix that accumulated a large WAL
+/// Number of object deletes the collections run at a time. A collection takes
+/// no more candidates than this leaves free and leaves the rest to the next
+/// one, so the first collection on a prefix that accumulated a large WAL
 /// costs a bounded number of requests.
 const MAX_IN_FLIGHT_DELETES: usize = 4;
 /// Number of objects one collection inspects in the catalog before it stops
@@ -72,8 +72,8 @@ const MAX_IN_FLIGHT_DELETES: usize = 4;
 /// this many footers, and nothing it reads besides them grows with the
 /// prefix. It is wide enough to cross a stretch of objects that are all
 /// retained in few passes, which matters because such a pass accepts no
-/// candidate and so schedules nothing: it advances by one pass per
-/// `obsolete`.
+/// candidate and so schedules nothing of its own: it is advanced only by the
+/// passes an `obsolete` or a delete already in flight that succeeds starts.
 const DELETE_SCAN_LIMIT: usize = 1024;
 /// Delay before a create that failed transiently is attempted again in the
 /// `enqueued` acknowledgement mode, where no caller is left to retry it.
@@ -1648,11 +1648,14 @@ impl Actor {
     /// retried on a later sweep instead of holding up the objects behind
     /// them.
     ///
-    /// A pass runs on an `obsolete` and on every delete that succeeded, so a
-    /// stretch that yields candidates keeps itself going, four deletes at a
-    /// time. A pass that accepts nothing schedules nothing and leaves the
-    /// next one to the following `obsolete`, and so does a delete that
-    /// failed. Nothing is collected once stop began or the store is
+    /// A pass runs on an `obsolete` and on every delete that succeeded, and
+    /// takes no more candidates than it has free slots, so the first pass of
+    /// a stretch that yields candidates fills all four and every pass a
+    /// completed delete starts refills the one slot it freed, which keeps
+    /// four deletes in flight for as long as the stretch lasts. A pass that
+    /// accepts nothing schedules nothing of its own and leaves the next one
+    /// to the following `obsolete` or to a delete already in flight that
+    /// succeeds, and so does a delete that failed. Nothing is collected once stop began or the store is
     /// poisoned.
     fn collect_garbage(&mut self) {
         if self.is_stopped() || terminal(&self.terminal_error).is_some() {
