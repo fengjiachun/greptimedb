@@ -5955,14 +5955,25 @@ mod tests {
     }
 
     /// Object access that fails a conditional create on request, either before
-    /// or after the object was actually written, fails every read of one
-    /// object, damages range reads, or holds and fails deletes.
+    /// or after the object was actually written, fails every create, fails a
+    /// listing, fails the reads of one object or one range of it, damages
+    /// range reads, or holds and fails deletes.
     struct FaultyIo {
         inner: ObjectStoreIo,
         fail_next_put: AtomicBool,
         fail_after_next_put: AtomicBool,
+        /// Fails every conditional create, like an unwritable object store.
+        fail_puts: AtomicBool,
+        /// Writes the object of the next conditional create before the create
+        /// runs, so that it meets the object a create whose response was lost
+        /// left behind and reconciles it.
+        reconcile_next_put: AtomicBool,
+        fail_next_list: AtomicBool,
         /// Sequence of the object whose reads fail; `u64::MAX` fails none.
         fail_reads_of: AtomicU64,
+        /// Offset of the read of that object which fails; `u64::MAX` fails
+        /// every read of it.
+        fail_reads_at: AtomicU64,
         damage_next_range_read: AtomicBool,
         /// Sequence of the object whose range reads are always damaged, so a
         /// segment stays undecodable however often it is fetched;
@@ -5986,7 +5997,11 @@ mod tests {
                 inner: ObjectStoreIo::new(object_store, PREFIX).unwrap(),
                 fail_next_put: AtomicBool::new(false),
                 fail_after_next_put: AtomicBool::new(false),
+                fail_puts: AtomicBool::new(false),
+                reconcile_next_put: AtomicBool::new(false),
+                fail_next_list: AtomicBool::new(false),
                 fail_reads_of: AtomicU64::new(u64::MAX),
+                fail_reads_at: AtomicU64::new(u64::MAX),
                 damage_next_range_read: AtomicBool::new(false),
                 damage_reads_of: AtomicU64::new(u64::MAX),
                 fail_next_delete: AtomicBool::new(false),
@@ -6018,8 +6033,11 @@ mod tests {
             (Arc::new(io), parked)
         }
 
-        fn check_read(&self, object_seq: u64) -> Result<()> {
-            if self.fail_reads_of.load(Ordering::Relaxed) == object_seq {
+        fn check_read(&self, object_seq: u64, offset: u64) -> Result<()> {
+            let fail_at = self.fail_reads_at.load(Ordering::Relaxed);
+            if self.fail_reads_of.load(Ordering::Relaxed) == object_seq
+                && (fail_at == u64::MAX || fail_at == offset)
+            {
                 injected_failure("read", self.inner.object_path(object_seq))
             } else {
                 Ok(())
@@ -6035,8 +6053,15 @@ mod tests {
     #[async_trait::async_trait]
     impl WalObjectIo for FaultyIo {
         async fn put_if_absent(&self, object_seq: u64, content: Bytes) -> Result<PutResult> {
-            if self.fail_next_put.swap(false, Ordering::Relaxed) {
+            if self.fail_next_put.swap(false, Ordering::Relaxed)
+                || self.fail_puts.load(Ordering::Relaxed)
+            {
                 return injected_failure("write", self.inner.object_path(object_seq));
+            }
+            if self.reconcile_next_put.swap(false, Ordering::Relaxed) {
+                self.inner
+                    .put_if_absent(object_seq, content.clone())
+                    .await?;
             }
             let result = self.inner.put_if_absent(object_seq, content).await?;
             if self.fail_after_next_put.swap(false, Ordering::Relaxed) {
@@ -6046,12 +6071,12 @@ mod tests {
         }
 
         async fn get(&self, object_seq: u64) -> Result<Bytes> {
-            self.check_read(object_seq)?;
+            self.check_read(object_seq, 0)?;
             self.inner.get(object_seq).await
         }
 
         async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
-            self.check_read(object_seq)?;
+            self.check_read(object_seq, offset)?;
             let bytes = self.inner.get_range(object_seq, offset, len).await?;
             if self.damage_next_range_read.swap(false, Ordering::Relaxed)
                 || self.damage_reads_of.load(Ordering::Relaxed) == object_seq
@@ -6082,6 +6107,9 @@ mod tests {
         }
 
         async fn list(&self) -> Result<Vec<ListedObject>> {
+            if self.fail_next_list.swap(false, Ordering::Relaxed) {
+                return injected_failure("list", format!("{PREFIX}/objects/"));
+            }
             self.inner.list().await
         }
 
@@ -6305,6 +6333,904 @@ mod tests {
 
         fn object_path(&self, object_seq: u64) -> String {
             self.inner.object_path(object_seq)
+        }
+    }
+
+    /// Every failure the object store access of the store can produce, driven
+    /// through the store, each asserting the outcome the *Failure matrix* of
+    /// `docs/rfcs/2026-09-06-object-store-wal.md` documents for it.
+    ///
+    /// The counters the cases assert on are process wide, so the module assumes
+    /// it has the process to itself, as `cargo nextest` gives every test.
+    mod fault_matrix {
+        use super::*;
+
+        /// A row of the *Failure matrix*, named by its *Situation* cell.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Row {
+            /// create succeeds, or identical retry
+            Created,
+            /// transient I/O error, `durable` mode, no later object created
+            TransientRollsBack,
+            /// transient I/O error, `durable` mode, a later object is durable
+            TransientHistoryGap,
+            /// transient I/O error, `enqueued` mode
+            TransientRepeated,
+            /// transient I/O error, `enqueued` mode after `stop` began
+            TransientAfterStop,
+            /// conflicting object
+            Conflict,
+            /// encoding or catalog error
+            CatalogError,
+            /// create succeeds at the last representable sequence
+            LastSequence,
+        }
+
+        /// Every row of the matrix, in the order the RFC lists them.
+        const ROWS: [Row; 8] = [
+            Row::Created,
+            Row::TransientRollsBack,
+            Row::TransientHistoryGap,
+            Row::TransientRepeated,
+            Row::TransientAfterStop,
+            Row::Conflict,
+            Row::CatalogError,
+            Row::LastSequence,
+        ];
+
+        /// One failure of the object store access and the row it exercises. A
+        /// failure of a read or of a listing is not the outcome of a conditional
+        /// create, so the matrix has no row for it.
+        struct Case {
+            /// What the object store does.
+            fault: &'static str,
+            row: Option<Row>,
+            run: fn() -> BoxFuture<'static, ()>,
+        }
+
+        /// The counters the cases assert on, sampled around a case.
+        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+        struct Counters {
+            created_objects: u64,
+            create_failures: u64,
+            create_conflicts: u64,
+            poisoned: u64,
+            deleted_objects: u64,
+            failed_deletes: u64,
+        }
+
+        impl Counters {
+            fn sample() -> Self {
+                Self {
+                    created_objects: METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL.get(),
+                    create_failures: METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL.get(),
+                    create_conflicts: METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL.get(),
+                    poisoned: METRIC_OBJECT_STORE_WAL_POISONED_TOTAL.get(),
+                    deleted_objects: METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get(),
+                    failed_deletes: METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get(),
+                }
+            }
+
+            /// The counters recorded since `before`.
+            fn since(before: Self) -> Self {
+                let now = Self::sample();
+                Self {
+                    created_objects: now.created_objects - before.created_objects,
+                    create_failures: now.create_failures - before.create_failures,
+                    create_conflicts: now.create_conflicts - before.create_conflicts,
+                    poisoned: now.poisoned - before.poisoned,
+                    deleted_objects: now.deleted_objects - before.deleted_objects,
+                    failed_deletes: now.failed_deletes - before.failed_deletes,
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_store_fault_matrix() {
+            let cases = [
+                Case {
+                    fault: "a create that succeeds",
+                    row: Some(Row::Created),
+                    run: || Box::pin(create_succeeds()),
+                },
+                Case {
+                    fault: "a create that finds an object with identical content",
+                    row: Some(Row::Created),
+                    run: || Box::pin(create_finds_an_identical_object()),
+                },
+                Case {
+                    fault: "a create whose response is lost",
+                    row: Some(Row::TransientRollsBack),
+                    run: || Box::pin(create_response_is_lost()),
+                },
+                Case {
+                    fault: "a create that fails transiently, `durable` mode",
+                    row: Some(Row::TransientRollsBack),
+                    run: || Box::pin(create_fails_transiently()),
+                },
+                Case {
+                    fault: "an object store that is unwritable, `durable` mode",
+                    row: Some(Row::TransientRollsBack),
+                    run: || Box::pin(object_store_is_unwritable()),
+                },
+                Case {
+                    fault: "a create that fails transiently before a durable object",
+                    row: Some(Row::TransientHistoryGap),
+                    run: || Box::pin(create_fails_transiently_before_a_durable_object()),
+                },
+                Case {
+                    fault: "a create that fails transiently, `enqueued` mode",
+                    row: Some(Row::TransientRepeated),
+                    run: || Box::pin(create_fails_transiently_enqueued()),
+                },
+                Case {
+                    fault: "a create that fails transiently after `stop` began",
+                    row: Some(Row::TransientAfterStop),
+                    run: || Box::pin(create_fails_transiently_after_stop_began()),
+                },
+                Case {
+                    fault: "a create that finds an object with different content, `durable` mode",
+                    row: Some(Row::Conflict),
+                    run: || Box::pin(create_finds_a_different_object()),
+                },
+                Case {
+                    fault: "a create that finds an object with different content, `enqueued` mode",
+                    row: Some(Row::Conflict),
+                    run: || Box::pin(create_finds_a_different_object_enqueued()),
+                },
+                Case {
+                    fault: "a created object the catalog rejects",
+                    row: Some(Row::CatalogError),
+                    run: || Box::pin(catalog_rejects_the_created_object()),
+                },
+                Case {
+                    fault: "a create at the last representable object sequence",
+                    row: Some(Row::LastSequence),
+                    run: || Box::pin(create_takes_the_last_object_sequence()),
+                },
+                Case {
+                    fault: "a listing that fails at recovery",
+                    row: None,
+                    run: || Box::pin(listing_fails_at_recovery()),
+                },
+                Case {
+                    fault: "a fetch of a trailer that fails at recovery",
+                    row: None,
+                    run: || Box::pin(trailer_fetch_fails_at_recovery()),
+                },
+                Case {
+                    fault: "a fetch of a footer that fails at recovery",
+                    row: None,
+                    run: || Box::pin(footer_fetch_fails_at_recovery()),
+                },
+                Case {
+                    fault: "a fetch of a segment that fails at a read",
+                    row: None,
+                    run: || Box::pin(segment_fetch_fails_at_a_read()),
+                },
+                Case {
+                    fault: "a delete that fails at a collection",
+                    row: None,
+                    run: || Box::pin(delete_fails_at_a_collection()),
+                },
+            ];
+
+            common_telemetry::init_default_ut_logging();
+            for case in &cases {
+                common_telemetry::info!("Fault matrix case: {}", case.fault);
+                (case.run)().await;
+            }
+            for row in ROWS {
+                assert!(
+                    cases.iter().any(|case| case.row == Some(row)),
+                    "no case covers the failure matrix row {row:?}"
+                );
+            }
+        }
+
+        /// The create advances the sequence, the batch is acknowledged and the
+        /// store stays healthy.
+        async fn create_succeeds() {
+            let before = Counters::sample();
+            let store = open(memory_store(), &eager()).await;
+            let region_id = region(1);
+
+            append(&store, region_id, "a1").await.unwrap();
+            let response = append(&store, region_id, "a2").await.unwrap();
+            assert_eq!(Some(&id(1, 1)), response.last_entry_ids.get(&region_id));
+            assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
+            assert_eq!(
+                entries(&[(id(0, 1), "a1"), (id(1, 1), "a2")]),
+                read(&store, region_id, 1).await
+            );
+
+            let indexed_bytes = store
+                .io
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .map(|object| object.size)
+                .sum::<u64>();
+            assert_eq!(2, METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get());
+            assert_eq!(
+                indexed_bytes as i64,
+                METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.get()
+            );
+            assert_eq!(
+                Counters {
+                    created_objects: 2,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// The object of a create whose response was lost holds exactly what this
+        /// create writes, so the conditional create accepts it as a retry of
+        /// itself and the batch is acknowledged like any other.
+        async fn create_finds_an_identical_object() {
+            let io = Arc::new(FaultyIo::new());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+
+            io.reconcile_next_put.store(true, Ordering::Relaxed);
+            let response = append(&store, region_id, "a1").await.unwrap();
+            assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_eq!(
+                entries(&[(id(0, 1), "a1")]),
+                read(&store, region_id, 1).await
+            );
+
+            // The sequence advanced: the next batch takes the next one.
+            append(&store, region_id, "a2").await.unwrap();
+            assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+            assert_eq!(
+                Counters {
+                    created_objects: 2,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// The object is written and both the response and the read-back of the
+        /// conditional create are lost: the append fails, the sequence rolls back
+        /// and the retry of the same entries writes the same object, which the
+        /// conditional create then reconciles.
+        async fn create_response_is_lost() {
+            let io = Arc::new(FaultyIo::new());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+
+            io.fail_after_next_put.store(true, Ordering::Relaxed);
+            let error = append(&store, region_id, "a1").await.unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(RetryHint::Retryable, error.retry_hint());
+            // The object exists but was never indexed, so a read sees nothing.
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_eq!(0, latest(&store, region_id));
+            assert!(read(&store, region_id, 1).await.is_empty());
+
+            let response = append(&store, region_id, "a1").await.unwrap();
+            assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_eq!(
+                entries(&[(id(0, 1), "a1")]),
+                read(&store, region_id, 1).await
+            );
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    create_failures: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// The waiters of the batch fail with a retryable error, the store stays
+        /// healthy, and the sequence and the entry ids roll back, so the retry of
+        /// the same entries writes the object the failed create did not.
+        async fn create_fails_transiently() {
+            let io = Arc::new(FaultyIo::new());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+
+            io.fail_next_put.store(true, Ordering::Relaxed);
+            let error = append(&store, region_id, "a1").await.unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(RetryHint::Retryable, error.retry_hint());
+            assert!(object_seqs(io.as_ref()).await.is_empty());
+            assert_eq!(0, latest(&store, region_id));
+
+            let response = append(&store, region_id, "a1").await.unwrap();
+            assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_eq!(
+                entries(&[(id(0, 1), "a1")]),
+                read(&store, region_id, 1).await
+            );
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    create_failures: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// Every create fails the same way: no append is acknowledged, nothing is
+        /// written and the store stays healthy, so the first append that the
+        /// object store accepts takes the sequence and the ids of the first one.
+        async fn object_store_is_unwritable() {
+            let io = Arc::new(FaultyIo::new());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+
+            io.fail_puts.store(true, Ordering::Relaxed);
+            for _ in 0..3 {
+                let error = append(&store, region_id, "a1").await.unwrap_err();
+                assert!(
+                    matches!(
+                        unwrap_shared(&error),
+                        Error::WalObjectStore {
+                            operation: "write",
+                            ..
+                        }
+                    ),
+                    "unexpected error: {error:?}"
+                );
+                assert_eq!(RetryHint::Retryable, error.retry_hint());
+            }
+            assert!(object_seqs(io.as_ref()).await.is_empty());
+
+            io.fail_puts.store(false, Ordering::Relaxed);
+            let response = append(&store, region_id, "a1").await.unwrap();
+            assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    create_failures: 3,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// The later object cannot be rolled back, so the sequence stays where it
+        /// is, both batches fail and the store poisons itself. The entries of the
+        /// later object were never acknowledged, but a store opened afterwards
+        /// indexes it and a read replays them.
+        async fn create_fails_transiently_before_a_durable_object() {
+            let object_store = memory_store();
+            let (io, mut gates) = GatedIo::over(object_store.clone());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+            let appends = spawn_appends(&store, region_id, 2).await;
+            let mut open = Vec::new();
+            for _ in 0..2 {
+                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
+            }
+
+            open.remove(0).send(false).unwrap();
+            open.remove(0).send(true).unwrap();
+            for append in appends {
+                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
+                assert!(
+                    matches!(
+                        unwrap_shared(&error),
+                        Error::WalObjectHistoryGap {
+                            object_seq: 0,
+                            later_object_seq: 1,
+                            ..
+                        }
+                    ),
+                    "unexpected error: {error:?}"
+                );
+            }
+            assert_eq!(vec![1], object_seqs(io.as_ref()).await);
+            assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            store.stop().await.unwrap();
+            drop(store);
+
+            let store = ObjectStoreLogStore::try_new(object_store, &eager())
+                .await
+                .unwrap();
+            assert_eq!(
+                entries(&[(id(1, 1), "a2")]),
+                read(&store, region_id, 1).await
+            );
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    create_failures: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// The append was acknowledged on admission, so nobody is left to retry:
+        /// the store repeats the create under the same sequence and the entry
+        /// becomes durable without the caller learning of the failure.
+        async fn create_fails_transiently_enqueued() {
+            let io = Arc::new(FaultyIo::new());
+            let store = ObjectStoreLogStore::open(io.clone(), &enqueued(eager()))
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+
+            io.fail_next_put.store(true, Ordering::Relaxed);
+            let response = append(&store, region_id, "a1").await.unwrap();
+            assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
+            timeout(WAIT, store.wait_durable(&provider(region_id), id(0, 1)))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_eq!(
+                entries(&[(id(0, 1), "a1")]),
+                read(&store, region_id, 1).await
+            );
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    create_failures: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// Once stop began the create is no longer repeated: the acknowledged
+        /// backlog is dropped, nothing is written, the store is not poisoned and
+        /// `stop` reports the loss.
+        async fn create_fails_transiently_after_stop_began() {
+            let (io, mut gates) = GatedIo::new();
+            let store = ObjectStoreLogStore::open(io.clone(), &enqueued(manual()))
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+            append(&store, region_id, "a1").await.unwrap();
+            let seal = {
+                let store = store.clone();
+                tokio::spawn(async move { store.seal_open_batch().await })
+            };
+            let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+
+            store.begin_stop();
+            gate.send(false).unwrap();
+            timeout(WAIT, seal).await.unwrap().unwrap().unwrap_err();
+            let error = store.stop().await.unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
+                "unexpected error: {error:?}"
+            );
+            assert!(object_seqs(io.as_ref()).await.is_empty());
+            assert_eq!(
+                Counters {
+                    create_failures: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+        }
+
+        /// The object at the sequence holds different content: the sequence stays
+        /// where it is, the waiter fails and the store poisons itself, so every
+        /// later operation, a read included, fails with the same error.
+        async fn create_finds_a_different_object() {
+            let object_store = memory_store();
+            let store = open(object_store.clone(), &eager()).await;
+            let region_id = region(1);
+            let io = ObjectStoreIo::new(object_store, PREFIX).unwrap();
+            io.put_if_absent(0, Bytes::from_static(b"foreign"))
+                .await
+                .unwrap();
+            let before = Counters::sample();
+
+            let error = append(&store, region_id, "a1").await.unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectConflict { path, .. }
+                    if path == &io.object_path(0)),
+                "unexpected error: {error:?}"
+            );
+            let error = store
+                .read(&provider(region_id), 1, None)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(vec![0], object_seqs(&io).await);
+            assert_eq!(
+                Counters {
+                    create_conflicts: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// The same conflict in the `enqueued` mode, where the acknowledgement
+        /// already returned and cannot be revoked: it surfaces at the durability
+        /// wait, and `stop` reports the acknowledged entry that was lost.
+        async fn create_finds_a_different_object_enqueued() {
+            let object_store = memory_store();
+            let store = open(object_store.clone(), &enqueued(eager())).await;
+            let region_id = region(1);
+            ObjectStoreIo::new(object_store, PREFIX)
+                .unwrap()
+                .put_if_absent(0, Bytes::from_static(b"foreign"))
+                .await
+                .unwrap();
+            let before = Counters::sample();
+
+            let response = append(&store, region_id, "a1").await.unwrap();
+            assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
+            let error = timeout(WAIT, store.wait_durable(&provider(region_id), id(0, 1)))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
+                "unexpected error: {error:?}"
+            );
+            assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            let error = store.stop().await.unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(
+                Counters {
+                    create_conflicts: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+        }
+
+        /// The sequence of the batch is indexed while its create is in flight, so
+        /// the catalog rejects the object the create returns: the waiter fails and
+        /// the store poisons itself, leaving an object it never indexed, which a
+        /// store opened afterwards indexes and a read replays.
+        async fn catalog_rejects_the_created_object() {
+            let object_store = memory_store();
+            let (io, mut gates) = GatedIo::over(object_store.clone());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+            let appends = spawn_appends(&store, region_id, 1).await;
+            let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+
+            store
+                .catalog
+                .write()
+                .unwrap()
+                .insert_object(0, vec![occupying_footer_entry()])
+                .unwrap();
+            gate.send(true).unwrap();
+            for append in appends {
+                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
+                assert!(
+                    matches!(unwrap_shared(&error), Error::CorruptedWalObject { .. }),
+                    "unexpected error: {error:?}"
+                );
+            }
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            store.stop().await.unwrap();
+            drop(store);
+
+            let store = ObjectStoreLogStore::try_new(object_store, &eager())
+                .await
+                .unwrap();
+            assert_eq!(
+                entries(&[(id(0, 1), "a1")]),
+                read(&store, region_id, 1).await
+            );
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// A footer entry of a region the store does not write, so that indexing
+        /// it occupies an object sequence.
+        fn occupying_footer_entry() -> FooterEntry {
+            FooterEntry {
+                region_id: region(9),
+                min_entry_id: 1,
+                max_entry_id: 1,
+                entry_count: 1,
+                segment_offset: HEADER_LEN as u64,
+                segment_len: 1,
+                segment_crc32: 0,
+            }
+        }
+
+        /// The batch takes the last sequence an entry id can name: it is created
+        /// and acknowledged, and the store poisons itself because no later batch
+        /// can be allocated a sequence.
+        async fn create_takes_the_last_object_sequence() {
+            let object_store = memory_store();
+            let region_id = region(1);
+            let last_object_seq = OBJECT_SEQ_LIMIT - 1;
+            put_object(
+                &object_store,
+                last_object_seq - 1,
+                region_id,
+                &[id(last_object_seq - 1, 1)],
+            )
+            .await;
+            let store = open(object_store, &eager()).await;
+            // The entry of the second append is built while the store is
+            // still healthy, since a poisoned store hands out none.
+            let second = entry(&store, region_id, "a2");
+            let before = Counters::sample();
+
+            let response = append(&store, region_id, "a1").await.unwrap();
+            assert_eq!(
+                Some(&id(last_object_seq, 1)),
+                response.last_entry_ids.get(&region_id)
+            );
+            let error = store.append_batch(vec![second]).await.unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectSequenceExhausted { last_object_seq: actual, .. }
+                    if *actual == last_object_seq),
+                "unexpected error: {error:?}"
+            );
+            assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// No store is built, so nothing is acknowledged and nothing is poisoned;
+        /// a retry recovers the whole prefix.
+        async fn listing_fails_at_recovery() {
+            let object_store = memory_store();
+            populate(&object_store, 2, 2).await;
+            let io = Arc::new(FaultyIo::over(object_store));
+            let before = Counters::sample();
+
+            io.fail_next_list.store(true, Ordering::Relaxed);
+            let error = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    Error::WalObjectStore {
+                        operation: "list",
+                        ..
+                    }
+                ),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(RetryHint::Retryable, error.retry_hint());
+
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            assert_eq!(2, METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get());
+            assert_eq!(Counters::default(), Counters::since(before));
+            store.stop().await.unwrap();
+        }
+
+        /// The fetch of the window at the end of the object, which carries the
+        /// trailer, fails: recovery abandons the prefix and no store is built, so
+        /// nothing is acknowledged and nothing is poisoned.
+        async fn trailer_fetch_fails_at_recovery() {
+            let (object_store, trailer_offset, _) = put_object_with_a_long_footer().await;
+            recovery_fails_on_a_read_at(object_store, trailer_offset).await;
+        }
+
+        /// The footer of the object starts before that window, so recovery
+        /// fetches it separately; that fetch fails with the same outcome.
+        async fn footer_fetch_fails_at_recovery() {
+            let (object_store, _, footer_offset) = put_object_with_a_long_footer().await;
+            recovery_fails_on_a_read_at(object_store, footer_offset).await;
+        }
+
+        async fn recovery_fails_on_a_read_at(object_store: ObjectStore, offset: u64) {
+            let io = Arc::new(FaultyIo::over(object_store));
+            let before = Counters::sample();
+            io.fail_reads_of.store(0, Ordering::Relaxed);
+            io.fail_reads_at.store(offset, Ordering::Relaxed);
+
+            let error = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::WalObjectStore { operation: "read", path, .. }
+                    if path == &io.object_path(0)),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(RetryHint::Retryable, error.retry_hint());
+
+            io.fail_reads_of.store(u64::MAX, Ordering::Relaxed);
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            assert_eq!(1, METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get());
+            assert_eq!(Counters::default(), Counters::since(before));
+            store.stop().await.unwrap();
+        }
+
+        /// Writes one object whose footer is longer than the window recovery reads
+        /// from the end of an object, so that recovery fetches its header, that
+        /// window and its footer separately, and returns the offsets of the window
+        /// and of the footer.
+        async fn put_object_with_a_long_footer() -> (ObjectStore, u64, u64) {
+            let object_store = memory_store();
+            let regions = (RECOVERY_TAIL_WINDOW / FOOTER_ENTRY_LEN + 100) as u32;
+            let store = open(object_store.clone(), &eager()).await;
+            let wide_entries = (1..=regions)
+                .map(|number| entry(&store, region(number), "wide"))
+                .collect::<Vec<_>>();
+            store.append_batch(wide_entries).await.unwrap();
+            store.stop().await.unwrap();
+            drop(store);
+
+            let path = object_path(&object_store, 0);
+            let bytes = object_store.read(&path).await.unwrap().to_vec();
+            let (trailer, _) = footer_of(&bytes);
+            assert!(trailer.footer_offset < (bytes.len() - RECOVERY_TAIL_WINDOW) as u64);
+            (
+                object_store,
+                (bytes.len() - RECOVERY_TAIL_WINDOW) as u64,
+                trailer.footer_offset,
+            )
+        }
+
+        /// The read fails rather than skipping the segment: no hole is recorded,
+        /// the store stays healthy and a read after the object store recovers
+        /// returns every entry.
+        async fn segment_fetch_fails_at_a_read() {
+            let object_store = memory_store();
+            populate(&object_store, 2, 1).await;
+            let io = Arc::new(FaultyIo::over(object_store));
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            let before = Counters::sample();
+
+            io.fail_reads_of.store(1, Ordering::Relaxed);
+            let error = store
+                .read(&provider(region_id), 1, None)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::WalObjectStore { operation: "read", path, .. }
+                    if path == &io.object_path(1)),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(RetryHint::Retryable, error.retry_hint());
+            assert!(store.wal_holes(&provider(region_id)).unwrap().is_empty());
+
+            io.fail_reads_of.store(u64::MAX, Ordering::Relaxed);
+            assert_eq!(2, read(&store, region_id, 1).await.len());
+            assert_eq!(Counters::default(), Counters::since(before));
+            store.stop().await.unwrap();
+        }
+
+        /// The object stays present and indexed and the store stays healthy,
+        /// so the indexed gauges do not move; the delete that succeeds takes
+        /// the object off both of them. That a failed delete is repeated at
+        /// the next collection is covered on its own.
+        async fn delete_fails_at_a_collection() {
+            let _serialized = GARBAGE_COLLECTION.lock().await;
+            let io = Arc::new(FaultyIo::new());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            append(&store, region_id, "a1").await.unwrap();
+            append(&store, region_id, "a2").await.unwrap();
+            let indexed = indexed_gauges();
+            let before = Counters::sample();
+
+            io.fail_next_delete.store(true, Ordering::Relaxed);
+            obsolete_and_collect(&store, region_id, id(0, 1)).await;
+            assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+            assert!(is_indexed(&store, 0));
+            assert_eq!(indexed, indexed_gauges());
+            assert_eq!(
+                Counters {
+                    failed_deletes: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+
+            // The object the next collection deletes leaves both gauges, and
+            // what stays indexed is what the prefix still holds.
+            obsolete_and_collect(&store, region_id, id(0, 1)).await;
+            assert_eq!(vec![1], object_seqs(io.as_ref()).await);
+            assert!(!is_indexed(&store, 0));
+            let remaining = io.list().await.unwrap();
+            assert_eq!(
+                (
+                    remaining.len() as i64,
+                    remaining.iter().map(|object| object.size).sum::<u64>() as i64
+                ),
+                indexed_gauges()
+            );
+            assert_eq!(
+                Counters {
+                    deleted_objects: 1,
+                    failed_deletes: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        fn indexed_gauges() -> (i64, i64) {
+            (
+                METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get(),
+                METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.get(),
+            )
         }
     }
 }
