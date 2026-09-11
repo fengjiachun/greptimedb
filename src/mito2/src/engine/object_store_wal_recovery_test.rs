@@ -723,8 +723,7 @@ async fn wal_object_seqs(object_store: &ObjectStore) -> Vec<u64> {
 async fn wait_for_collection(store: &ObjectStoreLogStore) {
     tokio::time::timeout(WAIT, store.wait_for_garbage_collection())
         .await
-        .expect("collection must complete")
-        .unwrap();
+        .expect("collection must complete");
 }
 
 #[rstest]
