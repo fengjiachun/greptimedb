@@ -45,15 +45,23 @@ use crate::error::{
     WalObjectSequenceExhaustedSnafu, WalObjectSequenceUnsettledSnafu,
 };
 use crate::metrics::{
+    METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS, METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL,
+    METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL, METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL,
     METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL, METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL,
-    METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL,
+    METRIC_OBJECT_STORE_WAL_INDEXED_BYTES, METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS,
+    METRIC_OBJECT_STORE_WAL_OBJECT_BYTES, METRIC_OBJECT_STORE_WAL_OBJECT_ENTRIES,
+    METRIC_OBJECT_STORE_WAL_POISONED_TOTAL, METRIC_OBJECT_STORE_WAL_READ_SECONDS,
+    METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL, METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS,
+    METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS,
+    METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL, METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS,
+    METRIC_OBJECT_STORE_WAL_STALLED_APPENDS_TOTAL,
 };
 use crate::object_store_wal::batch::{OBJECT_SEQ_LIMIT, OpenBatch, sequence_floor};
 use crate::object_store_wal::catalog::ObjectCatalog;
 use crate::object_store_wal::format::{
     EncodedObject, FixedTrailer, FooterEntry, HEADER_LEN, Header, MIN_OBJECT_LEN, Record,
     TRAILER_LEN, decode_footer, decode_header, decode_segment, decode_trailer, encode_object,
-    footer_range, verify_segment_ranges,
+    footer_range, object_len, verify_segment_ranges,
 };
 use crate::object_store_wal::io::{ListedObject, ObjectStoreIo, PutResult};
 
@@ -634,6 +642,7 @@ impl LogStore for ObjectStoreLogStore {
             );
         }
 
+        let requested_at = Instant::now();
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Append {
@@ -643,7 +652,13 @@ impl LogStore for ObjectStoreLogStore {
             .await
             .ok()
             .context(ObjectStoreWalStoppedSnafu)?;
-        response_rx.await.ok().context(ObjectStoreWalStoppedSnafu)?
+        let response = response_rx.await.ok().context(ObjectStoreWalStoppedSnafu)?;
+        // Only an acknowledgement is timed; an append that failed never got one.
+        if self.ack_mode == AckMode::Durable && response.is_ok() {
+            METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS
+                .observe(requested_at.elapsed().as_secs_f64());
+        }
+        response
     }
 
     /// Returns the entries of the provider's region with ids from `entry_id`
@@ -693,6 +708,7 @@ impl LogStore for ObjectStoreLogStore {
         let on_corrupted_segment = self.on_corrupted_segment;
         let wal_holes = self.wal_holes.clone();
         Ok(Box::pin(try_stream! {
+            let started_at = Instant::now();
             for (object_seq, footer_entry) in objects {
                 let records = match fetch_segment(io.as_ref(), object_seq, &footer_entry).await {
                     Ok(records) => records,
@@ -728,6 +744,7 @@ impl LogStore for ObjectStoreLogStore {
                     yield entries;
                 }
             }
+            METRIC_OBJECT_STORE_WAL_READ_SECONDS.observe(started_at.elapsed().as_secs_f64());
         }))
     }
 
@@ -925,6 +942,7 @@ struct SealedBatch {
     bytes: Bytes,
     footer: Vec<FooterEntry>,
     first_admitted_at: Instant,
+    sealed_at: Instant,
     /// Number of creates that were attempted for the batch.
     attempts: u32,
     waiters: Vec<PendingAppend>,
@@ -1006,8 +1024,9 @@ struct Actor {
     /// every create in flight has completed.
     draining: bool,
     /// Appends held back in the `enqueued` mode while the unpersisted backlog
-    /// is at a threshold, in arrival order.
-    stalled: VecDeque<(Vec<Entry>, AppendResponse)>,
+    /// is at a threshold, with the instant they were held back, in arrival
+    /// order.
+    stalled: VecDeque<(Vec<Entry>, AppendResponse, Instant)>,
     durable_waiters: Vec<DurableWaiter>,
     /// Callers of `stop`, answered once nothing is in flight.
     stop: Vec<oneshot::Sender<Result<()>>>,
@@ -1104,7 +1123,8 @@ impl Actor {
             return;
         }
         if self.ack_mode == AckMode::Enqueued && self.backlog_at_threshold() {
-            self.stalled.push_back((entries, response));
+            METRIC_OBJECT_STORE_WAL_STALLED_APPENDS_TOTAL.inc();
+            self.stalled.push_back((entries, response, Instant::now()));
             self.ensure_create_in_flight();
             return;
         }
@@ -1200,7 +1220,7 @@ impl Actor {
     fn release_stalled(&mut self) {
         while !self.stalled.is_empty() {
             if self.is_stopped() {
-                for (_, response) in self.stalled.drain(..) {
+                for (_, response, _) in self.stalled.drain(..) {
                     let _ = response.send(Err(ObjectStoreWalStoppedSnafu.build()));
                 }
                 return;
@@ -1210,9 +1230,11 @@ impl Actor {
                 self.ensure_create_in_flight();
                 return;
             }
-            let Some((entries, response)) = self.stalled.pop_front() else {
+            let Some((entries, response, stalled_at)) = self.stalled.pop_front() else {
                 return;
             };
+            METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS
+                .observe(stalled_at.elapsed().as_secs_f64());
             self.admit(entries, response);
         }
     }
@@ -1238,6 +1260,7 @@ impl Actor {
         };
 
         let (entries, first_admitted_at) = self.open_batch.seal();
+        let entry_count = entries.len();
         let encoded = match encode_batch(object_seq, self.writer_instance, entries) {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -1245,6 +1268,8 @@ impl Actor {
                 return false;
             }
         };
+        METRIC_OBJECT_STORE_WAL_OBJECT_BYTES.observe(encoded.bytes.len() as f64);
+        METRIC_OBJECT_STORE_WAL_OBJECT_ENTRIES.observe(entry_count as f64);
         self.next_object_seq = object_seq
             .checked_add(1)
             .filter(|next_object_seq| *next_object_seq < OBJECT_SEQ_LIMIT);
@@ -1264,6 +1289,7 @@ impl Actor {
             bytes: encoded.bytes,
             footer: encoded.footer,
             first_admitted_at,
+            sealed_at: Instant::now(),
             attempts: 0,
             waiters: std::mem::take(&mut self.pending),
             #[cfg(any(test, feature = "testing"))]
@@ -1343,12 +1369,18 @@ impl Actor {
             return;
         };
         match result {
-            Ok(_) => self.sealed[index].state = CreateState::Created,
+            Ok(_) => {
+                METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
+                    .observe(self.sealed[index].sealed_at.elapsed().as_secs_f64());
+                METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL.inc();
+                self.sealed[index].state = CreateState::Created;
+            }
             // The object store did not confirm the object. A caller of the
             // `durable` mode retries the append itself, so the batch fails
             // once it is known that no later object exists. Nobody is left to
             // retry in the `enqueued` mode, so the store repeats the create.
             Err(error @ Error::WalObjectStore { .. }) => {
+                METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL.inc();
                 if self.ack_mode == AckMode::Enqueued && !self.is_stopped() {
                     self.sealed[index].state = CreateState::Pending;
                 } else {
@@ -1357,6 +1389,9 @@ impl Actor {
                 }
             }
             Err(error) => {
+                if matches!(error, Error::WalObjectConflict { .. }) {
+                    METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL.inc();
+                }
                 self.poison(error);
                 return;
             }
@@ -1453,6 +1488,8 @@ impl Actor {
         let Some(batch) = self.sealed.pop_front() else {
             return false;
         };
+        METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.inc();
+        METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.add(batch.bytes.len() as i64);
         for waiter in batch.waiters {
             let _ = waiter.response.send(Ok(AppendBatchResponse {
                 last_entry_ids: waiter.last_entry_ids,
@@ -1563,7 +1600,7 @@ impl Actor {
         for pending in self.pending.drain(..) {
             let _ = pending.response.send(Err(error()));
         }
-        for (_, response) in self.stalled.drain(..) {
+        for (_, response, _) in self.stalled.drain(..) {
             let _ = response.send(Err(error()));
         }
         for waiter in self.durable_waiters.drain(..) {
@@ -1709,10 +1746,15 @@ impl Actor {
         let deleted = result.is_ok();
         match result {
             Ok(()) => {
-                self.catalog
+                let unindexed = self
+                    .catalog
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove_object(object_seq);
+                if let Some(footer) = unindexed {
+                    METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.dec();
+                    METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.sub(object_len(&footer) as i64);
+                }
                 METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.inc();
             }
             Err(error) => {
@@ -1832,7 +1874,7 @@ impl Actor {
                 }
             }
             AckMode::Enqueued => {
-                for (_, response) in self.stalled.drain(..) {
+                for (_, response, _) in self.stalled.drain(..) {
                     let _ = response.send(Err(ObjectStoreWalStoppedSnafu.build()));
                 }
                 self.flush_open_batch();
@@ -1906,9 +1948,13 @@ fn terminal(terminal_error: &TerminalError) -> Option<Arc<Error>> {
 /// Records `error` as the terminal error unless one is already recorded, and
 /// returns the recorded one.
 fn set_terminal(terminal_error: &TerminalError, error: Error) -> Arc<Error> {
-    terminal_error
+    let mut terminal_error = terminal_error
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner);
+    if terminal_error.is_none() {
+        METRIC_OBJECT_STORE_WAL_POISONED_TOTAL.inc();
+    }
+    terminal_error
         .get_or_insert_with(|| Arc::new(error))
         .clone()
 }
@@ -2047,14 +2093,24 @@ fn encode_batch(
 /// at a time and indexed in sequence order, so the catalog checks the entry
 /// ranges of every object against its predecessors like a sequential replay.
 async fn recover(io: &dyn WalObjectIo) -> Result<(ObjectCatalog, u64, HashMap<RegionId, EntryId>)> {
+    let started_at = Instant::now();
     let objects = io.list().await?;
+    let footers = fetch_footers(io, objects, RECOVERY_CONCURRENCY).await?;
+    METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL.inc_by(footers.len() as u64);
+    let indexed_objects = footers.len() as i64;
+    let indexed_bytes = footers.iter().map(|(object, _)| object.size).sum::<u64>() as i64;
     let mut catalog = ObjectCatalog::default();
-    for (object, footer) in fetch_footers(io, objects, RECOVERY_CONCURRENCY).await? {
+    for (object, footer) in footers {
         catalog
             .insert_object(object.object_seq, footer)
             .with_context(|_| InvalidWalObjectSnafu { path: object.path })?;
     }
-    finish_recovery(catalog)
+    let recovered = finish_recovery(catalog)?;
+    // The catalog of the store that is about to open replaces any earlier one.
+    METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.set(indexed_objects);
+    METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.set(indexed_bytes);
+    METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS.observe(started_at.elapsed().as_secs_f64());
+    Ok(recovered)
 }
 
 fn finish_recovery(

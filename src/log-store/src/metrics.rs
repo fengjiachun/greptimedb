@@ -107,4 +107,157 @@ lazy_static! {
         "object store logstore failed object deletes total",
     )
     .unwrap();
+
+    /// How long an object of the object store logstore takes to become durable
+    /// once its batch is sealed, which is one conditional create.
+    ///
+    /// A create is a few milliseconds on a local object store and tens of
+    /// milliseconds on a cloud one, so the buckets start at 1ms and reach 8s.
+    pub static ref METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS: Histogram = register_histogram!(
+        "greptime_logstore_object_store_wal_seal_to_durable_seconds",
+        "object store logstore seconds from sealing a batch to its object being durable",
+        exponential_buckets(0.001, 2.0, 14).unwrap(),
+    )
+    .unwrap();
+
+    /// How long an append of the object store logstore waits for its
+    /// acknowledgement in the `durable` mode, which is the write latency a
+    /// caller sees.
+    ///
+    /// The wait is one seal plus every earlier object plus one create, so with
+    /// the default 100ms flush interval it sits in the tens of milliseconds;
+    /// the buckets straddle that and leave room for a stalled uploader.
+    pub static ref METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS: Histogram = register_histogram!(
+        "greptime_logstore_object_store_wal_append_ack_seconds",
+        "object store logstore seconds an append waits for its acknowledgement in the durable mode",
+        exponential_buckets(0.002, 2.0, 14).unwrap(),
+    )
+    .unwrap();
+
+    /// How large the objects of the object store logstore are, which says
+    /// whether batches seal on size or on the flush interval.
+    ///
+    /// The buckets are powers of two from 1KiB, the size of a timer-sealed
+    /// batch of one small entry, to 16MiB, twice the 8MiB default batch size,
+    /// which is a threshold rather than an upper bound.
+    pub static ref METRIC_OBJECT_STORE_WAL_OBJECT_BYTES: Histogram = register_histogram!(
+        "greptime_logstore_object_store_wal_object_bytes",
+        "object store logstore bytes of each object sealed",
+        exponential_buckets(1024.0, 2.0, 15).unwrap(),
+    )
+    .unwrap();
+
+    /// How many entries the objects of the object store logstore hold, which
+    /// says how many writes one request amortises.
+    ///
+    /// The buckets reach the per-region position limit of 2^20 entries, the
+    /// theoretical bound an object cannot pass.
+    pub static ref METRIC_OBJECT_STORE_WAL_OBJECT_ENTRIES: Histogram = register_histogram!(
+        "greptime_logstore_object_store_wal_object_entries",
+        "object store logstore entries of each object sealed",
+        exponential_buckets(1.0, 4.0, 11).unwrap(),
+    )
+    .unwrap();
+
+    /// Counter of objects the object store logstore created, an identical
+    /// retry included: the requests the write path spends on the object store.
+    pub static ref METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL: IntCounter = register_int_counter!(
+        "greptime_logstore_object_store_wal_created_objects_total",
+        "object store logstore objects created total",
+    )
+    .unwrap();
+
+    /// Number of objects the object store logstore has indexed, which is what
+    /// a recovery of the prefix would have to read.
+    pub static ref METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS: IntGauge = register_int_gauge!(
+        "greptime_logstore_object_store_wal_indexed_objects",
+        "object store logstore objects currently indexed",
+    )
+    .unwrap();
+
+    /// Bytes of the objects the object store logstore has indexed, which is
+    /// what the WAL occupies under its prefix.
+    pub static ref METRIC_OBJECT_STORE_WAL_INDEXED_BYTES: IntGauge = register_int_gauge!(
+        "greptime_logstore_object_store_wal_indexed_bytes",
+        "object store logstore bytes currently indexed",
+    )
+    .unwrap();
+
+    /// How long the object store logstore takes to rebuild its catalog when it
+    /// opens, which is the part of a restart the WAL is responsible for.
+    ///
+    /// Recovery reads a few small ranges per object, so the buckets run from
+    /// 10ms, an empty prefix, to minutes on a prefix with many objects.
+    pub static ref METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS: Histogram = register_histogram!(
+        "greptime_logstore_object_store_wal_recovery_seconds",
+        "object store logstore seconds spent recovering the catalog",
+        exponential_buckets(0.01, 3.0, 10).unwrap(),
+    )
+    .unwrap();
+
+    /// Counter of objects the object store logstore read footers from while
+    /// opening, which is what the recovery time is spent on.
+    pub static ref METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL: IntCounter = register_int_counter!(
+        "greptime_logstore_object_store_wal_recovered_objects_total",
+        "object store logstore objects read at recovery total",
+    )
+    .unwrap();
+
+    /// How long a read stream of the object store logstore takes to serve the
+    /// replay of one region, which is the part of a region open the WAL costs.
+    ///
+    /// A read fetches one segment per object of the region, so the buckets run
+    /// from 5ms, a region with nothing to replay, to minutes.
+    pub static ref METRIC_OBJECT_STORE_WAL_READ_SECONDS: Histogram = register_histogram!(
+        "greptime_logstore_object_store_wal_read_seconds",
+        "object store logstore seconds spent serving a region read",
+        exponential_buckets(0.005, 3.0, 10).unwrap(),
+    )
+    .unwrap();
+
+    /// Counter of conditional creates of the object store logstore that found
+    /// an object with different content, each of which poisons the store.
+    pub static ref METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL: IntCounter = register_int_counter!(
+        "greptime_logstore_object_store_wal_create_conflicts_total",
+        "object store logstore conflicting conditional creates total",
+    )
+    .unwrap();
+
+    /// Counter of conditional creates of the object store logstore the object
+    /// store did not confirm, which fail the appends behind them in the
+    /// `durable` mode and are repeated in the `enqueued` mode.
+    pub static ref METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL: IntCounter = register_int_counter!(
+        "greptime_logstore_object_store_wal_create_failures_total",
+        "object store logstore transient conditional create failures total",
+    )
+    .unwrap();
+
+    /// Counter of object store logstores that hit an error they cannot recover
+    /// from, after which every operation of the store fails until it reopens.
+    pub static ref METRIC_OBJECT_STORE_WAL_POISONED_TOTAL: IntCounter = register_int_counter!(
+        "greptime_logstore_object_store_wal_poisoned_total",
+        "object store logstores poisoned total",
+    )
+    .unwrap();
+
+    /// Counter of appends the object store logstore held back because the
+    /// unpersisted backlog reached a threshold in the `enqueued` mode, which
+    /// says the write rate is above what the uploads sustain.
+    pub static ref METRIC_OBJECT_STORE_WAL_STALLED_APPENDS_TOTAL: IntCounter = register_int_counter!(
+        "greptime_logstore_object_store_wal_stalled_appends_total",
+        "object store logstore appends stalled by the backlog thresholds total",
+    )
+    .unwrap();
+
+    /// How long such an append waits before it is admitted, which is the
+    /// latency the `enqueued` mode pays once the backlog is at a threshold.
+    ///
+    /// A stalled append waits for one upload to complete, so the buckets run
+    /// from 5ms to half a minute of a struggling object store.
+    pub static ref METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS: Histogram = register_histogram!(
+        "greptime_logstore_object_store_wal_stalled_append_seconds",
+        "object store logstore seconds a stalled append waits for admission",
+        exponential_buckets(0.005, 3.0, 9).unwrap(),
+    )
+    .unwrap();
 }
