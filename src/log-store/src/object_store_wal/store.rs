@@ -2336,14 +2336,13 @@ mod tests {
 
     const PREFIX: &str = "datanodes/1/epochs/2";
     const WAIT: Duration = Duration::from_secs(30);
-    /// Held by every test that reads the process-wide skipped segments
-    /// counter, so that tests running in one process do not interleave
-    /// their increments.
-    static SKIPPED_SEGMENTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    /// Held by every test whose store collects an object, so that the tests
-    /// reading the process-wide delete counters see only their own
-    /// increments.
-    static GARBAGE_COLLECTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Held for the whole of every test of this module. The metrics of the
+    /// object store WAL are process wide, and `cargo test` runs the tests of
+    /// one binary on several threads of one process, so a test that asserts a
+    /// counter or a gauge would otherwise see the objects another test
+    /// creates, indexes, deletes or recovers. Serializing the module is what
+    /// makes those assertions mean anything under either test runner.
+    static SERIALIZED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn memory_store() -> ObjectStore {
         ObjectStore::new(Memory::default()).unwrap().finish()
@@ -2503,6 +2502,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_batches_regions_into_shared_objects() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &manual()).await;
         let region_one = region(1);
         let region_two = region(2);
@@ -2555,6 +2555,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovers_catalog_after_restart() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let region_one = region(1);
         let region_two = region(2);
@@ -2596,6 +2597,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_accepts_identical_retry_after_reported_failure() {
+        let _serialized = SERIALIZED.lock().await;
         let io = Arc::new(FaultyIo::new());
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -2626,6 +2628,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_fails_closed_on_conflicting_object() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let store = open(object_store.clone(), &eager()).await;
         let region_id = region(1);
@@ -2660,6 +2663,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_poisoned_by_conflict_rejects_every_operation() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let store = open(object_store.clone(), &eager()).await;
         let region_id = region(1);
@@ -2707,6 +2711,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovery_rejects_corrupted_object() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let store = open(object_store.clone(), &eager()).await;
         append(&store, region(1), "a1").await.unwrap();
@@ -2733,6 +2738,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_keeps_sequence_after_transient_failure() {
+        let _serialized = SERIALIZED.lock().await;
         let io = Arc::new(FaultyIo::new());
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -2757,6 +2763,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_rejects_foreign_providers() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &manual()).await;
         let region_id = region(1);
         let other_prefix = Provider::object_store_provider(region_id, "other/prefix".to_string());
@@ -2796,6 +2803,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_rejects_entries_of_another_region() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &manual()).await;
         let region_id = region(1);
 
@@ -2829,7 +2837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_obsolete_hides_entries_from_read_only() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &eager()).await;
         let region_id = region(1);
         for data in ["a1", "a2", "a3"] {
@@ -2874,6 +2882,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_stop_is_idempotent_and_fails_open_waiters() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &manual()).await;
         let region_id = region(1);
         let pending = {
@@ -2947,6 +2956,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_stop_during_failed_flush_reports_stopped() {
+        let _serialized = SERIALIZED.lock().await;
         let (store, io, result) = stop_while_flush_is_blocked(false).await;
         let error = result.unwrap_err();
         assert!(
@@ -2983,6 +2993,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_stop_with_several_creates_in_flight() {
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -3041,6 +3052,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_seal_after_stop_reports_stopped() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &manual()).await;
         store.stop().await.unwrap();
         let error = store.seal_open_batch().await.unwrap_err();
@@ -3088,6 +3100,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_stop_during_conflicting_flush_reports_stopped_and_poisons() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let (io, mut gates) = GatedIo::over(object_store.clone());
         let store = ObjectStoreLogStore::open(io, &eager()).await.unwrap();
@@ -3156,6 +3169,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_rejects_a_prefix_whose_entry_ids_leave_no_sequence() {
+        let _serialized = SERIALIZED.lock().await;
         // The maximum id names the last sequence, so no new id of the region
         // could be greater: the store cannot be constructed.
         let object_store = memory_store();
@@ -3207,6 +3221,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_resumes_above_contiguous_entry_ids() {
+        let _serialized = SERIALIZED.lock().await;
         // Objects written under the contiguous scheme: their ids carry no
         // object information, and the largest lies far above the ids the
         // sequence after them would assign.
@@ -3266,6 +3281,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_assigns_ids_from_the_object_sequence() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &enqueued(manual())).await;
         let region_one = region(1);
         let region_two = region(2);
@@ -3317,6 +3333,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_seals_when_a_region_exhausts_its_positions() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &enqueued(manual())).await;
         let region_id = region(1);
         let entries_of = |count: u64| {
@@ -3378,7 +3395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_obsolete_raises_the_sequence_floor() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &manual()).await;
         let region_one = region(1);
         let region_two = region(2);
@@ -3475,6 +3492,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_floor_waits_for_a_create_in_flight_and_its_rollback() {
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -3552,6 +3570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_floor_does_not_skip_an_object_left_by_a_failed_create() {
+        let _serialized = SERIALIZED.lock().await;
         let io = Arc::new(FaultyIo::new());
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -3617,6 +3636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_obsolete_cancelled_before_queueing_publishes_nothing() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &eager()).await;
         let region_id = region(1);
 
@@ -3667,6 +3687,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_floor_is_measured_against_a_rollback_not_the_next_sequence() {
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -3722,6 +3743,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_issued_id_needs_no_floor_while_in_flight() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &enqueued(manual())).await;
         let region_id = region(1);
         store.hold_creates();
@@ -3776,6 +3798,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_inherited_watermark_raises_the_floor() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let store = open(object_store.clone(), &enqueued(manual())).await;
         let region_id = region(1);
@@ -3813,6 +3836,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_obsolete_queued_behind_stop_records_the_watermark() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &eager()).await;
         let region_id = region(1);
         let region_two = region(2);
@@ -3829,7 +3853,17 @@ mod tests {
         tokio::pin!(obsolete);
         assert!(futures::poll!(obsolete.as_mut()).is_pending());
         timeout(WAIT, stop).await.unwrap().unwrap();
-        assert!(store.command_tx.is_closed());
+        // The actor drops the command channel as it exits, which it does on
+        // its own runtime after it answered the stop, so the close is waited
+        // for rather than expected the instant `stop` returns.
+        let deadline = Instant::now() + WAIT;
+        while !store.command_tx.is_closed() {
+            assert!(
+                Instant::now() < deadline,
+                "the actor never dropped the command channel"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         timeout(WAIT, obsolete).await.unwrap().unwrap();
 
         // Nothing is assigned an id any more, so the watermark alone holds.
@@ -3854,6 +3888,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_stop_during_successful_flush_acknowledges_waiters() {
+        let _serialized = SERIALIZED.lock().await;
         let (store, io, result) = stop_while_flush_is_blocked(true).await;
         let region_id = region(1);
         assert_eq!(
@@ -3872,6 +3907,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_actor_exits_when_the_store_is_dropped() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &manual()).await;
         let mut admitted_appends = store.admitted_appends.clone();
         drop(store);
@@ -3885,6 +3921,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_seals_by_size_and_by_interval() {
+        let _serialized = SERIALIZED.lock().await;
         // Only the size limit can seal within the test: the interval is an hour.
         let store = open(memory_store(), &eager()).await;
         timeout(WAIT, append(&store, region(1), "a1"))
@@ -3904,6 +3941,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_flushes_at_the_minimum_interval() {
+        let _serialized = SERIALIZED.lock().await;
         // An append is acknowledged once its object is durable, so a completed
         // append proves the tick after it sealed the batch. The appends are
         // spaced far apart, so every one of them lands in its own tick and
@@ -3938,6 +3976,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_rejects_invalid_config() {
+        let _serialized = SERIALIZED.lock().await;
         for config in [
             config(Duration::from_millis(9), 1),
             config(Duration::from_secs(1), 0),
@@ -4064,6 +4103,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_footer_recovery_matches_full_decode() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         populate(&object_store, 40, 5).await;
         let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
@@ -4097,6 +4137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovery_rejects_corrupted_trailer_version_and_footer() {
+        let _serialized = SERIALIZED.lock().await;
         type Corrupt = fn(&mut Vec<u8>);
         let cases: [(&str, Corrupt); 3] = [
             ("invalid trailer magic", |bytes| {
@@ -4123,6 +4164,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovery_rejects_header_sequence_mismatch() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
         let encoded = encode_object(
@@ -4162,6 +4204,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovery_rejects_segment_ranges_that_do_not_tile_the_object() {
+        let _serialized = SERIALIZED.lock().await;
         type Corrupt = fn(&mut Vec<u8>, &[FooterEntry]);
         let cases: [(&str, Corrupt); 5] = [
             ("overflows the object", |bytes, footer| {
@@ -4233,7 +4276,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_skips_a_corrupted_segment_and_records_a_hole() {
-        let _serialized = SKIPPED_SEGMENTS.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let region_one = region(1);
         let region_two = region(2);
@@ -4293,7 +4336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_corrupted_segment_fails_the_read_that_decodes_it() {
-        let _serialized = SKIPPED_SEGMENTS.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let region_one = region(1);
         let region_two = region(2);
@@ -4331,7 +4374,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_reads_a_segment_whose_first_download_was_damaged() {
-        let _serialized = SKIPPED_SEGMENTS.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         for on_corrupted_segment in [CorruptedSegmentAction::Skip, CorruptedSegmentAction::Fail] {
             let io = Arc::new(FaultyIo::new());
             let config = on_corruption(on_corrupted_segment, eager());
@@ -4369,6 +4412,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovery_bounds_concurrency_and_orders_by_sequence() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         populate(&object_store, 10, 3).await;
         let (io, mut parked) = ParkedIo::over(object_store);
@@ -4426,6 +4470,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovery_fails_closed_on_a_fetch_failure() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         populate(&object_store, 4, 2).await;
         let io = Arc::new(FaultyIo::over(object_store));
@@ -4455,6 +4500,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_recovery_fetches_a_footer_longer_than_the_tail_window() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let regions = (RECOVERY_TAIL_WINDOW / FOOTER_ENTRY_LEN + 100) as u32;
         let store = open(object_store.clone(), &eager()).await;
@@ -4524,6 +4570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_pipelines_creates_and_acknowledges_in_sequence_order() {
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut parked) = ParkedIo::parking_creates();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -4623,6 +4670,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_seals_at_the_threshold_while_creates_are_in_flight() {
+        let _serialized = SERIALIZED.lock().await;
         // The threshold holds exactly two entries, so every second admission
         // must seal, whether or not a create is in flight.
         let region_id = region(1);
@@ -4684,6 +4732,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_transient_failure_rolls_back_batches_that_were_not_created() {
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -4750,6 +4799,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_transient_failure_before_a_durable_object_poisons() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let (io, mut gates) = GatedIo::over(object_store.clone());
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
@@ -4809,6 +4859,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_permanent_failure_before_a_durable_object_poisons() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let (io, mut gates) = GatedIo::over(object_store.clone());
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
@@ -4851,6 +4902,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_append_returns_before_the_object_exists() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &enqueued(manual())).await;
         let region_id = region(1);
 
@@ -4878,6 +4930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_durable_id_advances_after_create_and_indexing() {
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &enqueued(eager()))
             .await
@@ -4920,6 +4973,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_obsolete_never_passes_the_durable_id() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &enqueued(manual())).await;
         let region_id = region(1);
         append(&store, region_id, "a1").await.unwrap();
@@ -4992,6 +5046,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_backlog_bytes_stall_admission_until_an_upload_completes() {
+        let _serialized = SERIALIZED.lock().await;
         let config = ObjectStoreWalConfig {
             max_unpersisted_bytes: ReadableSize(1),
             ..enqueued(manual())
@@ -5046,6 +5101,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_backlog_age_stalls_admission_until_an_upload_completes() {
+        let _serialized = SERIALIZED.lock().await;
         let config = ObjectStoreWalConfig {
             max_unpersisted_age: Duration::from_millis(50),
             ..enqueued(manual())
@@ -5070,6 +5126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_repeats_a_create_that_failed_transiently() {
+        let _serialized = SERIALIZED.lock().await;
         let io = Arc::new(FaultyIo::new());
         let store = ObjectStoreLogStore::open(io.clone(), &enqueued(eager()))
             .await
@@ -5089,6 +5146,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_permanent_failure_poisons() {
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let store = open(object_store.clone(), &enqueued(eager())).await;
         let region_id = region(1);
@@ -5125,6 +5183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_stop_reports_a_backlog_lost_before_the_stop_command() {
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut gates) = GatedIo::new();
         let store = ObjectStoreLogStore::open(io.clone(), &enqueued(manual()))
             .await
@@ -5172,6 +5231,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_enqueued_stop_uploads_the_backlog() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &enqueued(manual())).await;
         let region_id = region(1);
         append(&store, region_id, "a1").await.unwrap();
@@ -5204,7 +5264,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_collects_objects_below_the_watermarks() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &enqueued(manual())).await;
         let region_one = region(1);
         let region_two = region(2);
@@ -5289,7 +5349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_keeps_an_object_that_is_created_but_not_indexed() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut parked) = ParkedIo::parking_creates();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5334,7 +5394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_holds_collection_on_a_prefix_with_contiguous_ids() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let region_one = region(1);
         let region_two = region(2);
@@ -5383,7 +5443,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_read_started_before_collection_skips_a_deleted_object() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let object_store = memory_store();
         let store = open(object_store.clone(), &eager()).await;
         let region_id = region(1);
@@ -5443,7 +5503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_read_waits_for_a_pending_delete_and_skips_the_collected_object() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut parked) = FaultyIo::holding_deletes();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5485,7 +5545,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_read_observes_the_in_flight_set_before_the_catalog() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let io = Arc::new(FaultyIo::new());
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5521,8 +5581,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_failed_delete_lets_the_read_error_take_its_normal_path() {
-        let _collection = GARBAGE_COLLECTION.lock().await;
-        let _skipped = SKIPPED_SEGMENTS.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let region_id = region(1);
 
         for on_corrupted_segment in [CorruptedSegmentAction::Skip, CorruptedSegmentAction::Fail] {
@@ -5618,7 +5677,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_retries_a_failed_delete_at_the_next_collection() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let io = Arc::new(FaultyIo::new());
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5657,6 +5716,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_does_not_collect_after_stop_began() {
+        let _serialized = SERIALIZED.lock().await;
         let store = open(memory_store(), &eager()).await;
         let region_id = region(1);
         append(&store, region_id, "a1").await.unwrap();
@@ -5685,7 +5745,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_read_waits_for_its_own_attempt_not_for_the_sequence() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut parked) = FaultyIo::holding_deletes();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5755,7 +5815,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_dropped_without_stop_settles_the_deletes_it_abandons() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut parked) = FaultyIo::holding_deletes();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5795,7 +5855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_bounds_the_deletes_of_one_collection() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut parked) = FaultyIo::holding_deletes();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5865,7 +5925,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_failing_deletes_do_not_block_the_objects_behind_them() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut parked) = FaultyIo::holding_deletes();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -5936,7 +5996,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_stop_waits_for_a_delete_in_flight() {
-        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let _serialized = SERIALIZED.lock().await;
         let (io, mut gates, mut delete_gates) = GatedIo::gating_deletes();
         let store = ObjectStoreLogStore::open(io.clone(), &eager())
             .await
@@ -6369,8 +6429,9 @@ mod tests {
     /// through the store, each asserting the outcome the *Failure matrix* of
     /// `docs/rfcs/2026-09-06-object-store-wal.md` documents for it.
     ///
-    /// The counters the cases assert on are process wide, so the module assumes
-    /// it has the process to itself, as `cargo nextest` gives every test.
+    /// The cases run in one test, in order, so that the counters and gauges
+    /// they assert on move only by what the case itself did; [`SERIALIZED`]
+    /// keeps the rest of the module out while they do.
     mod fault_matrix {
         use super::*;
 
@@ -6421,22 +6482,35 @@ mod tests {
         #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
         struct Counters {
             created_objects: u64,
+            /// Samples of the seal-to-durable histogram, which every object
+            /// counted as created also feeds.
+            seal_to_durable: u64,
             create_failures: u64,
             create_conflicts: u64,
             poisoned: u64,
             deleted_objects: u64,
             failed_deletes: u64,
+            stalled_appends: u64,
+            /// Samples of the stalled-append histogram, which every append the
+            /// backlog thresholds held back feeds once, on whichever path it
+            /// leaves the queue by.
+            stalled_waits: u64,
         }
 
         impl Counters {
             fn sample() -> Self {
                 Self {
                     created_objects: METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL.get(),
+                    seal_to_durable: METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
+                        .get_sample_count(),
                     create_failures: METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL.get(),
                     create_conflicts: METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL.get(),
                     poisoned: METRIC_OBJECT_STORE_WAL_POISONED_TOTAL.get(),
                     deleted_objects: METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get(),
                     failed_deletes: METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get(),
+                    stalled_appends: METRIC_OBJECT_STORE_WAL_STALLED_APPENDS_TOTAL.get(),
+                    stalled_waits: METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS
+                        .get_sample_count(),
                 }
             }
 
@@ -6445,17 +6519,50 @@ mod tests {
                 let now = Self::sample();
                 Self {
                     created_objects: now.created_objects - before.created_objects,
+                    seal_to_durable: now.seal_to_durable - before.seal_to_durable,
                     create_failures: now.create_failures - before.create_failures,
                     create_conflicts: now.create_conflicts - before.create_conflicts,
                     poisoned: now.poisoned - before.poisoned,
                     deleted_objects: now.deleted_objects - before.deleted_objects,
                     failed_deletes: now.failed_deletes - before.failed_deletes,
+                    stalled_appends: now.stalled_appends - before.stalled_appends,
+                    stalled_waits: now.stalled_waits - before.stalled_waits,
                 }
             }
         }
 
+        /// Asserts that the store has exactly the objects `indexed`, by their
+        /// sequence, on both indexed gauges, taking their sizes from the object
+        /// store itself. An object a failed create left behind, or one a
+        /// poisoned store never indexed, is listed but must not be counted, so
+        /// this is checked at the failure itself, before any retry or reopen
+        /// can index it after all.
+        async fn assert_indexed(io: &dyn WalObjectIo, indexed: &[u64]) {
+            let bytes = io
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|object| indexed.contains(&object.object_seq))
+                .map(|object| object.size)
+                .sum::<u64>();
+            assert_eq!(
+                (indexed.len() as i64, bytes as i64),
+                indexed_gauges(),
+                "expected the gauges to hold the objects {indexed:?}"
+            );
+        }
+
+        fn indexed_gauges() -> (i64, i64) {
+            (
+                METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get(),
+                METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.get(),
+            )
+        }
+
         #[tokio::test]
         async fn test_store_fault_matrix() {
+            let _serialized = SERIALIZED.lock().await;
             let cases = [
                 Case {
                     fault: "a create that succeeds",
@@ -6508,6 +6615,11 @@ mod tests {
                     run: || Box::pin(create_finds_a_different_object_enqueued()),
                 },
                 Case {
+                    fault: "a create that completes after the conflict poisoned the store",
+                    row: Some(Row::Conflict),
+                    run: || Box::pin(create_completes_after_the_store_was_poisoned()),
+                },
+                Case {
                     fault: "a created object the catalog rejects",
                     row: Some(Row::CatalogError),
                     run: || Box::pin(catalog_rejects_the_created_object()),
@@ -6542,6 +6654,11 @@ mod tests {
                     row: None,
                     run: || Box::pin(delete_fails_at_a_collection()),
                 },
+                Case {
+                    fault: "a create that stops while appends are stalled behind it",
+                    row: None,
+                    run: || Box::pin(stalled_appends_released_by_a_stop()),
+                },
             ];
 
             common_telemetry::init_default_ut_logging();
@@ -6573,22 +6690,11 @@ mod tests {
                 read(&store, region_id, 1).await
             );
 
-            let indexed_bytes = store
-                .io
-                .list()
-                .await
-                .unwrap()
-                .iter()
-                .map(|object| object.size)
-                .sum::<u64>();
-            assert_eq!(2, METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get());
-            assert_eq!(
-                indexed_bytes as i64,
-                METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.get()
-            );
+            assert_indexed(store.io.as_ref(), &[0, 1]).await;
             assert_eq!(
                 Counters {
                     created_objects: 2,
+                    seal_to_durable: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6616,12 +6722,16 @@ mod tests {
                 read(&store, region_id, 1).await
             );
 
+            assert_indexed(io.as_ref(), &[0]).await;
+
             // The sequence advanced: the next batch takes the next one.
             append(&store, region_id, "a2").await.unwrap();
             assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+            assert_indexed(io.as_ref(), &[0, 1]).await;
             assert_eq!(
                 Counters {
                     created_objects: 2,
+                    seal_to_durable: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6648,10 +6758,19 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert_eq!(RetryHint::Retryable, error.retry_hint());
-            // The object exists but was never indexed, so a read sees nothing.
+            // The object exists but was never indexed, so a read sees nothing
+            // and neither gauge counts it.
             assert_eq!(vec![0], object_seqs(io.as_ref()).await);
             assert_eq!(0, latest(&store, region_id));
             assert!(read(&store, region_id, 1).await.is_empty());
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(
+                Counters {
+                    create_failures: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
 
             let response = append(&store, region_id, "a1").await.unwrap();
             assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
@@ -6660,9 +6779,11 @@ mod tests {
                 entries(&[(id(0, 1), "a1")]),
                 read(&store, region_id, 1).await
             );
+            assert_indexed(io.as_ref(), &[0]).await;
             assert_eq!(
                 Counters {
                     created_objects: 1,
+                    seal_to_durable: 1,
                     create_failures: 1,
                     ..Counters::default()
                 },
@@ -6675,34 +6796,74 @@ mod tests {
         /// healthy, and the sequence and the entry ids roll back, so the retry of
         /// the same entries writes the object the failed create did not.
         async fn create_fails_transiently() {
-            let io = Arc::new(FaultyIo::new());
+            let (io, mut gates) = GatedIo::new();
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
                 .unwrap();
             let region_id = region(1);
             let before = Counters::sample();
+            let appends = spawn_appends(&store, region_id, 3).await;
+            let mut open = Vec::new();
+            for _ in 0..3 {
+                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
+            }
 
-            io.fail_next_put.store(true, Ordering::Relaxed);
-            let error = append(&store, region_id, "a1").await.unwrap_err();
-            assert!(
-                matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
-                "unexpected error: {error:?}"
-            );
-            assert_eq!(RetryHint::Retryable, error.retry_hint());
+            // Object 0 fails while the others are in flight. Nothing is
+            // decided until they complete, and since none of them was created
+            // every batch fails and the sequence rolls back to object 0.
+            open.remove(0).send(false).unwrap();
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(appends.iter().all(|append| !append.is_finished()));
+            for gate in open {
+                gate.send(false).unwrap();
+            }
+            for append in appends {
+                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
+                assert!(
+                    matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
+                    "unexpected error: {error:?}"
+                );
+                assert_eq!(RetryHint::Retryable, error.retry_hint());
+            }
             assert!(object_seqs(io.as_ref()).await.is_empty());
             assert_eq!(0, latest(&store, region_id));
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(
+                Counters {
+                    create_failures: 3,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
 
-            let response = append(&store, region_id, "a1").await.unwrap();
+            // The entry ids rolled back with the sequence, so the retry of the
+            // first entries writes the object the failed create did not.
+            let retry = spawn_appends(&store, region_id, 1).await;
+            timeout(WAIT, gates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .send(true)
+                .unwrap();
+            let response = timeout(WAIT, retry.into_iter().next().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
             assert_eq!(vec![0], object_seqs(io.as_ref()).await);
             assert_eq!(
                 entries(&[(id(0, 1), "a1")]),
                 read(&store, region_id, 1).await
             );
+            assert_indexed(io.as_ref(), &[0]).await;
             assert_eq!(
                 Counters {
                     created_objects: 1,
-                    create_failures: 1,
+                    seal_to_durable: 1,
+                    create_failures: 3,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6737,14 +6898,24 @@ mod tests {
                 assert_eq!(RetryHint::Retryable, error.retry_hint());
             }
             assert!(object_seqs(io.as_ref()).await.is_empty());
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(
+                Counters {
+                    create_failures: 3,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
 
             io.fail_puts.store(false, Ordering::Relaxed);
             let response = append(&store, region_id, "a1").await.unwrap();
             assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
             assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_indexed(io.as_ref(), &[0]).await;
             assert_eq!(
                 Counters {
                     created_objects: 1,
+                    seal_to_durable: 1,
                     create_failures: 3,
                     ..Counters::default()
                 },
@@ -6789,6 +6960,18 @@ mod tests {
             }
             assert_eq!(vec![1], object_seqs(io.as_ref()).await);
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            // The durable object was never indexed by this store.
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    seal_to_durable: 1,
+                    create_failures: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
             store.stop().await.unwrap();
             drop(store);
 
@@ -6799,15 +6982,7 @@ mod tests {
                 entries(&[(id(1, 1), "a2")]),
                 read(&store, region_id, 1).await
             );
-            assert_eq!(
-                Counters {
-                    created_objects: 1,
-                    create_failures: 1,
-                    poisoned: 1,
-                    ..Counters::default()
-                },
-                Counters::since(before)
-            );
+            assert_indexed(store.io.as_ref(), &[1]).await;
             store.stop().await.unwrap();
         }
 
@@ -6834,9 +7009,11 @@ mod tests {
                 entries(&[(id(0, 1), "a1")]),
                 read(&store, region_id, 1).await
             );
+            assert_indexed(io.as_ref(), &[0]).await;
             assert_eq!(
                 Counters {
                     created_objects: 1,
+                    seal_to_durable: 1,
                     create_failures: 1,
                     ..Counters::default()
                 },
@@ -6871,6 +7048,7 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert!(object_seqs(io.as_ref()).await.is_empty());
+            assert_indexed(io.as_ref(), &[]).await;
             assert_eq!(
                 Counters {
                     create_failures: 1,
@@ -6885,20 +7063,41 @@ mod tests {
         /// later operation, a read included, fails with the same error.
         async fn create_finds_a_different_object() {
             let object_store = memory_store();
-            let store = open(object_store.clone(), &eager()).await;
+            let (io, mut gates) = GatedIo::over(object_store.clone());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
             let region_id = region(1);
-            let io = ObjectStoreIo::new(object_store, PREFIX).unwrap();
-            io.put_if_absent(0, Bytes::from_static(b"foreign"))
+            // Written after the store opened, so that recovery does not meet
+            // an object that is not one of its own.
+            ObjectStoreIo::new(object_store, PREFIX)
+                .unwrap()
+                .put_if_absent(0, Bytes::from_static(b"foreign"))
                 .await
                 .unwrap();
             let before = Counters::sample();
+            let appends = spawn_appends(&store, region_id, 2).await;
+            let mut open = Vec::new();
+            for _ in 0..2 {
+                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
+            }
 
-            let error = append(&store, region_id, "a1").await.unwrap_err();
-            assert!(
-                matches!(unwrap_shared(&error), Error::WalObjectConflict { path, .. }
-                    if path == &io.object_path(0)),
-                "unexpected error: {error:?}"
-            );
+            // Object 1 is created but cannot be indexed before object 0, whose
+            // create meets the foreign object: both waiters fail.
+            open.remove(1).send(true).unwrap();
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(appends.iter().all(|append| !append.is_finished()));
+            open.remove(0).send(true).unwrap();
+            for append in appends {
+                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
+                assert!(
+                    matches!(unwrap_shared(&error), Error::WalObjectConflict { path, .. }
+                        if path == &io.object_path(0)),
+                    "unexpected error: {error:?}"
+                );
+            }
             let error = store
                 .read(&provider(region_id), 1, None)
                 .await
@@ -6908,7 +7107,57 @@ mod tests {
                 matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
                 "unexpected error: {error:?}"
             );
-            assert_eq!(vec![0], object_seqs(&io).await);
+            assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+            // The object that was created was never indexed.
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    seal_to_durable: 1,
+                    create_conflicts: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            store.stop().await.unwrap();
+        }
+
+        /// The conflict poisons the store before the create of the later batch
+        /// completes, so that create has no batch left to index. Its object is
+        /// durable all the same, and the write path counts it and times it;
+        /// nothing else about the outcome changes.
+        async fn create_completes_after_the_store_was_poisoned() {
+            let object_store = memory_store();
+            let (io, mut gates) = GatedIo::over(object_store.clone());
+            let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap();
+            let region_id = region(1);
+            // Written after the store opened, so that recovery does not meet
+            // an object that is not one of its own.
+            ObjectStoreIo::new(object_store, PREFIX)
+                .unwrap()
+                .put_if_absent(0, Bytes::from_static(b"foreign"))
+                .await
+                .unwrap();
+            let before = Counters::sample();
+            let appends = spawn_appends(&store, region_id, 2).await;
+            let mut open = Vec::new();
+            for _ in 0..2 {
+                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
+            }
+
+            // Object 0 conflicts first: the store poisons itself and gives up
+            // on the batch of object 1, whose create is still in flight.
+            open.remove(0).send(true).unwrap();
+            for append in appends {
+                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
+                assert!(
+                    matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
+                    "unexpected error: {error:?}"
+                );
+            }
             assert_eq!(
                 Counters {
                     create_conflicts: 1,
@@ -6917,7 +7166,33 @@ mod tests {
                 },
                 Counters::since(before)
             );
+
+            // The abandoned create completes and its object is durable.
+            open.remove(0).send(true).unwrap();
+            wait_until(|| Counters::since(before).created_objects == 1).await;
+            assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    seal_to_durable: 1,
+                    create_conflicts: 1,
+                    poisoned: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
             store.stop().await.unwrap();
+        }
+
+        /// Polls until `settled` holds, so a case can wait for what the actor
+        /// records after it has answered every waiter.
+        async fn wait_until(settled: impl Fn() -> bool) {
+            let deadline = Instant::now() + WAIT;
+            while !settled() {
+                assert!(Instant::now() < deadline, "the actor never settled");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
         }
 
         /// The same conflict in the `enqueued` mode, where the acknowledgement
@@ -6945,6 +7220,7 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            assert_indexed(store.io.as_ref(), &[]).await;
             let error = store.stop().await.unwrap_err();
             assert!(
                 matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
@@ -6972,16 +7248,23 @@ mod tests {
                 .unwrap();
             let region_id = region(1);
             let before = Counters::sample();
-            let appends = spawn_appends(&store, region_id, 1).await;
-            let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+            let appends = spawn_appends(&store, region_id, 2).await;
+            let mut open = Vec::new();
+            for _ in 0..2 {
+                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
+            }
 
+            // Object 1 is created and waits behind object 0, whose sequence
+            // the catalog is holding by the time its create returns: neither
+            // batch is durable, so both waiters fail.
+            open.remove(1).send(true).unwrap();
             store
                 .catalog
                 .write()
                 .unwrap()
                 .insert_object(0, vec![occupying_footer_entry()])
                 .unwrap();
-            gate.send(true).unwrap();
+            open.remove(0).send(true).unwrap();
             for append in appends {
                 let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
                 assert!(
@@ -6989,26 +7272,33 @@ mod tests {
                     "unexpected error: {error:?}"
                 );
             }
-            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
-            store.stop().await.unwrap();
-            drop(store);
-
-            let store = ObjectStoreLogStore::try_new(object_store, &eager())
-                .await
-                .unwrap();
-            assert_eq!(
-                entries(&[(id(0, 1), "a1")]),
-                read(&store, region_id, 1).await
-            );
+            // Neither object was indexed by this store, whatever the catalog
+            // the case put a sequence into holds.
+            assert_indexed(io.as_ref(), &[]).await;
             assert_eq!(
                 Counters {
-                    created_objects: 1,
+                    created_objects: 2,
+                    seal_to_durable: 2,
                     poisoned: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
             );
+            store.stop().await.unwrap();
+            drop(store);
+
+            // A store opened afterwards indexes the objects this one gave up
+            // on, and a read replays them.
+            let store = ObjectStoreLogStore::try_new(object_store, &eager())
+                .await
+                .unwrap();
+            assert_eq!(
+                entries(&[(id(0, 1), "a1"), (id(1, 1), "a2")]),
+                read(&store, region_id, 1).await
+            );
+            assert_indexed(store.io.as_ref(), &[0, 1]).await;
             store.stop().await.unwrap();
         }
 
@@ -7058,9 +7348,13 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            // The batch was acknowledged, so its object is indexed, alongside
+            // the one the prefix was seeded with.
+            assert_indexed(store.io.as_ref(), &[last_object_seq - 1, last_object_seq]).await;
             assert_eq!(
                 Counters {
                     created_objects: 1,
+                    seal_to_durable: 1,
                     poisoned: 1,
                     ..Counters::default()
                 },
@@ -7096,7 +7390,7 @@ mod tests {
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
                 .unwrap();
-            assert_eq!(2, METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get());
+            assert_indexed(io.as_ref(), &[0, 1]).await;
             assert_eq!(Counters::default(), Counters::since(before));
             store.stop().await.unwrap();
         }
@@ -7136,7 +7430,7 @@ mod tests {
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
                 .unwrap();
-            assert_eq!(1, METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get());
+            assert_indexed(io.as_ref(), &[0]).await;
             assert_eq!(Counters::default(), Counters::since(before));
             store.stop().await.unwrap();
         }
@@ -7195,9 +7489,11 @@ mod tests {
             );
             assert_eq!(RetryHint::Retryable, error.retry_hint());
             assert!(store.wal_holes(&provider(region_id)).unwrap().is_empty());
+            assert_indexed(io.as_ref(), &[0, 1]).await;
 
             io.fail_reads_of.store(u64::MAX, Ordering::Relaxed);
             assert_eq!(2, read(&store, region_id, 1).await.len());
+            assert_indexed(io.as_ref(), &[0, 1]).await;
             assert_eq!(Counters::default(), Counters::since(before));
             store.stop().await.unwrap();
         }
@@ -7207,7 +7503,6 @@ mod tests {
         /// the object off both of them. That a failed delete is repeated at
         /// the next collection is covered on its own.
         async fn delete_fails_at_a_collection() {
-            let _serialized = GARBAGE_COLLECTION.lock().await;
             let io = Arc::new(FaultyIo::new());
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
@@ -7215,14 +7510,13 @@ mod tests {
             let region_id = region(1);
             append(&store, region_id, "a1").await.unwrap();
             append(&store, region_id, "a2").await.unwrap();
-            let indexed = indexed_gauges();
             let before = Counters::sample();
 
             io.fail_next_delete.store(true, Ordering::Relaxed);
             obsolete_and_collect(&store, region_id, id(0, 1)).await;
             assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
             assert!(is_indexed(&store, 0));
-            assert_eq!(indexed, indexed_gauges());
+            assert_indexed(io.as_ref(), &[0, 1]).await;
             assert_eq!(
                 Counters {
                     failed_deletes: 1,
@@ -7231,19 +7525,11 @@ mod tests {
                 Counters::since(before)
             );
 
-            // The object the next collection deletes leaves both gauges, and
-            // what stays indexed is what the prefix still holds.
+            // The object the next collection deletes leaves both gauges.
             obsolete_and_collect(&store, region_id, id(0, 1)).await;
             assert_eq!(vec![1], object_seqs(io.as_ref()).await);
             assert!(!is_indexed(&store, 0));
-            let remaining = io.list().await.unwrap();
-            assert_eq!(
-                (
-                    remaining.len() as i64,
-                    remaining.iter().map(|object| object.size).sum::<u64>() as i64
-                ),
-                indexed_gauges()
-            );
+            assert_indexed(io.as_ref(), &[1]).await;
             assert_eq!(
                 Counters {
                     deleted_objects: 1,
@@ -7255,11 +7541,53 @@ mod tests {
             store.stop().await.unwrap();
         }
 
-        fn indexed_gauges() -> (i64, i64) {
-            (
-                METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.get(),
-                METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.get(),
-            )
+        /// An append the backlog thresholds hold back is never admitted, since
+        /// the create it waits for is still parked when `stop` begins: it
+        /// receives the stopped error, and the wait it spent in the queue is
+        /// recorded all the same. Those are the longest waits there are, so
+        /// dropping them would bias the histogram towards the healthy path.
+        async fn stalled_appends_released_by_a_stop() {
+            let config = ObjectStoreWalConfig {
+                max_unpersisted_bytes: ReadableSize(1),
+                ..enqueued(manual())
+            };
+            let before = Counters::sample();
+            let (store, io, gates, stalled, gate) = stall_second_append(config).await;
+            assert_eq!(
+                Counters {
+                    stalled_appends: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+
+            // Stop releases the stalled append with the stopped error rather
+            // than admitting it, and the create it was waiting for succeeds.
+            let stop = {
+                let store = store.clone();
+                tokio::spawn(async move { store.stop().await })
+            };
+            wait_until(move || store.stopped.load(Ordering::Acquire)).await;
+            gate.send(true).unwrap();
+            let error = timeout(WAIT, stalled).await.unwrap().unwrap().unwrap_err();
+            assert!(
+                matches!(error, Error::ObjectStoreWalStopped { .. }),
+                "unexpected error: {error:?}"
+            );
+            timeout(WAIT, stop).await.unwrap().unwrap().unwrap();
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+            assert_indexed(io.as_ref(), &[0]).await;
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    seal_to_durable: 1,
+                    stalled_appends: 1,
+                    stalled_waits: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            drop(gates);
         }
     }
 }
