@@ -967,7 +967,7 @@ impl SealedBatch {
     }
 }
 
-type CreateOutcome = (u64, Result<PutResult>);
+type CreateOutcome = (u64, Instant, Result<PutResult>);
 type DeleteOutcome = (u64, Result<()>);
 
 /// The actor that owns the open batch and the sealed batches until they are
@@ -1075,8 +1075,8 @@ impl Actor {
                         self.flush_open_batch();
                     }
                 }
-                Some((object_seq, result)) = self.creates.next(), if !self.creates.is_empty() => {
-                    self.on_create_completed(object_seq, result);
+                Some((object_seq, sealed_at, result)) = self.creates.next(), if !self.creates.is_empty() => {
+                    self.on_create_completed(object_seq, sealed_at, result);
                 }
                 Some((object_seq, result)) = self.deletes.next(), if !self.deletes.is_empty() => {
                     self.on_delete_completed(object_seq, result);
@@ -1220,7 +1220,8 @@ impl Actor {
     fn release_stalled(&mut self) {
         while !self.stalled.is_empty() {
             if self.is_stopped() {
-                for (_, response, _) in self.stalled.drain(..) {
+                for (_, response, stalled_at) in self.stalled.drain(..) {
+                    observe_stalled(stalled_at);
                     let _ = response.send(Err(ObjectStoreWalStoppedSnafu.build()));
                 }
                 return;
@@ -1233,8 +1234,7 @@ impl Actor {
             let Some((entries, response, stalled_at)) = self.stalled.pop_front() else {
                 return;
             };
-            METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS
-                .observe(stalled_at.elapsed().as_secs_f64());
+            observe_stalled(stalled_at);
             self.admit(entries, response);
         }
     }
@@ -1329,6 +1329,7 @@ impl Actor {
             batch.attempts += 1;
             let io = self.io.clone();
             let object_seq = batch.object_seq;
+            let sealed_at = batch.sealed_at;
             let bytes = batch.bytes.clone();
             #[cfg(any(test, feature = "testing"))]
             let mut creates_held = self.creates_held.clone();
@@ -1351,14 +1352,42 @@ impl Actor {
                         operation: "write",
                         path: io.object_path(object_seq),
                     });
-                    return (object_seq, result);
+                    return (object_seq, sealed_at, result);
                 }
-                (object_seq, io.put_if_absent(object_seq, bytes).await)
+                (
+                    object_seq,
+                    sealed_at,
+                    io.put_if_absent(object_seq, bytes).await,
+                )
             }));
         }
     }
 
-    fn on_create_completed(&mut self, object_seq: u64, result: Result<PutResult>) {
+    fn on_create_completed(
+        &mut self,
+        object_seq: u64,
+        sealed_at: Instant,
+        result: Result<PutResult>,
+    ) {
+        // Every create that completes is counted, whether or not its batch is
+        // still there to be indexed: a batch the store gave up on when it
+        // poisoned itself leaves its create running, and an object it creates
+        // is as durable as any other. The sealing instant comes with the
+        // outcome for the same reason.
+        match &result {
+            Ok(_) => {
+                METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
+                    .observe(sealed_at.elapsed().as_secs_f64());
+                METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL.inc();
+            }
+            Err(Error::WalObjectStore { .. }) => {
+                METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL.inc()
+            }
+            Err(Error::WalObjectConflict { .. }) => {
+                METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL.inc()
+            }
+            Err(_) => {}
+        }
         // A batch the store gave up on when it poisoned itself: the object
         // may exist, but nothing was acknowledged for it.
         let Some(index) = self
@@ -1369,18 +1398,12 @@ impl Actor {
             return;
         };
         match result {
-            Ok(_) => {
-                METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
-                    .observe(self.sealed[index].sealed_at.elapsed().as_secs_f64());
-                METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL.inc();
-                self.sealed[index].state = CreateState::Created;
-            }
+            Ok(_) => self.sealed[index].state = CreateState::Created,
             // The object store did not confirm the object. A caller of the
             // `durable` mode retries the append itself, so the batch fails
             // once it is known that no later object exists. Nobody is left to
             // retry in the `enqueued` mode, so the store repeats the create.
             Err(error @ Error::WalObjectStore { .. }) => {
-                METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL.inc();
                 if self.ack_mode == AckMode::Enqueued && !self.is_stopped() {
                     self.sealed[index].state = CreateState::Pending;
                 } else {
@@ -1389,9 +1412,6 @@ impl Actor {
                 }
             }
             Err(error) => {
-                if matches!(error, Error::WalObjectConflict { .. }) {
-                    METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL.inc();
-                }
                 self.poison(error);
                 return;
             }
@@ -1600,7 +1620,8 @@ impl Actor {
         for pending in self.pending.drain(..) {
             let _ = pending.response.send(Err(error()));
         }
-        for (_, response, _) in self.stalled.drain(..) {
+        for (_, response, stalled_at) in self.stalled.drain(..) {
+            observe_stalled(stalled_at);
             let _ = response.send(Err(error()));
         }
         for waiter in self.durable_waiters.drain(..) {
@@ -1874,7 +1895,8 @@ impl Actor {
                 }
             }
             AckMode::Enqueued => {
-                for (_, response, _) in self.stalled.drain(..) {
+                for (_, response, stalled_at) in self.stalled.drain(..) {
+                    observe_stalled(stalled_at);
                     let _ = response.send(Err(ObjectStoreWalStoppedSnafu.build()));
                 }
                 self.flush_open_batch();
@@ -1936,6 +1958,13 @@ impl Drop for Actor {
     fn drop(&mut self) {
         self.deleting.abandon_all();
     }
+}
+
+/// Records how long an append was held back by the backlog thresholds, which
+/// every path out of the stalled queue does once: an append released by a
+/// stop or by a terminal error waited longest of all.
+fn observe_stalled(stalled_at: Instant) {
+    METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS.observe(stalled_at.elapsed().as_secs_f64());
 }
 
 fn terminal(terminal_error: &TerminalError) -> Option<Arc<Error>> {
