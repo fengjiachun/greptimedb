@@ -104,6 +104,9 @@ pub struct ObjectStoreLogStore {
     /// Set once the store hit an error it cannot recover from, such as a
     /// conflicting object; every operation fails with it afterwards.
     terminal_error: TerminalError,
+    /// Objects a collection is deleting, which a read skips, see
+    /// [`is_collected`].
+    deleting: DeletingObjects,
     /// Set by [`stop`](LogStore::stop) before the actor is told to exit.
     stopped: Arc<AtomicBool>,
     command_tx: mpsc::Sender<Command>,
@@ -118,6 +121,7 @@ pub struct ObjectStoreLogStore {
 }
 
 type TerminalError = Arc<Mutex<Option<Arc<Error>>>>;
+type DeletingObjects = Arc<Mutex<BTreeSet<u64>>>;
 type ObsoleteEntryIds = Arc<Mutex<HashMap<RegionId, EntryId>>>;
 type WalHoles = Arc<Mutex<HashMap<RegionId, BTreeMap<u64, WalHole>>>>;
 
@@ -180,6 +184,7 @@ impl ObjectStoreLogStore {
         let (catalog, next_object_seq, durable_entry_ids) = recover(io.as_ref()).await?;
         let catalog = Arc::new(RwLock::new(catalog));
         let obsolete_entry_ids = ObsoleteEntryIds::default();
+        let deleting = DeletingObjects::default();
         let wal_holes = WalHoles::default();
         let terminal_error = TerminalError::default();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -215,7 +220,7 @@ impl ObjectStoreLogStore {
             stop_error: None,
             next_object_seq: Some(next_object_seq),
             unresolved_object_seq: None,
-            deleting: BTreeSet::new(),
+            deleting: deleting.clone(),
             deletes: FuturesUnordered::new(),
             writer_instance: uuid::Uuid::new_v4().into_bytes(),
             flush_interval: config.flush_interval,
@@ -237,6 +242,7 @@ impl ObjectStoreLogStore {
             io,
             catalog,
             obsolete_entry_ids,
+            deleting,
             wal_holes,
             terminal_error,
             stopped,
@@ -542,6 +548,7 @@ impl LogStore for ObjectStoreLogStore {
 
         let io = self.io.clone();
         let catalog = self.catalog.clone();
+        let deleting = self.deleting.clone();
         let provider = provider.clone();
         let on_corrupted_segment = self.on_corrupted_segment;
         let wal_holes = self.wal_holes.clone();
@@ -549,7 +556,7 @@ impl LogStore for ObjectStoreLogStore {
             for (object_seq, footer_entry) in objects {
                 let records = match fetch_segment(io.as_ref(), object_seq, &footer_entry).await {
                     Ok(records) => records,
-                    Err(error) if !is_indexed(&catalog, object_seq) => {
+                    Err(error) if is_collected(&catalog, &deleting, object_seq) => {
                         debug!(
                             "Skipped WAL object {} (sequence {}), collected after the read listed it: {error}",
                             io.object_path(object_seq),
@@ -876,8 +883,9 @@ struct Actor {
     /// sequence is skipped until an object at or above it is indexed.
     unresolved_object_seq: Option<u64>,
     /// Objects whose delete is in flight, so a collection does not delete
-    /// one twice.
-    deleting: BTreeSet<u64>,
+    /// one twice and a read skips one the object store may have removed
+    /// already, see [`is_collected`].
+    deleting: DeletingObjects,
     deletes: FuturesUnordered<BoxFuture<'static, DeleteOutcome>>,
     writer_instance: [u8; 16],
     flush_interval: Duration,
@@ -1483,6 +1491,9 @@ impl Actor {
     /// allow, see [`ObjectCatalog::deletable_objects`]. The deletes run in
     /// the background so they never hold up admission, sealing, uploads or
     /// acknowledgements; an object is unindexed once its delete succeeded.
+    /// An object is in the in-flight set from before its delete starts until
+    /// after it was unindexed, so a read that listed it never meets it as an
+    /// indexed object the object store has already removed.
     /// Nothing is collected once stop began or the store is poisoned.
     fn collect_garbage(&mut self) {
         if self.is_stopped() || terminal(&self.terminal_error).is_some() {
@@ -1500,7 +1511,12 @@ impl Actor {
             .deletable_objects(&obsolete_entry_ids);
         for object_seq in deletable {
             // Still in flight from an earlier collection.
-            if !self.deleting.insert(object_seq) {
+            if !self
+                .deleting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(object_seq)
+            {
                 continue;
             }
             let io = self.io.clone();
@@ -1509,14 +1525,15 @@ impl Actor {
             }));
         }
         #[cfg(any(test, feature = "testing"))]
-        self.deletes_in_flight.send_replace(self.deleting.len());
+        self.publish_deletes_in_flight();
     }
 
-    /// Unindexes the object `object_seq` once its delete succeeded. A failed
-    /// delete leaves the object indexed, so the next collection deletes it
-    /// again.
+    /// Unindexes the object `object_seq` once its delete succeeded, then takes
+    /// it out of the in-flight set; a read that listed the object sees it as
+    /// collected throughout, since the object store may have removed it as
+    /// soon as the delete started. A failed delete leaves the object indexed,
+    /// so the next collection deletes it again.
     fn on_delete_completed(&mut self, object_seq: u64, result: Result<()>) {
-        self.deleting.remove(&object_seq);
         match result {
             Ok(()) => {
                 self.catalog
@@ -1535,8 +1552,23 @@ impl Actor {
                 METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.inc();
             }
         }
+        self.deleting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&object_seq);
         #[cfg(any(test, feature = "testing"))]
-        self.deletes_in_flight.send_replace(self.deleting.len());
+        self.publish_deletes_in_flight();
+    }
+
+    /// Publishes how many deletes are in flight, which a test waits on.
+    #[cfg(any(test, feature = "testing"))]
+    fn publish_deletes_in_flight(&self) {
+        let in_flight = self
+            .deleting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        self.deletes_in_flight.send_replace(in_flight);
     }
 
     /// Moves the sequence of the next object above the object that holds
@@ -1717,6 +1749,29 @@ fn is_indexed(catalog: &RwLock<ObjectCatalog>, object_seq: u64) -> bool {
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .contains_object(object_seq)
+}
+
+/// Returns whether garbage collection has taken the object `object_seq` out
+/// of reach of a read that listed it earlier: it is unindexed, or its delete
+/// is in flight, so the object may already be gone from the object store
+/// although the catalog still holds it.
+///
+/// The two are checked in the order the actor leaves them: an object is
+/// unindexed before it leaves the in-flight set, so a delete that succeeds
+/// never has a moment in which the object is neither indexed-and-deleting nor
+/// unindexed. Every object a collection picked holds only entries at or below
+/// the watermark of their region, which a read never returns, so skipping one
+/// loses nothing even when the fetch failed for another reason.
+fn is_collected(
+    catalog: &RwLock<ObjectCatalog>,
+    deleting: &DeletingObjects,
+    object_seq: u64,
+) -> bool {
+    !is_indexed(catalog, object_seq)
+        || deleting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&object_seq)
 }
 
 /// Fetches and decodes the segment `entry` describes in the object
@@ -5102,6 +5157,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_read_is_not_failed_by_a_delete_that_has_not_been_unindexed() {
+        let _serialized = GARBAGE_COLLECTION.lock().await;
+        let (io, mut responses) = FaultyIo::holding_delete_responses();
+        let store = ObjectStoreLogStore::open(io.clone(), &eager())
+            .await
+            .unwrap();
+        let region_id = region(1);
+        append(&store, region_id, "a1").await.unwrap();
+        append(&store, region_id, "a2").await.unwrap();
+
+        // The stream lists objects 0 and 1 before the collection starts.
+        let stream = store.read(&provider(region_id), 1, None).await.unwrap();
+        store
+            .obsolete(&provider(region_id), region_id, id(0, 1))
+            .await
+            .unwrap();
+
+        // The object store removed object 0 and its response is held, so the
+        // catalog still holds an object that is no longer there.
+        let (deleted_seq, release) = timeout(WAIT, responses.recv()).await.unwrap().unwrap();
+        assert_eq!(0, deleted_seq);
+        assert_eq!(vec![1], object_seqs(io.as_ref()).await);
+        assert!(is_indexed(&store, 0));
+
+        // The stream reaches the object in that window and skips it instead
+        // of failing.
+        let read_entries = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|entry| (entry.entry_id(), entry.into_bytes()))
+            .collect::<Vec<_>>();
+        assert_eq!(entries(&[(id(1, 1), "a2")]), read_entries);
+
+        release.send(()).unwrap();
+        timeout(WAIT, store.wait_for_garbage_collection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!is_indexed(&store, 0));
+        assert_eq!(vec![1], object_seqs(io.as_ref()).await);
+    }
+
+    #[tokio::test]
     async fn test_store_retries_a_failed_delete_at_the_next_collection() {
         let _serialized = GARBAGE_COLLECTION.lock().await;
         let io = Arc::new(FaultyIo::new());
@@ -5229,6 +5330,10 @@ mod tests {
         fail_reads_of: AtomicU64,
         damage_next_range_read: AtomicBool,
         fail_next_delete: AtomicBool,
+        /// When set, every delete removes the object and then parks until the
+        /// test releases its response, which is the window in which the
+        /// object store no longer holds an object the catalog still does.
+        held_delete_responses: Option<mpsc::UnboundedSender<(u64, oneshot::Sender<()>)>>,
     }
 
     impl FaultyIo {
@@ -5244,7 +5349,22 @@ mod tests {
                 fail_reads_of: AtomicU64::new(u64::MAX),
                 damage_next_range_read: AtomicBool::new(false),
                 fail_next_delete: AtomicBool::new(false),
+                held_delete_responses: None,
             }
+        }
+
+        /// Holds the response of every delete until the test releases it; the
+        /// object is removed from the object store before the hold.
+        fn holding_delete_responses() -> (
+            Arc<Self>,
+            mpsc::UnboundedReceiver<(u64, oneshot::Sender<()>)>,
+        ) {
+            let (held_delete_responses, responses) = mpsc::unbounded_channel();
+            let io = Self {
+                held_delete_responses: Some(held_delete_responses),
+                ..Self::new()
+            };
+            (Arc::new(io), responses)
         }
 
         fn check_read(&self, object_seq: u64) -> Result<()> {
@@ -5296,7 +5416,15 @@ mod tests {
             if self.fail_next_delete.swap(false, Ordering::Relaxed) {
                 return injected_failure("delete", self.inner.object_path(object_seq));
             }
-            self.inner.delete(object_seq).await
+            let result = self.inner.delete(object_seq).await;
+            // The object is gone from the object store; the response that
+            // tells the actor so is held back.
+            if let Some(held) = &self.held_delete_responses {
+                let (release, released) = oneshot::channel();
+                held.send((object_seq, release)).unwrap();
+                released.await.unwrap();
+            }
+            result
         }
 
         async fn list(&self) -> Result<Vec<ListedObject>> {
