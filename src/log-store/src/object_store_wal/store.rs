@@ -1955,14 +1955,22 @@ impl Drop for Actor {
     /// without `stop` or because the runtime dropped the task. Their objects
     /// stay present and indexed, so the reads report the error they met.
     /// `stop` settles its deletes by completing them, and leaves none here.
+    ///
+    /// An append still held back when the actor is torn down leaves the queue
+    /// here, with its caller gone or about to be, so the wait it spent there
+    /// is recorded like the wait of one released any other way.
     fn drop(&mut self) {
         self.deleting.abandon_all();
+        for (_, _, stalled_at) in self.stalled.drain(..) {
+            observe_stalled(stalled_at);
+        }
     }
 }
 
 /// Records how long an append was held back by the backlog thresholds, which
-/// every path out of the stalled queue does once: an append released by a
-/// stop or by a terminal error waited longest of all.
+/// every path out of the stalled queue does once, the teardown of the actor
+/// included: an append released by a stop or by a terminal error waited
+/// longest of all.
 fn observe_stalled(stalled_at: Instant) {
     METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS.observe(stalled_at.elapsed().as_secs_f64());
 }
@@ -6062,8 +6070,13 @@ mod tests {
         reconcile_next_put: AtomicBool,
         fail_next_list: AtomicBool,
         /// Milliseconds every read and every conditional create waits before
-        /// it answers, so a case can force a known duration on the timers.
+        /// it answers, so a case can force a wait on the timers.
         answer_after_millis: AtomicU64,
+        /// Nanoseconds of the shortest wait actually served since a case reset
+        /// it; `u64::MAX` while none has been. An operation that waited here
+        /// took at least this long, which is the measured floor a case bounds
+        /// a timer by.
+        shortest_wait_nanos: AtomicU64,
         /// Sequence of the object whose reads fail; `u64::MAX` fails none.
         fail_reads_of: AtomicU64,
         /// Offset of the read of that object which fails; `u64::MAX` fails
@@ -6096,6 +6109,7 @@ mod tests {
                 reconcile_next_put: AtomicBool::new(false),
                 fail_next_list: AtomicBool::new(false),
                 answer_after_millis: AtomicU64::new(0),
+                shortest_wait_nanos: AtomicU64::new(u64::MAX),
                 fail_reads_of: AtomicU64::new(u64::MAX),
                 fail_reads_at: AtomicU64::new(u64::MAX),
                 damage_next_range_read: AtomicBool::new(false),
@@ -6132,8 +6146,26 @@ mod tests {
         async fn answer_after(&self) {
             let millis = self.answer_after_millis.load(Ordering::Relaxed);
             if millis > 0 {
+                let waiting_since = Instant::now();
                 tokio::time::sleep(Duration::from_millis(millis)).await;
+                let waited = waiting_since.elapsed().as_nanos() as u64;
+                self.shortest_wait_nanos
+                    .fetch_min(waited, Ordering::Relaxed);
             }
+        }
+
+        /// Forgets the waits served so far, so that the next
+        /// [`shortest_wait`](Self::shortest_wait) covers one operation alone.
+        fn forget_waits(&self) {
+            self.shortest_wait_nanos.store(u64::MAX, Ordering::Relaxed);
+        }
+
+        /// The shortest wait served since then, which every operation that
+        /// waited took at least.
+        fn shortest_wait(&self) -> Duration {
+            let nanos = self.shortest_wait_nanos.load(Ordering::Relaxed);
+            assert_ne!(u64::MAX, nanos, "the object store served no wait");
+            Duration::from_nanos(nanos)
         }
 
         fn check_read(&self, object_seq: u64, offset: u64) -> Result<()> {
@@ -6528,6 +6560,9 @@ mod tests {
             reads: u64,
             deleted_objects: u64,
             failed_deletes: u64,
+            /// A read of the matrix never meets a segment that does not
+            /// decode, so every case expects this to stand still.
+            skipped_segments: u64,
             stalled_appends: u64,
             /// Samples of the stalled-append histogram, which every append the
             /// backlog thresholds held back feeds once, on whichever path it
@@ -6594,6 +6629,9 @@ mod tests {
         #[derive(Debug, Clone, Copy)]
         struct Timed {
             recorded: f64,
+            /// The wait the case forced, as it was measured rather than as it
+            /// was asked for: a request told to wait 20ms may have waited far
+            /// longer, and the timer has to have covered that.
             held: Duration,
             elapsed: Duration,
         }
@@ -6673,6 +6711,7 @@ mod tests {
                     poisoned: METRIC_OBJECT_STORE_WAL_POISONED_TOTAL.get(),
                     deleted_objects: METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.get(),
                     failed_deletes: METRIC_OBJECT_STORE_WAL_FAILED_DELETES_TOTAL.get(),
+                    skipped_segments: METRIC_OBJECT_STORE_WAL_SKIPPED_SEGMENTS_TOTAL.get(),
                     stalled_appends: METRIC_OBJECT_STORE_WAL_STALLED_APPENDS_TOTAL.get(),
                     stalled_waits: METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS
                         .get_sample_count(),
@@ -6697,6 +6736,7 @@ mod tests {
                     poisoned: now.poisoned - before.poisoned,
                     deleted_objects: now.deleted_objects - before.deleted_objects,
                     failed_deletes: now.failed_deletes - before.failed_deletes,
+                    skipped_segments: now.skipped_segments - before.skipped_segments,
                     stalled_appends: now.stalled_appends - before.stalled_appends,
                     stalled_waits: now.stalled_waits - before.stalled_waits,
                 }
@@ -6853,6 +6893,11 @@ mod tests {
                     fault: "a delete that fails at a collection",
                     row: None,
                     run: || Box::pin(delete_fails_at_a_collection()),
+                },
+                Case {
+                    fault: "a store dropped while an append is stalled behind a create",
+                    row: None,
+                    run: || Box::pin(stalled_append_released_by_the_teardown()),
                 },
                 Case {
                     fault: "a create that stops while appends are stalled behind it",
@@ -7849,6 +7894,7 @@ mod tests {
                     .store(delay.as_millis() as u64, Ordering::Relaxed);
 
                 let timer = timer_before(&METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS);
+                io.forget_waits();
                 let started = Instant::now();
                 let store = ObjectStoreLogStore::open(io.clone(), &eager())
                     .await
@@ -7856,35 +7902,38 @@ mod tests {
                 recoveries.push(Timed::since(
                     &METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS,
                     timer,
-                    delay,
+                    io.shortest_wait(),
                     started.elapsed(),
                 ));
 
                 let timer = timer_before(&METRIC_OBJECT_STORE_WAL_READ_SECONDS);
+                io.forget_waits();
                 let started = Instant::now();
                 assert_eq!(object_seq as usize, read(&store, region_id, 1).await.len());
                 reads.push(Timed::since(
                     &METRIC_OBJECT_STORE_WAL_READ_SECONDS,
                     timer,
-                    delay,
+                    io.shortest_wait(),
                     started.elapsed(),
                 ));
 
                 let seal = timer_before(&METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS);
                 let acknowledgement = timer_before(&METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS);
+                io.forget_waits();
                 let started = Instant::now();
                 append(&store, region_id, "a1").await.unwrap();
                 let elapsed = started.elapsed();
+                let waited = io.shortest_wait();
                 seals.push(Timed::since(
                     &METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS,
                     seal,
-                    delay,
+                    waited,
                     elapsed,
                 ));
                 acknowledgements.push(Timed::since(
                     &METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS,
                     acknowledgement,
-                    delay,
+                    waited,
                     elapsed,
                 ));
 
@@ -8074,6 +8123,53 @@ mod tests {
             store.stop().await.unwrap();
         }
 
+        /// The store is dropped rather than stopped while an append is still
+        /// held back, so the actor is torn down with the queue as it stands:
+        /// the append is answered by nothing, its caller having gone, and the
+        /// wait it spent in the queue is recorded like any other.
+        async fn stalled_append_released_by_the_teardown() {
+            let config = ObjectStoreWalConfig {
+                max_unpersisted_bytes: ReadableSize(1),
+                ..enqueued(manual())
+            };
+            let before = Counters::sample();
+            let (store, io, gates, stalled, gate) = stall_second_append(config).await;
+            assert_eq!(
+                Counters {
+                    stalled_appends: 1,
+                    sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
+                    recoveries: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+
+            // The caller of the stalled append gives up and the last handle to
+            // the store goes with it, so the actor sees its commands end. The
+            // create stays parked, and is dropped with the actor rather than
+            // released, which is why the gate outlives the store here.
+            stalled.abort();
+            drop(store);
+            wait_until(|| Counters::since(before).stalled_waits == 1).await;
+            drop(gate);
+            assert!(object_seqs(io.as_ref()).await.is_empty());
+            assert_eq!(
+                Counters {
+                    stalled_appends: 1,
+                    stalled_waits: 1,
+                    sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
+                    recoveries: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+            drop(gates);
+        }
+
         /// An append the backlog thresholds hold back is never admitted, since
         /// the create it waits for is still parked when `stop` begins: it
         /// receives the stopped error, and the wait it spent in the queue is
@@ -8105,13 +8201,15 @@ mod tests {
             // The first stalled append waits for the upload and is admitted,
             // which is one of the two ways out of the queue.
             let timer = timer_before(&METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS);
+            let holding_since = Instant::now();
             tokio::time::sleep(SHORT).await;
+            let held = holding_since.elapsed();
             gate.send(true).unwrap();
             timeout(WAIT, stalled).await.unwrap().unwrap().unwrap();
             let admitted = Timed::since(
                 &METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS,
                 timer,
-                SHORT,
+                held,
                 stalled_at.elapsed(),
             );
 
@@ -8125,7 +8223,9 @@ mod tests {
             };
             let sealed = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
             let timer = timer_before(&METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS);
+            let holding_since = Instant::now();
             tokio::time::sleep(LONG).await;
+            let held = holding_since.elapsed();
             let stop = {
                 let store = store.clone();
                 tokio::spawn(async move { store.stop().await })
@@ -8134,7 +8234,7 @@ mod tests {
             let held_back = Timed::since(
                 &METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS,
                 timer,
-                LONG,
+                held,
                 stalled_at.elapsed(),
             );
             assert!(

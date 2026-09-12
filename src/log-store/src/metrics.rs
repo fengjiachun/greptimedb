@@ -255,9 +255,9 @@ lazy_static! {
     .unwrap();
 
     /// How long such an append stays held back, until it is admitted or until
-    /// it is refused, a stop or a terminal error releasing it included, which
-    /// is the latency the `enqueued` mode pays once the backlog is at a
-    /// threshold.
+    /// it is refused, a stop, a terminal error or the teardown of the store
+    /// releasing it included, which is the latency the `enqueued` mode pays
+    /// once the backlog is at a threshold.
     ///
     /// A stalled append waits for one upload to complete, so the buckets run
     /// from 5ms to half a minute of a struggling object store.
