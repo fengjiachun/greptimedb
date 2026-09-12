@@ -150,8 +150,9 @@ lazy_static! {
     /// How many entries the objects of the object store logstore hold, which
     /// says how many writes one request amortises.
     ///
-    /// The buckets reach the per-region position limit of 2^20 entries, the
-    /// theoretical bound an object cannot pass.
+    /// The largest finite bucket is 2^20, the position limit of one region in
+    /// one object. An object holds the entries of many regions, so its total
+    /// can pass that; such an object falls in the overflow bucket.
     pub static ref METRIC_OBJECT_STORE_WAL_OBJECT_ENTRIES: Histogram = register_histogram!(
         "greptime_logstore_object_store_wal_object_entries",
         "object store logstore entries of each object sealed",
@@ -183,34 +184,38 @@ lazy_static! {
     )
     .unwrap();
 
-    /// How long the object store logstore takes to rebuild its catalog when it
-    /// opens, which is the part of a restart the WAL is responsible for.
+    /// How long a recovery of the object store logstore that succeeded took to
+    /// rebuild its catalog, which is the part of a restart the WAL is
+    /// responsible for. A recovery that was abandoned records nothing.
     ///
     /// Recovery reads a few small ranges per object, so the buckets run from
     /// 10ms, an empty prefix, to minutes on a prefix with many objects.
     pub static ref METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS: Histogram = register_histogram!(
         "greptime_logstore_object_store_wal_recovery_seconds",
-        "object store logstore seconds spent recovering the catalog",
+        "object store logstore seconds spent by a recovery that succeeded",
         exponential_buckets(0.01, 3.0, 10).unwrap(),
     )
     .unwrap();
 
-    /// Counter of objects the object store logstore read footers from while
-    /// opening, which is what the recovery time is spent on.
+    /// Counter of objects a recovery of the object store logstore that
+    /// succeeded read footers from, which is what its time is spent on. It
+    /// counts the objects of the same recoveries the timer above measures, so
+    /// an abandoned one contributes to neither.
     pub static ref METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL: IntCounter = register_int_counter!(
         "greptime_logstore_object_store_wal_recovered_objects_total",
-        "object store logstore objects read at recovery total",
+        "object store logstore objects read by a recovery that succeeded total",
     )
     .unwrap();
 
-    /// How long a read stream of the object store logstore takes to serve the
-    /// replay of one region, which is the part of a region open the WAL costs.
+    /// How long a read stream of the object store logstore took to serve the
+    /// replay of one region, recorded once the stream has been read to its
+    /// end; one that fails or is dropped part way records nothing.
     ///
     /// A read fetches one segment per object of the region, so the buckets run
     /// from 5ms, a region with nothing to replay, to minutes.
     pub static ref METRIC_OBJECT_STORE_WAL_READ_SECONDS: Histogram = register_histogram!(
         "greptime_logstore_object_store_wal_read_seconds",
-        "object store logstore seconds spent serving a region read",
+        "object store logstore seconds spent serving a region read that ran to its end",
         exponential_buckets(0.005, 3.0, 10).unwrap(),
     )
     .unwrap();

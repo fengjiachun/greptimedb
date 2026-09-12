@@ -2125,7 +2125,7 @@ async fn recover(io: &dyn WalObjectIo) -> Result<(ObjectCatalog, u64, HashMap<Re
     let started_at = Instant::now();
     let objects = io.list().await?;
     let footers = fetch_footers(io, objects, RECOVERY_CONCURRENCY).await?;
-    METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL.inc_by(footers.len() as u64);
+    let recovered_objects = footers.len() as u64;
     let indexed_objects = footers.len() as i64;
     let indexed_bytes = footers.iter().map(|(object, _)| object.size).sum::<u64>() as i64;
     let mut catalog = ObjectCatalog::default();
@@ -2135,6 +2135,9 @@ async fn recover(io: &dyn WalObjectIo) -> Result<(ObjectCatalog, u64, HashMap<Re
             .with_context(|_| InvalidWalObjectSnafu { path: object.path })?;
     }
     let recovered = finish_recovery(catalog)?;
+    // Only a recovery that succeeded is reported, so that the objects counted
+    // and the time measured are those of the same recoveries.
+    METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL.inc_by(recovered_objects);
     // The catalog of the store that is about to open replaces any earlier one.
     METRIC_OBJECT_STORE_WAL_INDEXED_OBJECTS.set(indexed_objects);
     METRIC_OBJECT_STORE_WAL_INDEXED_BYTES.set(indexed_bytes);
@@ -6433,6 +6436,8 @@ mod tests {
     /// they assert on move only by what the case itself did; [`SERIALIZED`]
     /// keeps the rest of the module out while they do.
     mod fault_matrix {
+        use prometheus::Histogram;
+
         use super::*;
 
         /// A row of the *Failure matrix*, named by its *Situation* cell.
@@ -6491,6 +6496,12 @@ mod tests {
             /// Samples of the object size and object entry histograms, which
             /// every batch that seals and encodes feeds once each.
             sealed_objects: u64,
+            /// What those two histograms recorded: the bytes of the objects
+            /// the case sealed, and the entries they hold. The entry sum tells
+            /// an object apart from the entries in it, which the sample counts
+            /// cannot.
+            object_bytes: u64,
+            object_entries: u64,
             /// Samples of the acknowledgement histogram, which every append
             /// the `durable` mode acknowledges feeds once.
             acknowledged_appends: u64,
@@ -6508,6 +6519,91 @@ mod tests {
             /// backlog thresholds held back feeds once, on whichever path it
             /// leaves the queue by.
             stalled_waits: u64,
+        }
+
+        /// What a histogram of whole numbers has recorded so far. The sums
+        /// are exact at these magnitudes, so a case states them as counts.
+        fn sum_of(histogram: &Histogram) -> u64 {
+            let sum = histogram.get_sample_sum();
+            assert_eq!(
+                sum,
+                sum.round(),
+                "a histogram of whole numbers recorded {sum}"
+            );
+            sum as u64
+        }
+
+        /// The length of the object a batch of `entries` encodes into, which is
+        /// what the object size histogram records when the batch seals. Entry
+        /// ids do not affect the length, so the positions of the batch will do.
+        fn object_bytes_of(entries: &[(RegionId, &str)]) -> u64 {
+            let mut positions = HashMap::new();
+            let records = entries
+                .iter()
+                .map(|(region_id, data)| {
+                    let position = positions.entry(*region_id).or_insert(0);
+                    *position += 1;
+                    Record {
+                        region_id: *region_id,
+                        entry_id: entry_id(0, *position),
+                        payload: Bytes::from(data.as_bytes().to_vec()),
+                    }
+                })
+                .collect::<Vec<_>>();
+            encode_object(
+                Header {
+                    object_seq: 0,
+                    writer_instance: [0; 16],
+                },
+                &records,
+            )
+            .unwrap()
+            .bytes
+            .len() as u64
+        }
+
+        /// The length of the object that the batch of one two-byte entry of one
+        /// region, which most cases seal, encodes into.
+        fn one_entry_object() -> u64 {
+            object_bytes_of(&[(region(1), "a1")])
+        }
+
+        /// The sums of the two write-path timers, so that a case can check the
+        /// durations they recorded and not only how many.
+        #[derive(Debug, Clone, Copy)]
+        struct Timings {
+            seal_to_durable: f64,
+            append_ack: f64,
+        }
+
+        impl Timings {
+            fn sample() -> Self {
+                Self {
+                    seal_to_durable: METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
+                        .get_sample_sum(),
+                    append_ack: METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS.get_sample_sum(),
+                }
+            }
+
+            /// Asserts that both timers recorded at least `held`, the time the
+            /// case kept the create from completing, and no more than the case
+            /// itself took. A timer that records a constant, or seconds where
+            /// it means something else, falls outside those bounds.
+            fn assert_between(before: Self, held: Duration, elapsed: Duration) {
+                let now = Self::sample();
+                for (name, recorded) in [
+                    (
+                        "seal to durable",
+                        now.seal_to_durable - before.seal_to_durable,
+                    ),
+                    ("append acknowledgement", now.append_ack - before.append_ack),
+                ] {
+                    assert!(
+                        recorded >= held.as_secs_f64() && recorded <= elapsed.as_secs_f64(),
+                        "the {name} timer recorded {recorded}s, expected between {held:?} and {elapsed:?}"
+                    );
+                }
+            }
         }
 
         /// Samples of the two object shape histograms, which a sealed batch
@@ -6530,6 +6626,8 @@ mod tests {
                     seal_to_durable: METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
                         .get_sample_count(),
                     sealed_objects: sealed_objects(),
+                    object_bytes: sum_of(&METRIC_OBJECT_STORE_WAL_OBJECT_BYTES),
+                    object_entries: sum_of(&METRIC_OBJECT_STORE_WAL_OBJECT_ENTRIES),
                     acknowledged_appends: METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS
                         .get_sample_count(),
                     recovered_objects: METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL.get(),
@@ -6553,6 +6651,8 @@ mod tests {
                     created_objects: now.created_objects - before.created_objects,
                     seal_to_durable: now.seal_to_durable - before.seal_to_durable,
                     sealed_objects: now.sealed_objects - before.sealed_objects,
+                    object_bytes: now.object_bytes - before.object_bytes,
+                    object_entries: now.object_entries - before.object_entries,
                     acknowledged_appends: now.acknowledged_appends - before.acknowledged_appends,
                     recovered_objects: now.recovered_objects - before.recovered_objects,
                     recoveries: now.recoveries - before.recoveries,
@@ -6700,6 +6800,11 @@ mod tests {
                     run: || Box::pin(footer_fetch_fails_at_recovery()),
                 },
                 Case {
+                    fault: "a recovery the catalog rejects after every footer was fetched",
+                    row: None,
+                    run: || Box::pin(recovery_is_rejected_after_the_footers()),
+                },
+                Case {
                     fault: "a fetch of a segment that fails at a read",
                     row: None,
                     run: || Box::pin(segment_fetch_fails_at_a_read()),
@@ -6736,12 +6841,24 @@ mod tests {
             let store = open(memory_store(), &eager()).await;
             let region_id = region(1);
 
+            let other = region(2);
+
             append(&store, region_id, "a1").await.unwrap();
-            let response = append(&store, region_id, "a2").await.unwrap();
-            assert_eq!(Some(&id(1, 1)), response.last_entry_ids.get(&region_id));
+            // A batch of several entries of two regions, so that the entries
+            // the objects hold are not the count of the objects.
+            let response = store
+                .append_batch(vec![
+                    entry(&store, region_id, "a2"),
+                    entry(&store, region_id, "a3"),
+                    entry(&store, other, "b1"),
+                ])
+                .await
+                .unwrap();
+            assert_eq!(Some(&id(1, 2)), response.last_entry_ids.get(&region_id));
+            assert_eq!(Some(&id(1, 1)), response.last_entry_ids.get(&other));
             assert_eq!(vec![0, 1], object_seqs(store.io.as_ref()).await);
             assert_eq!(
-                entries(&[(id(0, 1), "a1"), (id(1, 1), "a2")]),
+                entries(&[(id(0, 1), "a1"), (id(1, 1), "a2"), (id(1, 2), "a3")]),
                 read(&store, region_id, 1).await
             );
 
@@ -6751,6 +6868,9 @@ mod tests {
                     created_objects: 2,
                     seal_to_durable: 2,
                     sealed_objects: 2,
+                    object_bytes: one_entry_object()
+                        + object_bytes_of(&[(region_id, "a2"), (region_id, "a3"), (other, "b1")]),
+                    object_entries: 4,
                     acknowledged_appends: 2,
                     recoveries: 1,
                     reads: 1,
@@ -6792,6 +6912,8 @@ mod tests {
                     created_objects: 2,
                     seal_to_durable: 2,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     acknowledged_appends: 2,
                     reads: 1,
                     ..Counters::default()
@@ -6830,6 +6952,8 @@ mod tests {
                 Counters {
                     create_failures: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     reads: 1,
                     ..Counters::default()
                 },
@@ -6850,6 +6974,8 @@ mod tests {
                     seal_to_durable: 1,
                     create_failures: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     acknowledged_appends: 1,
                     reads: 2,
                     ..Counters::default()
@@ -6903,6 +7029,8 @@ mod tests {
                 Counters {
                     create_failures: 3,
                     sealed_objects: 3,
+                    object_bytes: 3 * one_entry_object(),
+                    object_entries: 3,
                     reads: 1,
                     ..Counters::default()
                 },
@@ -6910,19 +7038,23 @@ mod tests {
             );
 
             // The entry ids rolled back with the sequence, so the retry of the
-            // first entries writes the object the failed create did not.
+            // first entries writes the object the failed create did not. It is
+            // the one create of the matrix the case can hold for a known time,
+            // so it is where the two write-path timers are read for what they
+            // recorded and not only for how often.
+            const HELD: Duration = Duration::from_millis(50);
+            let timings = Timings::sample();
+            let started = Instant::now();
             let retry = spawn_appends(&store, region_id, 1).await;
-            timeout(WAIT, gates.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .send(true)
-                .unwrap();
+            let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+            tokio::time::sleep(HELD).await;
+            gate.send(true).unwrap();
             let response = timeout(WAIT, retry.into_iter().next().unwrap())
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
+            Timings::assert_between(timings, HELD, started.elapsed());
             assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
             assert_eq!(vec![0], object_seqs(io.as_ref()).await);
             assert_eq!(
@@ -6936,6 +7068,8 @@ mod tests {
                     seal_to_durable: 1,
                     create_failures: 3,
                     sealed_objects: 4,
+                    object_bytes: 4 * one_entry_object(),
+                    object_entries: 4,
                     acknowledged_appends: 1,
                     reads: 2,
                     ..Counters::default()
@@ -6979,6 +7113,8 @@ mod tests {
                 Counters {
                     create_failures: 3,
                     sealed_objects: 3,
+                    object_bytes: 3 * one_entry_object(),
+                    object_entries: 3,
                     reads: 1,
                     ..Counters::default()
                 },
@@ -7000,6 +7136,8 @@ mod tests {
                     seal_to_durable: 1,
                     create_failures: 3,
                     sealed_objects: 4,
+                    object_bytes: 4 * one_entry_object(),
+                    object_entries: 4,
                     acknowledged_appends: 1,
                     reads: 2,
                     ..Counters::default()
@@ -7055,6 +7193,8 @@ mod tests {
                     create_failures: 1,
                     poisoned: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7077,6 +7217,8 @@ mod tests {
                     create_failures: 1,
                     poisoned: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     recovered_objects: 1,
                     recoveries: 1,
                     reads: 1,
@@ -7119,6 +7261,8 @@ mod tests {
                 Counters {
                     create_failures: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     reads: 1,
                     ..Counters::default()
                 },
@@ -7144,6 +7288,8 @@ mod tests {
                     seal_to_durable: 1,
                     create_failures: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     reads: 2,
                     ..Counters::default()
                 },
@@ -7183,6 +7329,8 @@ mod tests {
                 Counters {
                     create_failures: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7248,6 +7396,8 @@ mod tests {
                     create_conflicts: 1,
                     poisoned: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7295,6 +7445,8 @@ mod tests {
                     create_conflicts: 1,
                     poisoned: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7313,6 +7465,8 @@ mod tests {
                     create_conflicts: 1,
                     poisoned: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7367,6 +7521,8 @@ mod tests {
                     create_conflicts: 1,
                     poisoned: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7421,6 +7577,8 @@ mod tests {
                     seal_to_durable: 2,
                     poisoned: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7444,6 +7602,8 @@ mod tests {
                     seal_to_durable: 2,
                     poisoned: 1,
                     sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     recovered_objects: 2,
                     recoveries: 1,
                     reads: 1,
@@ -7510,6 +7670,8 @@ mod tests {
                     seal_to_durable: 1,
                     poisoned: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     acknowledged_appends: 1,
                     ..Counters::default()
                 },
@@ -7625,6 +7787,34 @@ mod tests {
                 Counters::since(before)
             );
             store.stop().await.unwrap();
+        }
+
+        /// Every footer is fetched and the catalog then rejects the prefix,
+        /// which is the other way a recovery is abandoned: the objects it read
+        /// are counted as recovered no more than the ones a failed fetch left
+        /// unread, and neither gauge is published.
+        async fn recovery_is_rejected_after_the_footers() {
+            let object_store = memory_store();
+            let region_id = region(1);
+            // The entry ranges of the region do not increase with the object
+            // sequence, which the catalog refuses to index.
+            put_object(&object_store, 0, region_id, &[id(3, 1), id(3, 2)]).await;
+            put_object(&object_store, 1, region_id, &[id(2, 1)]).await;
+            zero_the_indexed_gauges().await;
+            let io = Arc::new(FaultyIo::over(object_store));
+            let before = Counters::sample();
+
+            let error = ObjectStoreLogStore::open(io.clone(), &eager())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidWalObject { path, source, .. }
+                    if path == &io.object_path(1)
+                        && matches!(**source, Error::CorruptedWalObject { .. })),
+                "unexpected error: {error:?}"
+            );
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(Counters::default(), Counters::since(before));
         }
 
         /// Writes one object whose footer is longer than the window recovery reads
@@ -7767,6 +7957,8 @@ mod tests {
                 Counters {
                     stalled_appends: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     recoveries: 1,
                     ..Counters::default()
                 },
@@ -7794,6 +7986,8 @@ mod tests {
                     created_objects: 1,
                     seal_to_durable: 1,
                     sealed_objects: 1,
+                    object_bytes: one_entry_object(),
+                    object_entries: 1,
                     recoveries: 1,
                     stalled_appends: 1,
                     stalled_waits: 1,
