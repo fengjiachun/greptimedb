@@ -6488,6 +6488,19 @@ mod tests {
             create_failures: u64,
             create_conflicts: u64,
             poisoned: u64,
+            /// Samples of the object size and object entry histograms, which
+            /// every batch that seals and encodes feeds once each.
+            sealed_objects: u64,
+            /// Samples of the acknowledgement histogram, which every append
+            /// the `durable` mode acknowledges feeds once.
+            acknowledged_appends: u64,
+            /// Objects recovery read footers from, and samples of the recovery
+            /// histogram, which every recovery that succeeds feeds once.
+            recovered_objects: u64,
+            recoveries: u64,
+            /// Samples of the read histogram, which every read stream that is
+            /// driven to its end feeds once.
+            reads: u64,
             deleted_objects: u64,
             failed_deletes: u64,
             stalled_appends: u64,
@@ -6497,12 +6510,31 @@ mod tests {
             stalled_waits: u64,
         }
 
+        /// Samples of the two object shape histograms, which a sealed batch
+        /// feeds together, so that one field covers both and a batch that fed
+        /// only one of them fails the case.
+        fn sealed_objects() -> u64 {
+            let bytes = METRIC_OBJECT_STORE_WAL_OBJECT_BYTES.get_sample_count();
+            let entries = METRIC_OBJECT_STORE_WAL_OBJECT_ENTRIES.get_sample_count();
+            assert_eq!(
+                bytes, entries,
+                "an object was sized but its entries were not counted"
+            );
+            bytes
+        }
+
         impl Counters {
             fn sample() -> Self {
                 Self {
                     created_objects: METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL.get(),
                     seal_to_durable: METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
                         .get_sample_count(),
+                    sealed_objects: sealed_objects(),
+                    acknowledged_appends: METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS
+                        .get_sample_count(),
+                    recovered_objects: METRIC_OBJECT_STORE_WAL_RECOVERED_OBJECTS_TOTAL.get(),
+                    recoveries: METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS.get_sample_count(),
+                    reads: METRIC_OBJECT_STORE_WAL_READ_SECONDS.get_sample_count(),
                     create_failures: METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL.get(),
                     create_conflicts: METRIC_OBJECT_STORE_WAL_CREATE_CONFLICTS_TOTAL.get(),
                     poisoned: METRIC_OBJECT_STORE_WAL_POISONED_TOTAL.get(),
@@ -6520,6 +6552,11 @@ mod tests {
                 Self {
                     created_objects: now.created_objects - before.created_objects,
                     seal_to_durable: now.seal_to_durable - before.seal_to_durable,
+                    sealed_objects: now.sealed_objects - before.sealed_objects,
+                    acknowledged_appends: now.acknowledged_appends - before.acknowledged_appends,
+                    recovered_objects: now.recovered_objects - before.recovered_objects,
+                    recoveries: now.recoveries - before.recoveries,
+                    reads: now.reads - before.reads,
                     create_failures: now.create_failures - before.create_failures,
                     create_conflicts: now.create_conflicts - before.create_conflicts,
                     poisoned: now.poisoned - before.poisoned,
@@ -6550,6 +6587,24 @@ mod tests {
                 (indexed.len() as i64, bytes as i64),
                 indexed_gauges(),
                 "expected the gauges to hold the objects {indexed:?}"
+            );
+        }
+
+        /// Asserts that a read of the poisoned store fails with the terminal
+        /// error rather than returning what the store still has indexed.
+        async fn assert_read_is_terminal(store: &ObjectStoreLogStore, region_id: RegionId) {
+            let error = store
+                .read(&provider(region_id), 1, None)
+                .await
+                .err()
+                .expect("a read of a poisoned store must fail");
+            assert!(
+                terminal(&store.terminal_error).is_some(),
+                "the store was expected to be poisoned"
+            );
+            assert!(
+                matches!(&error, Error::ObjectStoreWal { .. }),
+                "unexpected error: {error:?}"
             );
         }
 
@@ -6695,6 +6750,10 @@ mod tests {
                 Counters {
                     created_objects: 2,
                     seal_to_durable: 2,
+                    sealed_objects: 2,
+                    acknowledged_appends: 2,
+                    recoveries: 1,
+                    reads: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6732,6 +6791,9 @@ mod tests {
                 Counters {
                     created_objects: 2,
                     seal_to_durable: 2,
+                    sealed_objects: 2,
+                    acknowledged_appends: 2,
+                    reads: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6767,6 +6829,8 @@ mod tests {
             assert_eq!(
                 Counters {
                     create_failures: 1,
+                    sealed_objects: 1,
+                    reads: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6785,6 +6849,9 @@ mod tests {
                     created_objects: 1,
                     seal_to_durable: 1,
                     create_failures: 1,
+                    sealed_objects: 2,
+                    acknowledged_appends: 1,
+                    reads: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6830,9 +6897,13 @@ mod tests {
             assert!(object_seqs(io.as_ref()).await.is_empty());
             assert_eq!(0, latest(&store, region_id));
             assert_indexed(io.as_ref(), &[]).await;
+            // The store is healthy, so a read works and sees nothing.
+            assert!(read(&store, region_id, 1).await.is_empty());
             assert_eq!(
                 Counters {
                     create_failures: 3,
+                    sealed_objects: 3,
+                    reads: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6864,6 +6935,9 @@ mod tests {
                     created_objects: 1,
                     seal_to_durable: 1,
                     create_failures: 3,
+                    sealed_objects: 4,
+                    acknowledged_appends: 1,
+                    reads: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6899,9 +6973,13 @@ mod tests {
             }
             assert!(object_seqs(io.as_ref()).await.is_empty());
             assert_indexed(io.as_ref(), &[]).await;
+            // The store is healthy, so a read works and sees nothing.
+            assert!(read(&store, region_id, 1).await.is_empty());
             assert_eq!(
                 Counters {
                     create_failures: 3,
+                    sealed_objects: 3,
+                    reads: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6913,10 +6991,17 @@ mod tests {
             assert_eq!(vec![0], object_seqs(io.as_ref()).await);
             assert_indexed(io.as_ref(), &[0]).await;
             assert_eq!(
+                entries(&[(id(0, 1), "a1")]),
+                read(&store, region_id, 1).await
+            );
+            assert_eq!(
                 Counters {
                     created_objects: 1,
                     seal_to_durable: 1,
                     create_failures: 3,
+                    sealed_objects: 4,
+                    acknowledged_appends: 1,
+                    reads: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6960,6 +7045,7 @@ mod tests {
             }
             assert_eq!(vec![1], object_seqs(io.as_ref()).await);
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            assert_read_is_terminal(&store, region_id).await;
             // The durable object was never indexed by this store.
             assert_indexed(io.as_ref(), &[]).await;
             assert_eq!(
@@ -6968,6 +7054,7 @@ mod tests {
                     seal_to_durable: 1,
                     create_failures: 1,
                     poisoned: 1,
+                    sealed_objects: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -6983,6 +7070,20 @@ mod tests {
                 read(&store, region_id, 1).await
             );
             assert_indexed(store.io.as_ref(), &[1]).await;
+            assert_eq!(
+                Counters {
+                    created_objects: 1,
+                    seal_to_durable: 1,
+                    create_failures: 1,
+                    poisoned: 1,
+                    sealed_objects: 2,
+                    recovered_objects: 1,
+                    recoveries: 1,
+                    reads: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
             store.stop().await.unwrap();
         }
 
@@ -6990,16 +7091,43 @@ mod tests {
         /// the store repeats the create under the same sequence and the entry
         /// becomes durable without the caller learning of the failure.
         async fn create_fails_transiently_enqueued() {
-            let io = Arc::new(FaultyIo::new());
+            let (io, mut gates) = GatedIo::new();
             let store = ObjectStoreLogStore::open(io.clone(), &enqueued(eager()))
                 .await
                 .unwrap();
             let region_id = region(1);
             let before = Counters::sample();
 
-            io.fail_next_put.store(true, Ordering::Relaxed);
             let response = append(&store, region_id, "a1").await.unwrap();
             assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
+            timeout(WAIT, gates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .send(false)
+                .unwrap();
+
+            // The retry is held at its gate, so the failed attempt is what the
+            // store stands at: the entry was acknowledged but is not durable,
+            // nothing is written, nothing is indexed and the store is healthy.
+            let retry = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+            assert!(object_seqs(io.as_ref()).await.is_empty());
+            assert_eq!(0, store.durable_entry_id(&provider(region_id)).unwrap());
+            assert!(read(&store, region_id, 1).await.is_empty());
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(
+                Counters {
+                    create_failures: 1,
+                    sealed_objects: 1,
+                    reads: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+
+            // The repeat writes the object under the same sequence and the
+            // caller, which was answered on admission, learns nothing of it.
+            retry.send(true).unwrap();
             timeout(WAIT, store.wait_durable(&provider(region_id), id(0, 1)))
                 .await
                 .unwrap()
@@ -7015,6 +7143,8 @@ mod tests {
                     created_objects: 1,
                     seal_to_durable: 1,
                     create_failures: 1,
+                    sealed_objects: 1,
+                    reads: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7052,6 +7182,7 @@ mod tests {
             assert_eq!(
                 Counters {
                     create_failures: 1,
+                    sealed_objects: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7116,6 +7247,7 @@ mod tests {
                     seal_to_durable: 1,
                     create_conflicts: 1,
                     poisoned: 1,
+                    sealed_objects: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7162,6 +7294,7 @@ mod tests {
                 Counters {
                     create_conflicts: 1,
                     poisoned: 1,
+                    sealed_objects: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7171,6 +7304,7 @@ mod tests {
             open.remove(0).send(true).unwrap();
             wait_until(|| Counters::since(before).created_objects == 1).await;
             assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+            assert_read_is_terminal(&store, region_id).await;
             assert_indexed(io.as_ref(), &[]).await;
             assert_eq!(
                 Counters {
@@ -7178,6 +7312,7 @@ mod tests {
                     seal_to_durable: 1,
                     create_conflicts: 1,
                     poisoned: 1,
+                    sealed_objects: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7220,6 +7355,7 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            assert_read_is_terminal(&store, region_id).await;
             assert_indexed(store.io.as_ref(), &[]).await;
             let error = store.stop().await.unwrap_err();
             assert!(
@@ -7230,6 +7366,7 @@ mod tests {
                 Counters {
                     create_conflicts: 1,
                     poisoned: 1,
+                    sealed_objects: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7274,6 +7411,7 @@ mod tests {
             }
             assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            assert_read_is_terminal(&store, region_id).await;
             // Neither object was indexed by this store, whatever the catalog
             // the case put a sequence into holds.
             assert_indexed(io.as_ref(), &[]).await;
@@ -7282,6 +7420,7 @@ mod tests {
                     created_objects: 2,
                     seal_to_durable: 2,
                     poisoned: 1,
+                    sealed_objects: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7299,6 +7438,19 @@ mod tests {
                 read(&store, region_id, 1).await
             );
             assert_indexed(store.io.as_ref(), &[0, 1]).await;
+            assert_eq!(
+                Counters {
+                    created_objects: 2,
+                    seal_to_durable: 2,
+                    poisoned: 1,
+                    sealed_objects: 2,
+                    recovered_objects: 2,
+                    recoveries: 1,
+                    reads: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
             store.stop().await.unwrap();
         }
 
@@ -7348,6 +7500,7 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
+            assert_read_is_terminal(&store, region_id).await;
             // The batch was acknowledged, so its object is indexed, alongside
             // the one the prefix was seeded with.
             assert_indexed(store.io.as_ref(), &[last_object_seq - 1, last_object_seq]).await;
@@ -7356,6 +7509,8 @@ mod tests {
                     created_objects: 1,
                     seal_to_durable: 1,
                     poisoned: 1,
+                    sealed_objects: 1,
+                    acknowledged_appends: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7368,6 +7523,7 @@ mod tests {
         async fn listing_fails_at_recovery() {
             let object_store = memory_store();
             populate(&object_store, 2, 2).await;
+            zero_the_indexed_gauges().await;
             let io = Arc::new(FaultyIo::over(object_store));
             let before = Counters::sample();
 
@@ -7386,13 +7542,35 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert_eq!(RetryHint::Retryable, error.retry_hint());
+            // Nothing of the prefix reached either gauge, and no object was
+            // counted as recovered.
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(Counters::default(), Counters::since(before));
 
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
                 .unwrap();
             assert_indexed(io.as_ref(), &[0, 1]).await;
-            assert_eq!(Counters::default(), Counters::since(before));
+            assert_eq!(2, read(&store, region(1), 1).await.len());
+            assert_eq!(
+                Counters {
+                    recovered_objects: 2,
+                    recoveries: 1,
+                    reads: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
             store.stop().await.unwrap();
+        }
+
+        /// Opens a store on an empty prefix of its own, which puts both indexed
+        /// gauges back to zero, so that a case can tell what the recovery it is
+        /// about to fail published from what the prefix already held.
+        async fn zero_the_indexed_gauges() {
+            let store = open(memory_store(), &eager()).await;
+            store.stop().await.unwrap();
+            assert_eq!((0, 0), indexed_gauges());
         }
 
         /// The fetch of the window at the end of the object, which carries the
@@ -7411,6 +7589,7 @@ mod tests {
         }
 
         async fn recovery_fails_on_a_read_at(object_store: ObjectStore, offset: u64) {
+            zero_the_indexed_gauges().await;
             let io = Arc::new(FaultyIo::over(object_store));
             let before = Counters::sample();
             io.fail_reads_of.store(0, Ordering::Relaxed);
@@ -7425,13 +7604,26 @@ mod tests {
                 "unexpected error: {error:?}"
             );
             assert_eq!(RetryHint::Retryable, error.retry_hint());
+            // The listing found the object, but the recovery that abandoned it
+            // published neither gauge and counted nothing as recovered.
+            assert_indexed(io.as_ref(), &[]).await;
+            assert_eq!(Counters::default(), Counters::since(before));
 
             io.fail_reads_of.store(u64::MAX, Ordering::Relaxed);
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
                 .unwrap();
             assert_indexed(io.as_ref(), &[0]).await;
-            assert_eq!(Counters::default(), Counters::since(before));
+            assert_eq!(1, read(&store, region(1), 1).await.len());
+            assert_eq!(
+                Counters {
+                    recovered_objects: 1,
+                    recoveries: 1,
+                    reads: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
             store.stop().await.unwrap();
         }
 
@@ -7494,7 +7686,13 @@ mod tests {
             io.fail_reads_of.store(u64::MAX, Ordering::Relaxed);
             assert_eq!(2, read(&store, region_id, 1).await.len());
             assert_indexed(io.as_ref(), &[0, 1]).await;
-            assert_eq!(Counters::default(), Counters::since(before));
+            assert_eq!(
+                Counters {
+                    reads: 1,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
             store.stop().await.unwrap();
         }
 
@@ -7517,9 +7715,16 @@ mod tests {
             assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
             assert!(is_indexed(&store, 0));
             assert_indexed(io.as_ref(), &[0, 1]).await;
+            // The object is still there, and a read hides its entries because
+            // the watermark covers them, not because it was collected.
+            assert_eq!(
+                entries(&[(id(1, 1), "a2")]),
+                read(&store, region_id, 1).await
+            );
             assert_eq!(
                 Counters {
                     failed_deletes: 1,
+                    reads: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7531,9 +7736,14 @@ mod tests {
             assert!(!is_indexed(&store, 0));
             assert_indexed(io.as_ref(), &[1]).await;
             assert_eq!(
+                entries(&[(id(1, 1), "a2")]),
+                read(&store, region_id, 1).await
+            );
+            assert_eq!(
                 Counters {
                     deleted_objects: 1,
                     failed_deletes: 1,
+                    reads: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7556,6 +7766,8 @@ mod tests {
             assert_eq!(
                 Counters {
                     stalled_appends: 1,
+                    sealed_objects: 1,
+                    recoveries: 1,
                     ..Counters::default()
                 },
                 Counters::since(before)
@@ -7581,6 +7793,8 @@ mod tests {
                 Counters {
                     created_objects: 1,
                     seal_to_durable: 1,
+                    sealed_objects: 1,
+                    recoveries: 1,
                     stalled_appends: 1,
                     stalled_waits: 1,
                     ..Counters::default()
