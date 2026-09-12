@@ -6049,7 +6049,7 @@ mod tests {
     /// Object access that fails a conditional create on request, either before
     /// or after the object was actually written, fails every create, fails a
     /// listing, fails the reads of one object or one range of it, damages
-    /// range reads, or holds and fails deletes.
+    /// range reads, holds and fails deletes, or answers after a delay.
     struct FaultyIo {
         inner: ObjectStoreIo,
         fail_next_put: AtomicBool,
@@ -6061,6 +6061,9 @@ mod tests {
         /// left behind and reconciles it.
         reconcile_next_put: AtomicBool,
         fail_next_list: AtomicBool,
+        /// Milliseconds every read and every conditional create waits before
+        /// it answers, so a case can force a known duration on the timers.
+        answer_after_millis: AtomicU64,
         /// Sequence of the object whose reads fail; `u64::MAX` fails none.
         fail_reads_of: AtomicU64,
         /// Offset of the read of that object which fails; `u64::MAX` fails
@@ -6092,6 +6095,7 @@ mod tests {
                 fail_puts: AtomicBool::new(false),
                 reconcile_next_put: AtomicBool::new(false),
                 fail_next_list: AtomicBool::new(false),
+                answer_after_millis: AtomicU64::new(0),
                 fail_reads_of: AtomicU64::new(u64::MAX),
                 fail_reads_at: AtomicU64::new(u64::MAX),
                 damage_next_range_read: AtomicBool::new(false),
@@ -6125,6 +6129,13 @@ mod tests {
             (Arc::new(io), parked)
         }
 
+        async fn answer_after(&self) {
+            let millis = self.answer_after_millis.load(Ordering::Relaxed);
+            if millis > 0 {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+            }
+        }
+
         fn check_read(&self, object_seq: u64, offset: u64) -> Result<()> {
             let fail_at = self.fail_reads_at.load(Ordering::Relaxed);
             if self.fail_reads_of.load(Ordering::Relaxed) == object_seq
@@ -6150,6 +6161,7 @@ mod tests {
             {
                 return injected_failure("write", self.inner.object_path(object_seq));
             }
+            self.answer_after().await;
             if self.reconcile_next_put.swap(false, Ordering::Relaxed) {
                 self.inner
                     .put_if_absent(object_seq, content.clone())
@@ -6164,11 +6176,13 @@ mod tests {
 
         async fn get(&self, object_seq: u64) -> Result<Bytes> {
             self.check_read(object_seq, 0)?;
+            self.answer_after().await;
             self.inner.get(object_seq).await
         }
 
         async fn get_range(&self, object_seq: u64, offset: u64, len: u64) -> Result<Bytes> {
             self.check_read(object_seq, offset)?;
+            self.answer_after().await;
             let bytes = self.inner.get_range(object_seq, offset, len).await?;
             if self.damage_next_range_read.swap(false, Ordering::Relaxed)
                 || self.damage_reads_of.load(Ordering::Relaxed) == object_seq
@@ -6568,41 +6582,62 @@ mod tests {
             object_bytes_of(&[(region(1), "a1")])
         }
 
-        /// The sums of the two write-path timers, so that a case can check the
-        /// durations they recorded and not only how many.
-        #[derive(Debug, Clone, Copy)]
-        struct Timings {
-            seal_to_durable: f64,
-            append_ack: f64,
+        /// The sum and the count of a timing histogram, taken before a case
+        /// forces a wait on it.
+        fn timer_before(histogram: &Histogram) -> (f64, u64) {
+            (histogram.get_sample_sum(), histogram.get_sample_count())
         }
 
-        impl Timings {
-            fn sample() -> Self {
+        /// One observation of a timing histogram: the seconds it recorded for
+        /// the one sample it took since `before`, the wait the case forced on
+        /// it, and what the case itself took around that wait.
+        #[derive(Debug, Clone, Copy)]
+        struct Timed {
+            recorded: f64,
+            held: Duration,
+            elapsed: Duration,
+        }
+
+        impl Timed {
+            fn since(
+                histogram: &Histogram,
+                before: (f64, u64),
+                held: Duration,
+                elapsed: Duration,
+            ) -> Self {
+                assert_eq!(
+                    before.1 + 1,
+                    histogram.get_sample_count(),
+                    "expected the timer to take exactly one sample"
+                );
                 Self {
-                    seal_to_durable: METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS
-                        .get_sample_sum(),
-                    append_ack: METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS.get_sample_sum(),
+                    recorded: histogram.get_sample_sum() - before.0,
+                    held,
+                    elapsed,
                 }
             }
 
-            /// Asserts that both timers recorded at least `held`, the time the
-            /// case kept the create from completing, and no more than the case
-            /// itself took. A timer that records a constant, or seconds where
-            /// it means something else, falls outside those bounds.
-            fn assert_between(before: Self, held: Duration, elapsed: Duration) {
-                let now = Self::sample();
-                for (name, recorded) in [
-                    (
-                        "seal to durable",
-                        now.seal_to_durable - before.seal_to_durable,
-                    ),
-                    ("append acknowledgement", now.append_ack - before.append_ack),
-                ] {
+            /// Asserts the two observations of one timer, taken around waits of
+            /// different lengths: each lies in the interval its own wait forces,
+            /// and the two differ. A timer that records a constant satisfies at
+            /// most one of the intervals and never the second check, whatever
+            /// constant it records.
+            fn assert_pair(name: &str, short: Self, long: Self) {
+                for observed in [short, long] {
                     assert!(
-                        recorded >= held.as_secs_f64() && recorded <= elapsed.as_secs_f64(),
-                        "the {name} timer recorded {recorded}s, expected between {held:?} and {elapsed:?}"
+                        observed.recorded >= observed.held.as_secs_f64()
+                            && observed.recorded <= observed.elapsed.as_secs_f64(),
+                        "the {name} timer recorded {}s around a wait of {:?}, expected at most {:?}",
+                        observed.recorded,
+                        observed.held,
+                        observed.elapsed
                     );
                 }
+                assert_ne!(
+                    short.recorded, long.recorded,
+                    "the {name} timer recorded one duration around waits of {:?} and {:?}",
+                    short.held, long.held
+                );
             }
         }
 
@@ -6798,6 +6833,11 @@ mod tests {
                     fault: "a fetch of a footer that fails at recovery",
                     row: None,
                     run: || Box::pin(footer_fetch_fails_at_recovery()),
+                },
+                Case {
+                    fault: "an object store that answers after a delay",
+                    row: None,
+                    run: || Box::pin(object_store_answers_slowly()),
                 },
                 Case {
                     fault: "a recovery the catalog rejects after every footer was fetched",
@@ -7038,23 +7078,19 @@ mod tests {
             );
 
             // The entry ids rolled back with the sequence, so the retry of the
-            // first entries writes the object the failed create did not. It is
-            // the one create of the matrix the case can hold for a known time,
-            // so it is where the two write-path timers are read for what they
-            // recorded and not only for how often.
-            const HELD: Duration = Duration::from_millis(50);
-            let timings = Timings::sample();
-            let started = Instant::now();
+            // first entries writes the object the failed create did not.
             let retry = spawn_appends(&store, region_id, 1).await;
-            let gate = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
-            tokio::time::sleep(HELD).await;
-            gate.send(true).unwrap();
+            timeout(WAIT, gates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .send(true)
+                .unwrap();
             let response = timeout(WAIT, retry.into_iter().next().unwrap())
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            Timings::assert_between(timings, HELD, started.elapsed());
             assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
             assert_eq!(vec![0], object_seqs(io.as_ref()).await);
             assert_eq!(
@@ -7789,6 +7825,103 @@ mod tests {
             store.stop().await.unwrap();
         }
 
+        /// The object store answers every request after a delay the case sets,
+        /// which is how the timers of recovery, of a read and of the write path
+        /// are read for the durations they recorded and not only for how many.
+        /// Each is observed around two delays, so that a duration that is
+        /// measured falls in the interval its delay forces and differs between
+        /// the two; a timer that records one value cannot do both.
+        async fn object_store_answers_slowly() {
+            const SHORT: Duration = Duration::from_millis(20);
+            const LONG: Duration = Duration::from_millis(120);
+            let object_store = memory_store();
+            let region_id = region(1);
+            put_object(&object_store, 0, region_id, &[id(0, 1)]).await;
+            let io = Arc::new(FaultyIo::over(object_store));
+            let before = Counters::sample();
+
+            let mut recoveries = Vec::new();
+            let mut reads = Vec::new();
+            let mut seals = Vec::new();
+            let mut acknowledgements = Vec::new();
+            for (delay, object_seq) in [(SHORT, 1), (LONG, 2)] {
+                io.answer_after_millis
+                    .store(delay.as_millis() as u64, Ordering::Relaxed);
+
+                let timer = timer_before(&METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS);
+                let started = Instant::now();
+                let store = ObjectStoreLogStore::open(io.clone(), &eager())
+                    .await
+                    .unwrap();
+                recoveries.push(Timed::since(
+                    &METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS,
+                    timer,
+                    delay,
+                    started.elapsed(),
+                ));
+
+                let timer = timer_before(&METRIC_OBJECT_STORE_WAL_READ_SECONDS);
+                let started = Instant::now();
+                assert_eq!(object_seq as usize, read(&store, region_id, 1).await.len());
+                reads.push(Timed::since(
+                    &METRIC_OBJECT_STORE_WAL_READ_SECONDS,
+                    timer,
+                    delay,
+                    started.elapsed(),
+                ));
+
+                let seal = timer_before(&METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS);
+                let acknowledgement = timer_before(&METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS);
+                let started = Instant::now();
+                append(&store, region_id, "a1").await.unwrap();
+                let elapsed = started.elapsed();
+                seals.push(Timed::since(
+                    &METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS,
+                    seal,
+                    delay,
+                    elapsed,
+                ));
+                acknowledgements.push(Timed::since(
+                    &METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS,
+                    acknowledgement,
+                    delay,
+                    elapsed,
+                ));
+
+                assert_eq!(
+                    (0..=object_seq).collect::<Vec<_>>(),
+                    object_seqs(io.as_ref()).await
+                );
+                store.stop().await.unwrap();
+            }
+            Timed::assert_pair("recovery", recoveries[0], recoveries[1]);
+            Timed::assert_pair("read", reads[0], reads[1]);
+            Timed::assert_pair("seal to durable", seals[0], seals[1]);
+            Timed::assert_pair(
+                "append acknowledgement",
+                acknowledgements[0],
+                acknowledgements[1],
+            );
+
+            io.answer_after_millis.store(0, Ordering::Relaxed);
+            assert_indexed(io.as_ref(), &[0, 1, 2]).await;
+            assert_eq!(
+                Counters {
+                    created_objects: 2,
+                    seal_to_durable: 2,
+                    sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
+                    acknowledged_appends: 2,
+                    recovered_objects: 3,
+                    recoveries: 2,
+                    reads: 2,
+                    ..Counters::default()
+                },
+                Counters::since(before)
+            );
+        }
+
         /// Every footer is fetched and the catalog then rejects the prefix,
         /// which is the other way a recovery is abandoned: the objects it read
         /// are counted as recovered no more than the ones a failed fetch left
@@ -7951,8 +8084,12 @@ mod tests {
                 max_unpersisted_bytes: ReadableSize(1),
                 ..enqueued(manual())
             };
+            const SHORT: Duration = Duration::from_millis(20);
+            const LONG: Duration = Duration::from_millis(120);
+            let region_id = region(1);
             let before = Counters::sample();
-            let (store, io, gates, stalled, gate) = stall_second_append(config).await;
+            let stalled_at = Instant::now();
+            let (store, io, mut gates, stalled, gate) = stall_second_append(config).await;
             assert_eq!(
                 Counters {
                     stalled_appends: 1,
@@ -7965,37 +8102,65 @@ mod tests {
                 Counters::since(before)
             );
 
-            // Stop releases the stalled append with the stopped error rather
-            // than admitting it, and the create it was waiting for succeeds.
+            // The first stalled append waits for the upload and is admitted,
+            // which is one of the two ways out of the queue.
+            let timer = timer_before(&METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS);
+            tokio::time::sleep(SHORT).await;
+            gate.send(true).unwrap();
+            timeout(WAIT, stalled).await.unwrap().unwrap().unwrap();
+            let admitted = Timed::since(
+                &METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS,
+                timer,
+                SHORT,
+                stalled_at.elapsed(),
+            );
+
+            // The admitted entry puts the backlog back at the threshold, so the
+            // next append stalls behind the upload it seals; the stop releases
+            // it with the stopped error instead, which is the other way out.
+            let stalled_at = Instant::now();
+            let refused = {
+                let store = store.clone();
+                tokio::spawn(async move { append(&store, region_id, "a3").await })
+            };
+            let sealed = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
+            let timer = timer_before(&METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS);
+            tokio::time::sleep(LONG).await;
             let stop = {
                 let store = store.clone();
                 tokio::spawn(async move { store.stop().await })
             };
-            wait_until(move || store.stopped.load(Ordering::Acquire)).await;
-            gate.send(true).unwrap();
-            let error = timeout(WAIT, stalled).await.unwrap().unwrap().unwrap_err();
+            let error = timeout(WAIT, refused).await.unwrap().unwrap().unwrap_err();
+            let held_back = Timed::since(
+                &METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS,
+                timer,
+                LONG,
+                stalled_at.elapsed(),
+            );
             assert!(
                 matches!(error, Error::ObjectStoreWalStopped { .. }),
                 "unexpected error: {error:?}"
             );
+            Timed::assert_pair("stalled append", admitted, held_back);
+
+            sealed.send(true).unwrap();
             timeout(WAIT, stop).await.unwrap().unwrap().unwrap();
-            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
-            assert_indexed(io.as_ref(), &[0]).await;
+            assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
+            assert_indexed(io.as_ref(), &[0, 1]).await;
             assert_eq!(
                 Counters {
-                    created_objects: 1,
-                    seal_to_durable: 1,
-                    sealed_objects: 1,
-                    object_bytes: one_entry_object(),
-                    object_entries: 1,
+                    created_objects: 2,
+                    seal_to_durable: 2,
+                    sealed_objects: 2,
+                    object_bytes: 2 * one_entry_object(),
+                    object_entries: 2,
                     recoveries: 1,
-                    stalled_appends: 1,
-                    stalled_waits: 1,
+                    stalled_appends: 2,
+                    stalled_waits: 2,
                     ..Counters::default()
                 },
                 Counters::since(before)
             );
-            drop(gates);
         }
     }
 }
