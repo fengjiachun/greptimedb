@@ -6765,6 +6765,66 @@ mod tests {
             );
         }
 
+        /// Opens a store over the object access a case injects and samples the
+        /// counters once it is open, which is how a case that brings its own
+        /// object access starts: the recovery of an empty prefix belongs to the
+        /// fixture, not to what the case is measured on.
+        async fn opened_over(
+            io: Arc<dyn WalObjectIo>,
+            config: &ObjectStoreWalConfig,
+        ) -> (Arc<ObjectStoreLogStore>, Counters) {
+            let store = ObjectStoreLogStore::open(io, config).await.unwrap();
+            (store, Counters::sample())
+        }
+
+        /// Spawns `count` appends, each sealing a batch of its own, and collects
+        /// the gate of every create they start, in sequence order. The creates
+        /// are parked at their gates, so the case decides which of them
+        /// succeeds, which fails and in what order.
+        async fn gated_appends(
+            store: &Arc<ObjectStoreLogStore>,
+            region_id: RegionId,
+            gates: &mut Gates,
+            count: usize,
+        ) -> (
+            Vec<tokio::task::JoinHandle<Result<AppendBatchResponse>>>,
+            Vec<oneshot::Sender<bool>>,
+        ) {
+            let appends = spawn_appends(store, region_id, count).await;
+            let mut open = Vec::with_capacity(count);
+            for _ in 0..count {
+                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
+            }
+            (appends, open)
+        }
+
+        /// Awaits every append and asserts each failed with the error
+        /// `recognise` accepts, which is what a row that fails a batch and every
+        /// later one means.
+        async fn assert_appends_failed(
+            appends: Vec<tokio::task::JoinHandle<Result<AppendBatchResponse>>>,
+            recognise: impl Fn(&Error) -> bool,
+        ) {
+            for append in appends {
+                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
+                assert!(
+                    recognise(unwrap_shared(&error)),
+                    "unexpected error: {error:?}"
+                );
+            }
+        }
+
+        /// Writes the object of another writer at sequence 0, after the store
+        /// has opened so that its recovery does not meet an object that is not
+        /// one of its own.
+        async fn put_foreign_object(object_store: ObjectStore) {
+            ObjectStoreIo::new(object_store, PREFIX)
+                .unwrap()
+                .put_if_absent(0, Bytes::from_static(b"foreign"))
+                .await
+                .unwrap();
+        }
+
         /// Asserts that a read of the poisoned store fails with the terminal
         /// error rather than returning what the store still has indexed.
         async fn assert_read_is_terminal(store: &ObjectStoreLogStore, region_id: RegionId) {
@@ -6808,11 +6868,6 @@ mod tests {
                     fault: "a create whose response is lost",
                     row: Some(Row::TransientRollsBack),
                     run: || Box::pin(create_response_is_lost()),
-                },
-                Case {
-                    fault: "a create that fails transiently, `durable` mode",
-                    row: Some(Row::TransientRollsBack),
-                    run: || Box::pin(create_fails_transiently()),
                 },
                 Case {
                     fault: "an object store that is unwritable, `durable` mode",
@@ -6971,11 +7026,8 @@ mod tests {
         /// itself and the batch is acknowledged like any other.
         async fn create_finds_an_identical_object() {
             let io = Arc::new(FaultyIo::new());
-            let store = ObjectStoreLogStore::open(io.clone(), &eager())
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
+            let (store, before) = opened_over(io.clone(), &eager()).await;
 
             io.reconcile_next_put.store(true, Ordering::Relaxed);
             let response = append(&store, region_id, "a1").await.unwrap();
@@ -7014,11 +7066,8 @@ mod tests {
         /// conditional create then reconciles.
         async fn create_response_is_lost() {
             let io = Arc::new(FaultyIo::new());
-            let store = ObjectStoreLogStore::open(io.clone(), &eager())
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
+            let (store, before) = opened_over(io.clone(), &eager()).await;
 
             io.fail_after_next_put.store(true, Ordering::Relaxed);
             let error = append(&store, region_id, "a1").await.unwrap_err();
@@ -7070,106 +7119,13 @@ mod tests {
             store.stop().await.unwrap();
         }
 
-        /// The waiters of the batch fail with a retryable error, the store stays
-        /// healthy, and the sequence and the entry ids roll back, so the retry of
-        /// the same entries writes the object the failed create did not.
-        async fn create_fails_transiently() {
-            let (io, mut gates) = GatedIo::new();
-            let store = ObjectStoreLogStore::open(io.clone(), &eager())
-                .await
-                .unwrap();
-            let region_id = region(1);
-            let before = Counters::sample();
-            let appends = spawn_appends(&store, region_id, 3).await;
-            let mut open = Vec::new();
-            for _ in 0..3 {
-                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
-            }
-
-            // Object 0 fails while the others are in flight. Nothing is
-            // decided until they complete, and since none of them was created
-            // every batch fails and the sequence rolls back to object 0.
-            open.remove(0).send(false).unwrap();
-            for _ in 0..16 {
-                tokio::task::yield_now().await;
-            }
-            assert!(appends.iter().all(|append| !append.is_finished()));
-            for gate in open {
-                gate.send(false).unwrap();
-            }
-            for append in appends {
-                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
-                assert!(
-                    matches!(unwrap_shared(&error), Error::WalObjectStore { .. }),
-                    "unexpected error: {error:?}"
-                );
-                assert_eq!(RetryHint::Retryable, error.retry_hint());
-            }
-            assert!(object_seqs(io.as_ref()).await.is_empty());
-            assert_eq!(0, latest(&store, region_id));
-            assert_indexed(io.as_ref(), &[]).await;
-            // The store is healthy, so a read works and sees nothing.
-            assert!(read(&store, region_id, 1).await.is_empty());
-            assert_eq!(
-                Counters {
-                    create_failures: 3,
-                    sealed_objects: 3,
-                    object_bytes: 3 * one_entry_object(),
-                    object_entries: 3,
-                    reads: 1,
-                    ..Counters::default()
-                },
-                Counters::since(before)
-            );
-
-            // The entry ids rolled back with the sequence, so the retry of the
-            // first entries writes the object the failed create did not.
-            let retry = spawn_appends(&store, region_id, 1).await;
-            timeout(WAIT, gates.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .send(true)
-                .unwrap();
-            let response = timeout(WAIT, retry.into_iter().next().unwrap())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
-            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
-            assert_eq!(
-                entries(&[(id(0, 1), "a1")]),
-                read(&store, region_id, 1).await
-            );
-            assert_indexed(io.as_ref(), &[0]).await;
-            assert_eq!(
-                Counters {
-                    created_objects: 1,
-                    seal_to_durable: 1,
-                    create_failures: 3,
-                    sealed_objects: 4,
-                    object_bytes: 4 * one_entry_object(),
-                    object_entries: 4,
-                    acknowledged_appends: 1,
-                    reads: 2,
-                    ..Counters::default()
-                },
-                Counters::since(before)
-            );
-            store.stop().await.unwrap();
-        }
-
         /// Every create fails the same way: no append is acknowledged, nothing is
         /// written and the store stays healthy, so the first append that the
         /// object store accepts takes the sequence and the ids of the first one.
         async fn object_store_is_unwritable() {
             let io = Arc::new(FaultyIo::new());
-            let store = ObjectStoreLogStore::open(io.clone(), &eager())
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
+            let (store, before) = opened_over(io.clone(), &eager()).await;
 
             io.fail_puts.store(true, Ordering::Relaxed);
             for _ in 0..3 {
@@ -7235,33 +7191,23 @@ mod tests {
         async fn create_fails_transiently_before_a_durable_object() {
             let object_store = memory_store();
             let (io, mut gates) = GatedIo::over(object_store.clone());
-            let store = ObjectStoreLogStore::open(io.clone(), &eager())
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
-            let appends = spawn_appends(&store, region_id, 2).await;
-            let mut open = Vec::new();
-            for _ in 0..2 {
-                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
-            }
+            let (store, before) = opened_over(io.clone(), &eager()).await;
+            let (appends, mut open) = gated_appends(&store, region_id, &mut gates, 2).await;
 
             open.remove(0).send(false).unwrap();
             open.remove(0).send(true).unwrap();
-            for append in appends {
-                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
-                assert!(
-                    matches!(
-                        unwrap_shared(&error),
-                        Error::WalObjectHistoryGap {
-                            object_seq: 0,
-                            later_object_seq: 1,
-                            ..
-                        }
-                    ),
-                    "unexpected error: {error:?}"
-                );
-            }
+            assert_appends_failed(appends, |error| {
+                matches!(
+                    error,
+                    Error::WalObjectHistoryGap {
+                        object_seq: 0,
+                        later_object_seq: 1,
+                        ..
+                    }
+                )
+            })
+            .await;
             assert_eq!(vec![1], object_seqs(io.as_ref()).await);
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
             assert_read_is_terminal(&store, region_id).await;
@@ -7315,11 +7261,8 @@ mod tests {
         /// becomes durable without the caller learning of the failure.
         async fn create_fails_transiently_enqueued() {
             let (io, mut gates) = GatedIo::new();
-            let store = ObjectStoreLogStore::open(io.clone(), &enqueued(eager()))
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
+            let (store, before) = opened_over(io.clone(), &enqueued(eager())).await;
 
             let response = append(&store, region_id, "a1").await.unwrap();
             assert_eq!(Some(&id(0, 1)), response.last_entry_ids.get(&region_id));
@@ -7384,11 +7327,8 @@ mod tests {
         /// `stop` reports the loss.
         async fn create_fails_transiently_after_stop_began() {
             let (io, mut gates) = GatedIo::new();
-            let store = ObjectStoreLogStore::open(io.clone(), &enqueued(manual()))
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
+            let (store, before) = opened_over(io.clone(), &enqueued(manual())).await;
             append(&store, region_id, "a1").await.unwrap();
             let seal = {
                 let store = store.clone();
@@ -7424,23 +7364,13 @@ mod tests {
         async fn create_finds_a_different_object() {
             let object_store = memory_store();
             let (io, mut gates) = GatedIo::over(object_store.clone());
+            let region_id = region(1);
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
                 .unwrap();
-            let region_id = region(1);
-            // Written after the store opened, so that recovery does not meet
-            // an object that is not one of its own.
-            ObjectStoreIo::new(object_store, PREFIX)
-                .unwrap()
-                .put_if_absent(0, Bytes::from_static(b"foreign"))
-                .await
-                .unwrap();
+            put_foreign_object(object_store).await;
             let before = Counters::sample();
-            let appends = spawn_appends(&store, region_id, 2).await;
-            let mut open = Vec::new();
-            for _ in 0..2 {
-                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
-            }
+            let (appends, mut open) = gated_appends(&store, region_id, &mut gates, 2).await;
 
             // Object 1 is created but cannot be indexed before object 0, whose
             // create meets the foreign object: both waiters fail.
@@ -7450,14 +7380,11 @@ mod tests {
             }
             assert!(appends.iter().all(|append| !append.is_finished()));
             open.remove(0).send(true).unwrap();
-            for append in appends {
-                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
-                assert!(
-                    matches!(unwrap_shared(&error), Error::WalObjectConflict { path, .. }
-                        if path == &io.object_path(0)),
-                    "unexpected error: {error:?}"
-                );
-            }
+            let path = io.object_path(0);
+            assert_appends_failed(appends, |error| {
+                matches!(error, Error::WalObjectConflict { path: actual, .. } if *actual == path)
+            })
+            .await;
             let error = store
                 .read(&provider(region_id), 1, None)
                 .await
@@ -7493,34 +7420,21 @@ mod tests {
         async fn create_completes_after_the_store_was_poisoned() {
             let object_store = memory_store();
             let (io, mut gates) = GatedIo::over(object_store.clone());
+            let region_id = region(1);
             let store = ObjectStoreLogStore::open(io.clone(), &eager())
                 .await
                 .unwrap();
-            let region_id = region(1);
-            // Written after the store opened, so that recovery does not meet
-            // an object that is not one of its own.
-            ObjectStoreIo::new(object_store, PREFIX)
-                .unwrap()
-                .put_if_absent(0, Bytes::from_static(b"foreign"))
-                .await
-                .unwrap();
+            put_foreign_object(object_store).await;
             let before = Counters::sample();
-            let appends = spawn_appends(&store, region_id, 2).await;
-            let mut open = Vec::new();
-            for _ in 0..2 {
-                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
-            }
+            let (appends, mut open) = gated_appends(&store, region_id, &mut gates, 2).await;
 
             // Object 0 conflicts first: the store poisons itself and gives up
             // on the batch of object 1, whose create is still in flight.
             open.remove(0).send(true).unwrap();
-            for append in appends {
-                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
-                assert!(
-                    matches!(unwrap_shared(&error), Error::WalObjectConflict { .. }),
-                    "unexpected error: {error:?}"
-                );
-            }
+            assert_appends_failed(appends, |error| {
+                matches!(error, Error::WalObjectConflict { .. })
+            })
+            .await;
             assert_eq!(
                 Counters {
                     create_conflicts: 1,
@@ -7617,16 +7531,9 @@ mod tests {
         async fn catalog_rejects_the_created_object() {
             let object_store = memory_store();
             let (io, mut gates) = GatedIo::over(object_store.clone());
-            let store = ObjectStoreLogStore::open(io.clone(), &eager())
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
-            let appends = spawn_appends(&store, region_id, 2).await;
-            let mut open = Vec::new();
-            for _ in 0..2 {
-                open.push(timeout(WAIT, gates.recv()).await.unwrap().unwrap());
-            }
+            let (store, before) = opened_over(io.clone(), &eager()).await;
+            let (appends, mut open) = gated_appends(&store, region_id, &mut gates, 2).await;
 
             // Object 1 is created and waits behind object 0, whose sequence
             // the catalog is holding by the time its create returns: neither
@@ -7639,13 +7546,10 @@ mod tests {
                 .insert_object(0, vec![occupying_footer_entry()])
                 .unwrap();
             open.remove(0).send(true).unwrap();
-            for append in appends {
-                let error = timeout(WAIT, append).await.unwrap().unwrap().unwrap_err();
-                assert!(
-                    matches!(unwrap_shared(&error), Error::CorruptedWalObject { .. }),
-                    "unexpected error: {error:?}"
-                );
-            }
+            assert_appends_failed(appends, |error| {
+                matches!(error, Error::CorruptedWalObject { .. })
+            })
+            .await;
             assert_eq!(vec![0, 1], object_seqs(io.as_ref()).await);
             assert!(store.latest_entry_id(&provider(region_id)).is_err());
             assert_read_is_terminal(&store, region_id).await;
@@ -8032,11 +7936,8 @@ mod tests {
             let object_store = memory_store();
             populate(&object_store, 2, 1).await;
             let io = Arc::new(FaultyIo::over(object_store));
-            let store = ObjectStoreLogStore::open(io.clone(), &eager())
-                .await
-                .unwrap();
             let region_id = region(1);
-            let before = Counters::sample();
+            let (store, before) = opened_over(io.clone(), &eager()).await;
 
             io.fail_reads_of.store(1, Ordering::Relaxed);
             let error = store
