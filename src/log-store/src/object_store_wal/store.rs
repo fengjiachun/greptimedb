@@ -8056,6 +8056,7 @@ mod tests {
             wait_until(|| Counters::since(before).stalled_waits == 1).await;
             drop(gate);
             assert!(object_seqs(io.as_ref()).await.is_empty());
+            assert_indexed(io.as_ref(), &[]).await;
             assert_eq!(
                 Counters {
                     stalled_appends: 1,
