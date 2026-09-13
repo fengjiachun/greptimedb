@@ -109,13 +109,16 @@ lazy_static! {
     .unwrap();
 
     /// How long an object of the object store logstore takes to become durable
-    /// once its batch is sealed, which is one conditional create.
+    /// once its batch is sealed, sampled for every conditional create that
+    /// succeeds, an identical retry included. The time runs from the seal, so
+    /// it includes any wait for a create slot and, in the `enqueued` mode,
+    /// every repeated attempt and the delay before it.
     ///
     /// A create is a few milliseconds on a local object store and tens of
     /// milliseconds on a cloud one, so the buckets start at 1ms and reach 8s.
     pub static ref METRIC_OBJECT_STORE_WAL_SEAL_TO_DURABLE_SECONDS: Histogram = register_histogram!(
         "greptime_logstore_object_store_wal_seal_to_durable_seconds",
-        "object store logstore seconds from sealing a batch to its object being durable",
+        "object store logstore seconds from sealing a batch to the success of its conditional create, slot waits and retries included",
         exponential_buckets(0.001, 2.0, 14).unwrap(),
     )
     .unwrap();
@@ -160,11 +163,13 @@ lazy_static! {
     )
     .unwrap();
 
-    /// Counter of objects the object store logstore created, an identical
-    /// retry included: the requests the write path spends on the object store.
+    /// Counter of conditional creates of the object store logstore that
+    /// succeeded, an identical retry that found its own object included. A
+    /// create that failed is counted in the create failure or conflict counter
+    /// instead.
     pub static ref METRIC_OBJECT_STORE_WAL_CREATED_OBJECTS_TOTAL: IntCounter = register_int_counter!(
         "greptime_logstore_object_store_wal_created_objects_total",
-        "object store logstore objects created total",
+        "object store logstore conditional creates that succeeded, identical retries included",
     )
     .unwrap();
 

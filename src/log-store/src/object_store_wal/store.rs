@@ -6657,10 +6657,17 @@ mod tests {
 
             /// Asserts the two observations of one timer, taken around waits of
             /// different lengths: each lies in the interval its own wait forces,
-            /// and the two differ. A timer that records a constant satisfies at
-            /// most one of the intervals and never the second check, whatever
-            /// constant it records.
+            /// and the long wait was held past everything the short observation
+            /// took, so the two intervals do not meet. A timer that records a
+            /// constant satisfies at most one of them, whatever constant it
+            /// records and however slow the machine is.
             fn assert_pair(name: &str, short: Self, long: Self) {
+                assert!(
+                    long.held > short.elapsed,
+                    "the {name} timer was observed around a long wait of {:?} that did not outlast the short observation's {:?}",
+                    long.held,
+                    short.elapsed
+                );
                 for observed in [short, long] {
                     assert!(
                         observed.recorded >= observed.held.as_secs_f64()
@@ -6671,11 +6678,6 @@ mod tests {
                         observed.elapsed
                     );
                 }
-                assert_ne!(
-                    short.recorded, long.recorded,
-                    "the {name} timer recorded one duration around waits of {:?} and {:?}",
-                    short.held, long.held
-                );
             }
         }
 
@@ -7777,12 +7779,12 @@ mod tests {
         /// The object store answers every request after a delay the case sets,
         /// which is how the timers of recovery, of a read and of the write path
         /// are read for the durations they recorded and not only for how many.
-        /// Each is observed around two delays, so that a duration that is
-        /// measured falls in the interval its delay forces and differs between
-        /// the two; a timer that records one value cannot do both.
+        /// Each is observed around two delays, the second longer than anything
+        /// the first observations took, so that a duration that is measured
+        /// falls in the interval its delay forces and a timer that records one
+        /// value cannot fall in both.
         async fn object_store_answers_slowly() {
             const SHORT: Duration = Duration::from_millis(20);
-            const LONG: Duration = Duration::from_millis(120);
             let object_store = memory_store();
             let region_id = region(1);
             put_object(&object_store, 0, region_id, &[id(0, 1)]).await;
@@ -7793,9 +7795,20 @@ mod tests {
             let mut reads = Vec::new();
             let mut seals = Vec::new();
             let mut acknowledgements = Vec::new();
-            for (delay, object_seq) in [(SHORT, 1), (LONG, 2)] {
+            for object_seq in 1..=2 {
+                let delay = match object_seq {
+                    1 => SHORT,
+                    _ => {
+                        [&recoveries, &reads, &seals, &acknowledgements]
+                            .iter()
+                            .map(|observed: &&Vec<Timed>| observed[0].elapsed)
+                            .max()
+                            .unwrap()
+                            + SHORT
+                    }
+                };
                 io.answer_after_millis
-                    .store(delay.as_millis() as u64, Ordering::Relaxed);
+                    .store(delay.as_millis() as u64 + 1, Ordering::Relaxed);
 
                 let timer = timer_before(&METRIC_OBJECT_STORE_WAL_RECOVERY_SECONDS);
                 io.forget_waits();
@@ -8083,7 +8096,6 @@ mod tests {
                 ..enqueued(manual())
             };
             const SHORT: Duration = Duration::from_millis(20);
-            const LONG: Duration = Duration::from_millis(120);
             let region_id = region(1);
             let before = Counters::sample();
             let stalled_at = Instant::now();
@@ -8126,7 +8138,7 @@ mod tests {
             let sealed = timeout(WAIT, gates.recv()).await.unwrap().unwrap();
             let timer = timer_before(&METRIC_OBJECT_STORE_WAL_STALLED_APPEND_SECONDS);
             let holding_since = Instant::now();
-            tokio::time::sleep(LONG).await;
+            tokio::time::sleep(admitted.elapsed + SHORT).await;
             let held = holding_since.elapsed();
             let stop = {
                 let store = store.clone();
