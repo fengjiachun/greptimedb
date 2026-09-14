@@ -167,17 +167,17 @@ impl ObjectCatalog {
         Ok(())
     }
 
-    /// Removes the object `object_seq` from the index once it was deleted.
-    /// The largest entry id of every region it held is kept.
-    pub(super) fn remove_object(&mut self, object_seq: u64) {
-        let Some(footer) = self.objects.remove(&object_seq) else {
-            return;
-        };
-        for entry in footer {
+    /// Removes the object `object_seq` from the index once it was deleted and
+    /// returns the footer it held, or `None` if it was not indexed. The
+    /// largest entry id of every region it held is kept.
+    pub(super) fn remove_object(&mut self, object_seq: u64) -> Option<Vec<FooterEntry>> {
+        let footer = self.objects.remove(&object_seq)?;
+        for entry in &footer {
             if let Some(region) = self.regions.get_mut(&entry.region_id) {
                 region.objects.remove(&object_seq);
             }
         }
+        Some(footer)
     }
 
     /// Returns true while the object `object_seq` is indexed.
