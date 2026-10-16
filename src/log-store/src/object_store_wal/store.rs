@@ -121,18 +121,22 @@ const MAX_SEALED_BATCHES: usize = 2 * MAX_IN_FLIGHT_CREATES;
 /// or is the floor object of a raise whose object was never indexed, which
 /// holds no entry.
 pub const UNLISTED_SEQUENCES: u64 = MAX_SEALED_BATCHES as u64;
-/// How long after an open a late object of an earlier instance can still
-/// land at a sequence the start object skipped, see [`UNLISTED_SEQUENCES`]:
-/// a create of that instance completes or fails within the timeouts and
-/// retries of its object store client, about two minutes with the defaults.
-const LATE_OBJECT_WINDOW: Duration = Duration::from_secs(300);
-/// How often the collections within [`LATE_OBJECT_WINDOW`] delete the
-/// skipped sequences again, since the delete of an absent object succeeds
-/// and a late object can land at its sequence afterwards.
+/// How long after an open, or after the last recheck, the collections delete
+/// the sequences the start object skipped again, see [`UNLISTED_SEQUENCES`]:
+/// the delete of an absent object succeeds, and a late object of an earlier
+/// instance can land at its sequence afterwards, at any time, since nothing
+/// bounds when a write that its client gave up on completes. The interval
+/// doubles after every recheck up to [`MAX_LATE_OBJECT_RECHECK`], so the
+/// rechecks of a store cost a few deletes an hour once it has run a while.
 #[cfg(not(test))]
 const LATE_OBJECT_RECHECK: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const LATE_OBJECT_RECHECK: Duration = Duration::from_millis(50);
+/// Longest interval between two rechecks of the skipped sequences.
+#[cfg(not(test))]
+const MAX_LATE_OBJECT_RECHECK: Duration = Duration::from_secs(3600);
+#[cfg(test)]
+const MAX_LATE_OBJECT_RECHECK: Duration = Duration::from_millis(100);
 /// Number of objects whose footers recovery fetches at a time. On S3 an
 /// object costs two reads, its header and its tail, tens of milliseconds per
 /// lane however many vCPUs the node has, and recovery time scales with objects
@@ -533,7 +537,7 @@ impl ObjectStoreLogStore {
                 .collect(),
             skipped: (next_object_seq < start_object_seq).then(|| SkippedSequences {
                 sequences: next_object_seq..start_object_seq,
-                until: Instant::now() + LATE_OBJECT_WINDOW,
+                interval: LATE_OBJECT_RECHECK,
                 next_check: Instant::now() + LATE_OBJECT_RECHECK,
             }),
             rechecked: HashSet::new(),
@@ -1671,18 +1675,18 @@ impl SealedBatch {
 
 type CreateOutcome = (u64, Result<PutResult>);
 
-/// Whether the store gave up its start object, see
-/// [`Actor::handle_withdraw`].
 /// The sequences the start object skipped, which a late object of an
-/// earlier instance can still take, see [`LATE_OBJECT_WINDOW`].
+/// earlier instance can still take, see [`LATE_OBJECT_RECHECK`].
 struct SkippedSequences {
     sequences: std::ops::Range<u64>,
-    /// When the collections stop deleting them again.
-    until: Instant,
+    /// How long after the last recheck a collection deletes them again.
+    interval: Duration,
     /// When a collection deletes them again next.
     next_check: Instant,
 }
 
+/// Whether the store gave up its start object, see
+/// [`Actor::handle_withdraw`].
 enum Withdrawal {
     Kept,
     /// The delete of the start object `object_seq` is in flight; `waiters`
@@ -1856,8 +1860,8 @@ struct Actor {
     /// objects recovery listed off the chain, the sequences the start object
     /// skipped and the batches a stop gave up.
     unindexed: BTreeSet<u64>,
-    /// The sequences the start object skipped, while collections still
-    /// delete them again, see [`LATE_OBJECT_WINDOW`].
+    /// The sequences the start object skipped, which collections delete
+    /// again, see [`LATE_OBJECT_RECHECK`].
     skipped: Option<SkippedSequences>,
     /// Skipped sequences whose delete a recheck started, which is not counted
     /// as a deleted object: most of them hold none.
@@ -3036,9 +3040,9 @@ impl Actor {
     }
 
     /// Makes the collection delete the sequences the start object skipped
-    /// again, at most every [`LATE_OBJECT_RECHECK`] and only within
-    /// [`LATE_OBJECT_WINDOW`] of the open, so that a late object that landed
-    /// after the delete of its absent sequence is collected too.
+    /// again once their recheck interval passed, so that a late object that
+    /// landed after the delete of its absent sequence is collected too, see
+    /// [`LATE_OBJECT_RECHECK`].
     fn recheck_skipped_sequences(&mut self) {
         let Some(skipped) = &mut self.skipped else {
             return;
@@ -3047,12 +3051,9 @@ impl Actor {
         if now < skipped.next_check {
             return;
         }
-        skipped.next_check = now + LATE_OBJECT_RECHECK;
-        let sequences = skipped.sequences.clone();
-        if now >= skipped.until {
-            self.skipped = None;
-        }
-        for object_seq in sequences {
+        skipped.interval = (skipped.interval * 2).min(MAX_LATE_OBJECT_RECHECK);
+        skipped.next_check = now + skipped.interval;
+        for object_seq in skipped.sequences.clone() {
             if self.unindexed.insert(object_seq) {
                 self.rechecked.insert(object_seq);
             }
@@ -3256,8 +3257,8 @@ impl Actor {
     }
 
     /// Answers the callers of `stop` once every sealed batch is settled and
-    /// every create and delete has completed. Returns true when the actor is
-    /// done.
+    /// every create and delete has completed or was abandoned at the stop
+    /// deadline. Returns true when the actor is done.
     fn finish_stop(&mut self) -> bool {
         if self.stop.is_empty()
             || !self.sealed.is_empty()
@@ -9816,7 +9817,7 @@ mod tests {
 
     /// A late object of an earlier instance that lands at a skipped sequence
     /// after a collection deleted that absent sequence is collected by a
-    /// later collection.
+    /// later collection, however long after the open it lands.
     #[tokio::test]
     async fn test_store_collects_a_late_object_landing_after_its_absent_delete() {
         let _serialized = SERIALIZED.lock().await;
@@ -9839,22 +9840,25 @@ mod tests {
         append(&store, other, "b1").await.unwrap();
         assert_eq!(vec![start_seq + 2], collected_object_seqs(&store).await);
 
-        // An object of the earlier instance lands at a skipped sequence, and
-        // a collection after the recheck interval deletes it.
-        let late_seq = 5;
-        put_object_with_header(
-            &io,
-            chain_header(late_seq, 1, Some((late_seq - 1, 1))),
-            &[Record {
-                region_id: writer,
-                entry_id: id(late_seq, 1),
-                payload: Bytes::from_static(b"late"),
-            }],
-        )
-        .await;
-        tokio::time::sleep(LATE_OBJECT_RECHECK * 2).await;
-        store.obsolete(&provider(other), other, 0).await.unwrap();
-        assert_eq!(vec![start_seq + 2], collected_object_seqs(&store).await);
+        // Objects of the earlier instance land at skipped sequences, one after
+        // the other, each once the interval of the rechecks reached its
+        // longest, and a collection after the next recheck deletes each.
+        for late_seq in [5, 3, 8] {
+            tokio::time::sleep(MAX_LATE_OBJECT_RECHECK * 2).await;
+            put_object_with_header(
+                &io,
+                chain_header(late_seq, 1, Some((late_seq - 1, 1))),
+                &[Record {
+                    region_id: writer,
+                    entry_id: id(late_seq, 1),
+                    payload: Bytes::from_static(b"late"),
+                }],
+            )
+            .await;
+            tokio::time::sleep(MAX_LATE_OBJECT_RECHECK * 2).await;
+            store.obsolete(&provider(other), other, 0).await.unwrap();
+            assert_eq!(vec![start_seq + 2], collected_object_seqs(&store).await);
+        }
         store.stop().await.unwrap();
     }
 
