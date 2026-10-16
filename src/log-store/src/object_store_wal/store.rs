@@ -1769,7 +1769,9 @@ impl Failing {
 /// A create still in flight when its batch failed runs to completion and its
 /// outcome is ignored: whatever it stored is off the chain. After `stop`
 /// began nothing is admitted, and the backlog is uploaded at once, a failing
-/// store's included; creates in flight run to completion.
+/// store's included; creates and deletes in flight run to completion unless
+/// they are still in flight `max_unpersisted_age` after the stop began, when
+/// they are abandoned, see [`Actor::on_stop_deadline`].
 ///
 /// Appends arrive on their own channel. The actor holds one back while the
 /// sealed batches leave no room for the two an admission can seal, at a
@@ -1788,7 +1790,7 @@ impl Failing {
 /// unindexed once its delete succeeded; a failed delete is attempted again at
 /// the next collection. Nothing is
 /// collected once stop began or the store is poisoned, and deletes in flight
-/// complete before `stop` returns.
+/// complete before `stop` returns unless the stop deadline abandons them.
 struct Actor {
     io: Arc<dyn WalObjectIo>,
     started_regions: StartedRegions,
@@ -2524,9 +2526,12 @@ impl Actor {
     /// deadline does not depend on what the creates of the batch did, so a
     /// run of transient failures and a create that never answers are both
     /// bounded. `None` while the store is failing, after stop began, which
-    /// gives every batch one more attempt, and once it is terminal.
+    /// gives every batch one more attempt, and while no batch is pending.
     fn transient_deadline(&self) -> Option<Instant> {
-        if self.failing.is_some() || self.is_stopped() || terminal(&self.terminal_error).is_some() {
+        // A store that poisoned itself or dropped its backlog keeps no sealed
+        // batch, while one that exhausted its sequences still uploads the
+        // batches it sealed.
+        if self.failing.is_some() || self.is_stopped() {
             return None;
         }
         let front = self.sealed.front()?;
@@ -2765,8 +2770,8 @@ impl Actor {
         error
     }
 
-    /// Drops the entries of the open batch; the next admission hands out the
-    /// same ids again under the sequence the batch is at.
+    /// Drops the entries of the open batch when the store gives its backlog
+    /// up, which records the error every later wait for them meets.
     fn reset_open_batch(&mut self) {
         self.open_batch.reset();
         self.open_admitted_at.clear();
@@ -7606,6 +7611,45 @@ mod tests {
                 "unexpected error: {error:?}"
             );
         }
+        store.stop().await.unwrap();
+    }
+
+    /// A store that took the last sequence still uploads the batch it sealed
+    /// there under the bound of a transient run: a writer waiting for it is
+    /// answered with an error once the batch is not durable within
+    /// `max_unpersisted_age`, while a durability barrier keeps waiting until
+    /// the create completes.
+    #[tokio::test]
+    async fn test_store_bounds_the_writers_of_the_last_sequence() {
+        let _serialized = SERIALIZED.lock().await;
+        let object_store = memory_store();
+        let last = OBJECT_SEQ_LIMIT - 1;
+        let listed = last - 2 - UNLISTED_SEQUENCES;
+        put_object(&object_store, listed, region(1), &[id(listed, 1)]).await;
+        let config = ObjectStoreWalConfig {
+            max_unpersisted_age: Duration::from_millis(200),
+            ..eager()
+        };
+        let (store, _io, mut parked) = open_parking_creates(object_store, &config).await;
+        let region_id = region(1);
+        let response = store
+            .append_batch(vec![entry(&store, region_id, "last")])
+            .await
+            .unwrap();
+        assert_eq!(Some(&id(last, 1)), response.last_entry_ids.get(&region_id));
+        let (object_seq, release) = next_parked_operation(&mut parked).await;
+        assert_eq!(last, object_seq);
+
+        let writer = spawn_wait(&store, region_id, id(last, 1), WaitKind::Write);
+        let barrier = spawn_wait(&store, region_id, id(last, 1), WaitKind::Barrier);
+        let error = timeout(WAIT, writer).await.unwrap().unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStoreWalFailing { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(!barrier.is_finished());
+        release.send(true).unwrap();
+        timeout(WAIT, barrier).await.unwrap().unwrap().unwrap();
         store.stop().await.unwrap();
     }
 
