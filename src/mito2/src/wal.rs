@@ -97,6 +97,17 @@ impl DurabilityBarrier {
             failing: Arc::new(|| true),
         }
     }
+
+    /// A barrier that waits as `wait` does, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_fn(
+        wait: impl Fn(EntryId) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            wait: Arc::new(wait),
+            failing: Arc::new(|| false),
+        }
+    }
 }
 
 impl std::fmt::Debug for DurabilityBarrier {
@@ -190,6 +201,36 @@ impl<S: LogStore> Wal<S> {
             }),
             failing: Arc::new(move || failing_store.is_failing()),
         }
+    }
+
+    /// Returns the barrier a write to the region waits on before its writers
+    /// are answered, or `None` when the log store answers an append only once
+    /// its entries have the persistence of an acknowledged write.
+    pub(crate) fn write_ack_barrier(
+        &self,
+        region_id: RegionId,
+        provider: &Provider,
+    ) -> Option<DurabilityBarrier> {
+        if !self.store.defers_write_durability() {
+            return None;
+        }
+        let store = self.store.clone();
+        let failing_store = self.store.clone();
+        let provider = provider.clone();
+        Some(DurabilityBarrier {
+            wait: Arc::new(move |entry_id| {
+                let store = store.clone();
+                let provider = provider.clone();
+                Box::pin(async move {
+                    store
+                        .wait_write_durable(&provider, entry_id)
+                        .await
+                        .map_err(BoxedError::new)
+                        .context(WaitWalDurableSnafu { region_id })
+                })
+            }),
+            failing: Arc::new(move || failing_store.is_failing()),
+        })
     }
 
     /// Checks that the log store holds the WAL history of the region through

@@ -359,15 +359,13 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "WAL object {} was written by the earlier epoch {}, this store writes epoch {}",
+        "WAL object {} did not become durable within {:?} of being sealed",
         path,
-        existing_epoch,
-        epoch
+        bound
     ))]
-    StaleWalObject {
+    WalObjectUnconfirmed {
         path: String,
-        existing_epoch: u64,
-        epoch: u64,
+        bound: std::time::Duration,
         #[snafu(implicit)]
         location: Location,
     },
@@ -541,7 +539,7 @@ impl ErrorExt for Error {
 
             // Object store related errors
             WalObjectStore { .. }
-            | StaleWalObject { .. }
+            | WalObjectUnconfirmed { .. }
             | UnconfirmedWalEpochStart { .. }
             | Io { .. } => StatusCode::StorageUnavailable,
             // Raft engine
@@ -576,7 +574,7 @@ impl ErrorExt for Error {
             | RaftEngine { .. }
             | AddEntryLogBatch { .. }
             | WalObjectSequenceUnsettled { .. }
-            | StaleWalObject { .. }
+            | WalObjectUnconfirmed { .. }
             | UnconfirmedWalEpochStart { .. }
             | ObjectStoreWalFailing { .. } => RetryHint::Retryable,
             ProduceRecord { error, .. } => match error {

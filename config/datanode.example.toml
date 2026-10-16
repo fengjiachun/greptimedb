@@ -233,23 +233,24 @@ overwrite_entry_start_id = false
 
 ## The interval of flushing buffered entries to the object store, at least `10ms`, defaults to `100ms`.
 ## Each non-empty timer-triggered flush creates one object, and a batch that reaches `max_batch_bytes` is flushed immediately, so the batch seals on size only when the admitted bytes reach `max_batch_bytes` before the next timer tick; otherwise it seals on the timer, whatever the load.
-## When writes are sparse, a shorter interval lowers the acknowledgement latency of `durable` appends and raises the number of object requests: timer-triggered sealing creates at most one object per interval per node, and in `enqueued` mode the backlog thresholds can seal earlier. An `enqueued` append does not wait for its batch to seal once it is admitted, but the backlog thresholds can delay admission.
+## When writes are sparse, a shorter interval lowers the answer latency of `durable` writes and raises the number of object requests: timer-triggered sealing creates at most one object per interval per node, and the backlog thresholds can seal earlier. An `enqueued` write does not wait for its batch to seal once it is admitted, but the backlog thresholds can delay admission.
 ## **It's only used when the provider is `experimental_object_store`**.
 #+ flush_interval = "100ms"
 
-## When an append to the object store WAL returns.
-## - `durable`: an append returns after the object holding its entries is durable (the default).
-## - `enqueued`: an append returns once its entries are admitted and their ids are assigned, and the object is created in the background. A crash loses the unpersisted backlog.
+## When a write through the object store WAL is answered. In both modes the WAL admits the write's entries at once, the write is applied to the memtable, and the objects are created in the background.
+## - `durable`: the write is answered once the object holding its entries is durable (the default). Reads can return its rows before that, and a crash before that loses them. A write answered with an error after it was admitted is already applied: its rows stay only if its entries become durable or a flush persists them before a restart, so retrying it can duplicate rows in append-mode tables.
+## - `enqueued`: the write is answered once it is applied. A crash loses the unpersisted backlog.
 ## **It's only used when the provider is `experimental_object_store`**.
 #+ ack_mode = "durable"
 
-## The size of the unpersisted backlog at which new appends stall until an upload completes, in `enqueued` mode.
-## Nothing is dropped and nothing is rejected; the threshold does not bound what a crash during an outage can lose.
-## **It's only used when the provider is `experimental_object_store` and `ack_mode` is `enqueued`**.
+## The size of the unpersisted backlog at which new appends are held back until an upload completes.
+## Nothing is dropped; the threshold does not bound what a crash during an outage can lose.
+## **It's only used when the provider is `experimental_object_store`**.
 #+ max_unpersisted_bytes = "64MB"
 
-## The age of the oldest unpersisted entry at which new appends stall until an upload completes, in `enqueued` mode.
-## **It's only used when the provider is `experimental_object_store` and `ack_mode` is `enqueued`**.
+## The age of the oldest unpersisted entry at which new appends are held back until an upload completes.
+## It also bounds how long the object store may take to confirm the oldest sealed object: past it, `durable` writes waiting for their objects are answered with an error and new appends are rejected until a create succeeds, while the backlog is kept and uploaded again.
+## **It's only used when the provider is `experimental_object_store`**.
 #+ max_unpersisted_age = "8s"
 
 ## What a read does with a segment that still does not decode after a second fetch, because its checksum does not match or its content disagrees with its footer entry.

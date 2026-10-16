@@ -79,4 +79,6 @@ mod io;
 mod store;
 
 pub use batch::entry_id;
+#[cfg(any(test, feature = "testing"))]
+pub use store::UNLISTED_SEQUENCES;
 pub use store::{ObjectStoreLogStore, WalHole};

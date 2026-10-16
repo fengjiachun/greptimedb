@@ -174,6 +174,8 @@ impl MetricEngineInner {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use api::v1::Rows;
     use common_wal::config::object_store::{ObjectStoreWalConfig, STANDALONE_GENERATION};
     use common_wal::options::{ObjectStoreWalOptions, WAL_OPTIONS_KEY, WalOptions};
@@ -201,10 +203,15 @@ mod tests {
     /// How the WAL releases of the dropped regions fail.
     #[derive(Clone, Copy, PartialEq)]
     enum ReleaseFailure {
-        /// The release of the data region fails transiently.
-        Data,
-        /// The releases of the data and the metadata region fail transiently.
-        Both,
+        /// The create of the data region's release record reports a
+        /// transient error after it wrote the object; the repeated create
+        /// finds the object and the release succeeds.
+        LostResponse,
+        /// Every create fails transiently: the data region's release record
+        /// does not become durable within `max_unpersisted_age`, which fails
+        /// its release and makes the WAL failing, so the metadata region's
+        /// release fails at once.
+        Refused,
         /// The release of the data region meets a conflicting object, which
         /// poisons the WAL, so the cleanup of the metadata region fails too.
         Conflict,
@@ -213,12 +220,15 @@ mod tests {
     #[tokio::test]
     async fn test_drop_physical_region_whose_wal_release_fails() {
         for failure in [
-            ReleaseFailure::Data,
-            ReleaseFailure::Both,
+            ReleaseFailure::LostResponse,
+            ReleaseFailure::Refused,
             ReleaseFailure::Conflict,
         ] {
             let object_store = ObjectStore::new(Memory::default()).unwrap();
-            let config = ObjectStoreWalConfig::default();
+            let config = ObjectStoreWalConfig {
+                max_unpersisted_age: Duration::from_millis(500),
+                ..Default::default()
+            };
             let open_wal = || {
                 ObjectStoreLogStore::try_new(
                     object_store.clone(),
@@ -272,10 +282,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            // The drop still removes both regions and the physical region state.
+            // The drop is answered within `max_unpersisted_age` and still
+            // removes both regions and the physical region state.
             match failure {
-                ReleaseFailure::Data => wal.fail_next_create_after_write(),
-                ReleaseFailure::Both => wal.fail_creates(),
+                ReleaseFailure::LostResponse => wal.fail_next_create_after_write(),
+                ReleaseFailure::Refused => wal.fail_creates(),
                 ReleaseFailure::Conflict => {
                     // A copy of the last object, of the same epoch, takes the
                     // sequence of the next one.
@@ -293,10 +304,13 @@ mod tests {
                     object_store.write(&path(last + 1), copy).await.unwrap();
                 }
             }
-            metric
-                .handle_request(region_id, drop_request())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                metric.handle_request(region_id, drop_request()),
+            )
+            .await
+            .expect("the drop must not wait for the WAL past its bound")
+            .unwrap();
             assert!(!env.mito().is_region_exists(to_data_region_id(region_id)));
             assert!(
                 !env.mito()

@@ -126,6 +126,36 @@ pub trait LogStore: Send + Sync + 'static + std::fmt::Debug {
     /// The default does nothing.
     fn begin_drain(&self) {}
 
+    /// Returns whether `append_batch` returns before the appended entries have
+    /// the persistence this log store guarantees for an acknowledged write,
+    /// so that the caller must wait with
+    /// [`wait_write_durable`](Self::wait_write_durable) before it answers the
+    /// writer.
+    ///
+    /// The default returns false, which keeps the behaviour of every log store
+    /// that does not override it.
+    fn defers_write_durability(&self) -> bool {
+        false
+    }
+
+    /// Waits until every entry of the provider's region with an id at or below
+    /// `entry_id` has the persistence this log store guarantees for an
+    /// acknowledged write, for a writer that is answered only then, see
+    /// [`defers_write_durability`](Self::defers_write_durability). Unlike
+    /// [`wait_durable`](Self::wait_durable), whose callers can wait as long as
+    /// the persistence takes, a log store may fail this wait once it cannot
+    /// make the entries durable within a bound, since the writer has to be
+    /// answered.
+    ///
+    /// The default waits with [`wait_durable`](Self::wait_durable).
+    async fn wait_write_durable(
+        &self,
+        provider: &Provider,
+        entry_id: EntryId,
+    ) -> Result<(), Self::Error> {
+        self.wait_durable(provider, entry_id).await
+    }
+
     /// Releases every entry of a region the caller dropped, after `obsolete`
     /// marked them obsolete, so that the log store keeps none of them even
     /// across a restart, which never opens the region again to mark its

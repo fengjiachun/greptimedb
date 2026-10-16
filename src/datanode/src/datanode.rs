@@ -167,6 +167,12 @@ impl Datanode {
                     .context(ShutdownInstanceSnafu),
             );
         }
+        // The WAL stops admitting before the regions close, which answers the
+        // writes and releases it holds back, and keeps uploading its backlog
+        // while the engines stop.
+        if let Some(log_store) = &self.object_store_log_store {
+            log_store.begin_stop().await;
+        }
         record_shutdown_error(&mut first_error, self.region_server.stop().await);
         if let Some(log_store) = &self.object_store_log_store {
             record_shutdown_error(
@@ -1096,6 +1102,7 @@ mod tests {
     };
     use crate::error::{self, Error};
     use crate::region_query::DatanodeRegionQueryHandler;
+    use crate::region_server::RegionServer;
     use crate::tests::{MockRegionEngine, mock_region_server};
 
     const WAIT: Duration = Duration::from_secs(30);
@@ -1584,20 +1591,18 @@ mod tests {
         assert!(is_stopped(log_store).await);
     }
 
-    /// Builds a datanode on an `enqueued` object store WAL, whose creates fail
-    /// from now on if `failing`, and creates a region on it with `rows`
-    /// written through the WAL and `skipped_rows` written past it. Returns the
-    /// datanode, its log store and the region.
+    /// Builds a datanode on an object store WAL with `config` and creates a
+    /// region on it. Returns the datanode, its log store, the region and its
+    /// row schema.
     async fn datanode_with_object_store_wal(
         data_home: &str,
-        rows: usize,
-        skipped_rows: usize,
-        failing: bool,
-    ) -> (Datanode, Arc<ObjectStoreLogStore>, RegionId) {
-        let config = ObjectStoreWalConfig {
-            ack_mode: AckMode::Enqueued,
-            ..Default::default()
-        };
+        config: ObjectStoreWalConfig,
+    ) -> (
+        Datanode,
+        Arc<ObjectStoreLogStore>,
+        RegionId,
+        Vec<api::v1::ColumnSchema>,
+    ) {
         let prefix = config.node_prefix(0, STANDALONE_GENERATION);
         let datanode = object_store_wal_builder(data_home, config)
             .build()
@@ -1617,7 +1622,50 @@ mod tests {
             .handle_request(region_id, RegionRequest::Create(request))
             .await
             .unwrap();
+        (datanode, log_store, region_id, schema)
+    }
 
+    /// Writes rows `range` to the region, through the WAL unless `skip_wal`.
+    async fn put_rows(
+        region_server: RegionServer,
+        region_id: RegionId,
+        schema: Vec<api::v1::ColumnSchema>,
+        range: std::ops::Range<usize>,
+        skip_wal: bool,
+    ) -> error::Result<()> {
+        region_server
+            .handle_request(
+                region_id,
+                RegionRequest::Put(RegionPutRequest {
+                    rows: Rows {
+                        schema,
+                        rows: build_rows(range.start, range.end),
+                    },
+                    skip_wal,
+                    hint: None,
+                    partition_expr_version: None,
+                }),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// Builds a datanode on an `enqueued` object store WAL, whose creates fail
+    /// from now on if `failing`, and creates a region on it with `rows`
+    /// written through the WAL and `skipped_rows` written past it. Returns the
+    /// datanode, its log store and the region.
+    async fn datanode_with_enqueued_wal(
+        data_home: &str,
+        rows: usize,
+        skipped_rows: usize,
+        failing: bool,
+    ) -> (Datanode, Arc<ObjectStoreLogStore>, RegionId) {
+        let config = ObjectStoreWalConfig {
+            ack_mode: AckMode::Enqueued,
+            ..Default::default()
+        };
+        let (datanode, log_store, region_id, schema) =
+            datanode_with_object_store_wal(data_home, config).await;
         if failing {
             log_store.fail_creates();
         }
@@ -1625,21 +1673,15 @@ mod tests {
             if range.is_empty() {
                 continue;
             }
-            region_server
-                .handle_request(
-                    region_id,
-                    RegionRequest::Put(RegionPutRequest {
-                        rows: Rows {
-                            schema: schema.clone(),
-                            rows: build_rows(range.start, range.end),
-                        },
-                        skip_wal,
-                        hint: None,
-                        partition_expr_version: None,
-                    }),
-                )
-                .await
-                .unwrap();
+            put_rows(
+                datanode.region_server(),
+                region_id,
+                schema.clone(),
+                range,
+                skip_wal,
+            )
+            .await
+            .unwrap();
         }
         (datanode, log_store, region_id)
     }
@@ -1652,7 +1694,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
         let data_home = create_temp_dir("object-store-wal-shutdown-flush");
         let (mut datanode, log_store, region_id) =
-            datanode_with_object_store_wal(data_home.path().to_str().unwrap(), 3, 0, true).await;
+            datanode_with_enqueued_wal(data_home.path().to_str().unwrap(), 3, 0, true).await;
         let flush = {
             let region_server = datanode.region_server();
             tokio::spawn(async move {
@@ -1676,8 +1718,68 @@ mod tests {
             format!("{err:?}").contains("injected create failure"),
             "{err:?}"
         );
-        let flush_err = flush.await.unwrap().unwrap_err();
-        assert_eq!(StatusCode::Cancelled, flush_err.status_code());
+        // The flush is cancelled, or fails with the stopped log store if that
+        // dropped the backlog first.
+        flush.await.unwrap().unwrap_err();
+        assert!(is_stopped(&log_store).await);
+    }
+
+    /// A `durable` write held back in admission, because the backlog that
+    /// keeps failing to upload is at `max_unpersisted_bytes`, blocks its
+    /// region worker. The shutdown answers it before the regions close
+    /// instead of waiting for `max_unpersisted_age`, and answers the write
+    /// whose object the stop drops with an error.
+    #[tokio::test]
+    async fn test_shutdown_while_a_write_is_held_back_in_admission() {
+        common_telemetry::init_default_ut_logging();
+        let data_home = create_temp_dir("object-store-wal-shutdown-held-back");
+        let config = ObjectStoreWalConfig {
+            ack_mode: AckMode::Durable,
+            max_unpersisted_bytes: ReadableSize(1),
+            max_unpersisted_age: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let (mut datanode, log_store, region_id, schema) =
+            datanode_with_object_store_wal(data_home.path().to_str().unwrap(), config).await;
+        log_store.fail_creates();
+        let spawn_put = |range| {
+            tokio::spawn(put_rows(
+                datanode.region_server(),
+                region_id,
+                schema.clone(),
+                range,
+                false,
+            ))
+        };
+        let deferred = spawn_put(0..3);
+        tokio::time::timeout(WAIT, log_store.wait_for_failed_creates(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let held_back = spawn_put(3..5);
+        tokio::time::timeout(WAIT, log_store.wait_for_held_back_appends(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = tokio::time::timeout(WAIT, datanode.shutdown())
+            .await
+            .expect("the shutdown must finish")
+            .unwrap_err();
+
+        assert!(
+            format!("{err:?}").contains("injected create failure"),
+            "{err:?}"
+        );
+        // The held-back write was not admitted: it fails with the stopped log
+        // store, and nothing of it was applied.
+        let held_back_err = held_back.await.unwrap().unwrap_err();
+        assert!(
+            format!("{held_back_err:?}").contains("log store is stopped"),
+            "{held_back_err:?}"
+        );
+        let deferred_err = deferred.await.unwrap().unwrap_err();
+        assert_eq!(StatusCode::DeadlineExceeded, deferred_err.status_code());
         assert!(is_stopped(&log_store).await);
     }
 
@@ -1690,7 +1792,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
         let data_home = create_temp_dir("object-store-wal-shutdown-closing-flush");
         let (mut datanode, log_store, region_id) =
-            datanode_with_object_store_wal(data_home.path().to_str().unwrap(), 3, 2, true).await;
+            datanode_with_enqueued_wal(data_home.path().to_str().unwrap(), 3, 2, true).await;
 
         let err = tokio::time::timeout(WAIT, datanode.shutdown())
             .await
@@ -1711,7 +1813,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
         let data_home = create_temp_dir("object-store-wal-shutdown-healthy-flush");
         let (mut datanode, log_store, _) =
-            datanode_with_object_store_wal(data_home.path().to_str().unwrap(), 3, 2, false).await;
+            datanode_with_enqueued_wal(data_home.path().to_str().unwrap(), 3, 2, false).await;
 
         tokio::time::timeout(WAIT, datanode.shutdown())
             .await

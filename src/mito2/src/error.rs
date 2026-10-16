@@ -461,6 +461,31 @@ pub enum Error {
         source: BoxedError,
     },
 
+    #[snafu(display(
+        "The WAL did not confirm that the write to region {} through entry {} is durable; its rows are applied and stay only if the entry becomes durable or a flush persists them before a restart",
+        region_id,
+        entry_id
+    ))]
+    UnconfirmedWalWrite {
+        region_id: RegionId,
+        entry_id: u64,
+        #[snafu(implicit)]
+        location: Location,
+        source: Arc<Error>,
+    },
+
+    #[snafu(display(
+        "The wait for the WAL to confirm the write to region {} through entry {} ended without an answer; its rows are applied and stay only if the entry becomes durable or a flush persists them before a restart",
+        region_id,
+        entry_id
+    ))]
+    AbandonedWalWrite {
+        region_id: RegionId,
+        entry_id: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to check the WAL history, region_id: {}", region_id))]
     CheckWalHistory {
         region_id: RegionId,
@@ -1549,6 +1574,10 @@ impl ErrorExt for Error {
 
             WriteParquet { .. } => StatusCode::StorageUnavailable,
             WriteGroup { source, .. } => source.status_code(),
+            // The rows of the write are applied, so a retry may apply them
+            // twice; the code tells the caller that the outcome is unknown,
+            // unlike the rejection of a write that was never applied.
+            UnconfirmedWalWrite { .. } | AbandonedWalWrite { .. } => StatusCode::DeadlineExceeded,
             InvalidBatch { .. } => StatusCode::InvalidArguments,
             InvalidRecordBatch { .. } => StatusCode::InvalidArguments,
             ConvertVector { source, .. } => source.status_code(),

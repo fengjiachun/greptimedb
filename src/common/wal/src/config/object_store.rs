@@ -24,15 +24,22 @@ use serde::{Deserialize, Serialize};
 /// node id and the generation from the metasrv.
 pub const STANDALONE_GENERATION: u64 = 0;
 
-/// When an append to the object store WAL returns.
+/// When a write through the object store WAL is answered.
+///
+/// In both modes an append returns once its entries are admitted and their
+/// ids are assigned, the engine applies the write, and the objects are
+/// created in the background.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AckMode {
-    /// An append returns after the object holding its entries is durable.
+    /// A write is answered once the object holding its entries is durable
+    /// and indexed. Reads can return its rows before that, and a crash before
+    /// that loses them; a write answered with an error after admission is
+    /// already applied.
     #[default]
     Durable,
-    /// An append returns once its entries are admitted and their ids are
-    /// assigned; the object is created in the background.
+    /// A write is answered once it is applied; a crash loses the unpersisted
+    /// backlog.
     Enqueued,
 }
 
@@ -68,13 +75,16 @@ pub struct ObjectStoreWalConfig {
     pub flush_interval: Duration,
     /// The max size of a single batch object, defaults to 8MiB.
     pub max_batch_bytes: ReadableSize,
-    /// When an append returns, defaults to `durable`.
+    /// When a write is answered, defaults to `durable`.
     pub ack_mode: AckMode,
-    /// Size of the unpersisted backlog at which appends stall until an
-    /// upload completes in `enqueued` mode, defaults to 64MiB.
+    /// Size of the unpersisted backlog at which appends are held back until
+    /// an upload completes, defaults to 64MiB.
     pub max_unpersisted_bytes: ReadableSize,
-    /// Age of the oldest unpersisted entry at which appends stall until an
-    /// upload completes in `enqueued` mode, defaults to 8s.
+    /// Age of the oldest unpersisted entry at which appends are held back
+    /// until an upload completes, defaults to 8s. It also bounds how long the
+    /// object store may take to confirm the oldest sealed object before the
+    /// store fails the writes waiting for it and rejects new appends until a
+    /// create succeeds.
     #[serde(with = "humantime_serde")]
     pub max_unpersisted_age: Duration,
     /// What a read does with a segment that still does not decode after a

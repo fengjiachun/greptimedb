@@ -133,8 +133,8 @@ lazy_static! {
     /// How long an object of the object store logstore takes to become durable
     /// once its batch is sealed, sampled for every conditional create that
     /// succeeds, an identical retry included. The time runs from the seal, so
-    /// it includes any wait for a create slot and, in the `enqueued` mode,
-    /// every repeated attempt and the delay before it.
+    /// it includes any wait for a create slot and every repeated attempt and
+    /// the delay before it.
     ///
     /// A create is a few milliseconds on a local object store and tens of
     /// milliseconds on a cloud one, so the buckets start at 1ms and reach 8s.
@@ -145,16 +145,16 @@ lazy_static! {
     )
     .unwrap();
 
-    /// How long an append of the object store logstore waits for its
-    /// acknowledgement in the `durable` mode, which is the write latency a
-    /// caller sees.
+    /// How long it takes in the `durable` mode from the admission of an
+    /// append of the object store logstore until the object holding it is
+    /// indexed, which is when its writers can be acknowledged.
     ///
-    /// The wait is one seal plus every earlier object plus one create, so with
+    /// The time is one seal plus every earlier object plus one create, so with
     /// the default 100ms flush interval it sits in the tens of milliseconds;
     /// the buckets straddle that and leave room for a stalled uploader.
     pub static ref METRIC_OBJECT_STORE_WAL_APPEND_ACK_SECONDS: Histogram = register_histogram!(
         "greptime_logstore_object_store_wal_append_ack_seconds",
-        "object store logstore seconds an append waits for its acknowledgement in the durable mode",
+        "object store logstore seconds from the admission of an append to the indexing of its object in the durable mode",
         exponential_buckets(0.002, 2.0, 14).unwrap(),
     )
     .unwrap();
@@ -258,8 +258,7 @@ lazy_static! {
     .unwrap();
 
     /// Counter of conditional creates of the object store logstore the object
-    /// store did not confirm, which fail the appends behind them in the
-    /// `durable` mode and are repeated in the `enqueued` mode.
+    /// store did not confirm, which the store repeats.
     pub static ref METRIC_OBJECT_STORE_WAL_CREATE_FAILURES_TOTAL: IntCounter = register_int_counter!(
         "greptime_logstore_object_store_wal_create_failures_total",
         "object store logstore conditional creates the object store did not confirm total",
@@ -275,10 +274,10 @@ lazy_static! {
     .unwrap();
 
     /// Counter of appends the object store logstore held back until an upload
-    /// completed: in either mode because the sealed batches waiting to become
-    /// durable left no room for another, and in the `enqueued` mode also
-    /// because the unpersisted backlog reached a threshold. Either says the
-    /// write rate is above what the uploads sustain.
+    /// completed, because the sealed batches waiting to become durable left no
+    /// room for another, because the unpersisted backlog reached a threshold,
+    /// or because a raised sequence floor was not durable yet. The first two
+    /// say the write rate is above what the uploads sustain.
     pub static ref METRIC_OBJECT_STORE_WAL_STALLED_APPENDS_TOTAL: IntCounter = register_int_counter!(
         "greptime_logstore_object_store_wal_stalled_appends_total",
         "object store logstore appends stalled by full sealed batches or the backlog thresholds total",
@@ -287,8 +286,8 @@ lazy_static! {
 
     /// How long such an append stays held back, until it is admitted or until
     /// it is refused, a stop, a terminal error or the teardown of the store
-    /// releasing it included, which is the latency the `enqueued` mode pays
-    /// once the backlog is at a threshold.
+    /// releasing it included, which is the latency a writer pays once the
+    /// backlog is at a threshold.
     ///
     /// A stalled append waits for one upload to complete, so the buckets run
     /// from 5ms to half a minute of a struggling object store.
@@ -299,24 +298,25 @@ lazy_static! {
     )
     .unwrap();
 
-    /// Number of object store logstores in the `enqueued` mode whose backlog
-    /// the object store refuses with an error that repeating the create
-    /// cannot settle, such as denied access or a missing bucket. Such a store
-    /// keeps its backlog, attempts it again with backoff and rejects appends
-    /// until a create succeeds.
+    /// Number of object store logstores that are failing: the object store
+    /// refuses their backlog with an error that repeating the create cannot
+    /// settle, such as denied access or a missing bucket, or an object did not
+    /// become durable within `max_unpersisted_age` of being sealed. Such a
+    /// store keeps its backlog, attempts it again with backoff and rejects
+    /// appends until a create succeeds.
     pub static ref METRIC_OBJECT_STORE_WAL_FAILING: IntGauge = register_int_gauge!(
         "greptime_logstore_object_store_wal_failing",
-        "object store logstores rejecting appends because the object store refuses their backlog with an error that requires intervention",
+        "object store logstores rejecting appends because the object store refuses their backlog or does not make it durable in time",
     )
     .unwrap();
 
-    /// Counter of appends the object store logstore rejected while its
-    /// backlog is refused, see the gauge above. They take no entry id and
-    /// fail with a retryable error. Releases of dropped regions failed in
-    /// that state count too; their records wait for the next object.
+    /// Counter of appends the object store logstore rejected while it is
+    /// failing, see the gauge above. They take no entry id and fail with a
+    /// retryable error. Releases of dropped regions failed in that state
+    /// count too; their records wait for the next object.
     pub static ref METRIC_OBJECT_STORE_WAL_REJECTED_APPENDS_TOTAL: IntCounter = register_int_counter!(
         "greptime_logstore_object_store_wal_rejected_appends_total",
-        "object store logstore appends rejected while the object store refuses the backlog total",
+        "object store logstore appends rejected while the store is failing total",
     )
     .unwrap();
 }

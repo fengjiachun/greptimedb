@@ -127,6 +127,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 // fast path for single region.
                 let mut region_ctx = region_ctxs.into_values().next().unwrap();
                 region_ctx.write_memtables().await;
+                answer_deferred_acks(&mut region_ctx);
                 put_rows += region_ctx.put_num;
                 delete_rows += region_ctx.delete_num;
             } else {
@@ -136,6 +137,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                         // use tokio runtime to schedule tasks.
                         common_runtime::spawn_global(async move {
                             region_ctx.write_memtables().await;
+                            answer_deferred_acks(&mut region_ctx);
                             (region_ctx.put_num, region_ctx.delete_num)
                         })
                     })
@@ -605,8 +607,18 @@ impl<S> RegionWorkerLoop<S> {
     }
 }
 
+/// Answers the writers of `region_ctx` whose answers wait for the WAL from a
+/// task of their own, so that the worker takes its next requests meanwhile.
+fn answer_deferred_acks(region_ctx: &mut RegionWriteCtx) {
+    if let Some(acks) = region_ctx.take_deferred_acks() {
+        common_runtime::spawn_global(acks.answer_when_durable());
+    }
+}
+
 /// Writes WAL entries of all region contexts to the WAL in one batch and updates
-/// the next entry id of each region on success.
+/// the next entry id of each region on success. When the log store answers
+/// the append before the entries are durable, the writers of the entries are
+/// made to wait for them, see [`RegionWriteCtx::defer_acks`].
 ///
 /// Returns `false` if the batch fails to be written to the WAL. In this case all
 /// contexts are consumed and their waiters are notified with the error, so the
@@ -648,6 +660,9 @@ async fn write_wal<S: LogStore>(
                 // response is returned or the last entry ids for each region in the batch do exist.
                 let last_entry_id = response.last_entry_ids.get(region_id).unwrap();
                 region_ctx.set_next_entry_id(last_entry_id + 1);
+                if let Some(barrier) = wal.write_ack_barrier(*region_id, region_ctx.provider()) {
+                    region_ctx.defer_acks(barrier, *last_entry_id);
+                }
             }
             true
         }

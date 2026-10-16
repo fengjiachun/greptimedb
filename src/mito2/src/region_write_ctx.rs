@@ -18,23 +18,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use api::v1::{BulkWalEntry, Mutation, OpType, Rows, WalEntry, WriteHint};
 use futures::stream::{FuturesUnordered, StreamExt};
-use snafu::ResultExt;
+use snafu::{IntoError, ResultExt};
 use store_api::logstore::LogStore;
 use store_api::logstore::provider::Provider;
 use store_api::storage::{RegionId, SequenceNumber};
 
-use crate::error::{Error, Result, WriteGroupSnafu};
+use crate::error::{
+    AbandonedWalWriteSnafu, Error, Result, UnconfirmedWalWriteSnafu, WriteGroupSnafu,
+};
 use crate::memtable::KeyValues;
 use crate::memtable::bulk::part::BulkPart;
 use crate::metrics;
 use crate::region::version::{VersionControlData, VersionControlRef, VersionRef};
 use crate::request::OptionOutputTx;
-use crate::wal::{EntryId, WalWriter};
+use crate::wal::{DurabilityBarrier, EntryId, WalWriter};
 
 /// Notifier to notify write result on drop.
 struct WriteNotify {
     /// Error to send to the waiter.
     err: Option<Arc<Error>>,
+    /// Whether the write goes into the WAL entry of its context.
+    in_wal: bool,
+    /// Whether `err` is the error the writer is answered with unless its WAL
+    /// entry is confirmed durable, see [`RegionWriteCtx::defer_acks`].
+    awaiting_durable: bool,
     /// Sender to send write result to the waiter for this mutation.
     sender: OptionOutputTx,
     /// Number of rows to be written.
@@ -43,11 +50,37 @@ struct WriteNotify {
 
 impl WriteNotify {
     /// Creates a new notify from the `sender`.
-    fn new(sender: OptionOutputTx, num_rows: usize) -> WriteNotify {
+    fn new(sender: OptionOutputTx, num_rows: usize, in_wal: bool) -> WriteNotify {
         WriteNotify {
             err: None,
+            in_wal,
+            awaiting_durable: false,
             sender,
             num_rows,
+        }
+    }
+
+    /// Answers the writer with `err` whatever its WAL entry becomes.
+    fn fail(&mut self, err: Arc<Error>) {
+        self.err = Some(err);
+        self.awaiting_durable = false;
+    }
+
+    /// Makes the writer wait for its WAL entry to be confirmed durable:
+    /// until then it is answered with `unconfirmed`.
+    fn await_durable(&mut self, unconfirmed: Arc<Error>) {
+        if self.err.is_none() {
+            self.err = Some(unconfirmed);
+            self.awaiting_durable = true;
+        }
+    }
+
+    /// Settles the wait for the WAL entry: a writer still waiting is answered
+    /// with success once the entry is durable, and with `failure` otherwise.
+    fn settle_durable(&mut self, failure: Option<&Arc<Error>>) {
+        if self.awaiting_durable {
+            self.err = failure.cloned();
+            self.awaiting_durable = false;
         }
     }
 
@@ -102,6 +135,10 @@ pub(crate) struct RegionWriteCtx {
     wal_entry: WalEntry,
     /// Mutations that skip WAL, paired with their write notifiers.
     memtable_mutations: Vec<(Mutation, WriteNotify)>,
+    /// The barrier and the last entry id of the region that the writers of
+    /// the WAL entry wait for, set once the entry is appended, see
+    /// [`defer_acks`](Self::defer_acks).
+    deferred_ack: Option<(DurabilityBarrier, EntryId)>,
     /// Wal options of the region being written to.
     provider: Provider,
     /// Notifiers to send write results to waiters.
@@ -150,6 +187,7 @@ impl RegionWriteCtx {
             next_entry_id: last_entry_id + 1,
             wal_entry: WalEntry::default(),
             memtable_mutations: Vec::new(),
+            deferred_ack: None,
             provider,
             wal_notifiers: Vec::new(),
             bulk_notifiers: vec![],
@@ -186,7 +224,7 @@ impl RegionWriteCtx {
 
         // Assign sequences before routing so concurrent memtable writes retain
         // their logical order regardless of the WAL policy.
-        let notify = WriteNotify::new(tx, num_rows);
+        let notify = WriteNotify::new(tx, num_rows, !skip_wal);
         if skip_wal {
             self.memtable_mutations.push((mutation, notify));
         } else {
@@ -224,6 +262,10 @@ impl RegionWriteCtx {
         &self.version
     }
 
+    pub(crate) fn provider(&self) -> &Provider {
+        &self.provider
+    }
+
     #[cfg(test)]
     pub(crate) fn version_control(&self) -> &VersionControlRef {
         &self.version_control
@@ -244,10 +286,10 @@ impl RegionWriteCtx {
             .iter_mut()
             .chain(self.memtable_mutations.iter_mut().map(|(_, notify)| notify))
         {
-            notify.err = Some(err.clone());
+            notify.fail(err.clone());
         }
         for notify in &mut self.bulk_notifiers {
-            notify.err = Some(err.clone());
+            notify.fail(err.clone());
         }
 
         // Fail the whole write operation.
@@ -262,6 +304,48 @@ impl RegionWriteCtx {
     /// Updates next entry id.
     pub(crate) fn set_next_entry_id(&mut self, next_entry_id: EntryId) {
         self.next_entry_id = next_entry_id
+    }
+
+    /// Makes every writer whose write went into the WAL entry, which the log
+    /// store admitted through `entry_id`, wait until `barrier` confirms the
+    /// entry durable before it is answered. Until then such a writer is
+    /// answered with an error, so a write whose wait is dropped, cancelled or
+    /// panics is never acknowledged. Call it once the entry is appended.
+    pub(crate) fn defer_acks(&mut self, barrier: DurabilityBarrier, entry_id: EntryId) {
+        let unconfirmed = Arc::new(
+            AbandonedWalWriteSnafu {
+                region_id: self.region_id,
+                entry_id,
+            }
+            .build(),
+        );
+        for notify in self.wal_notifiers.iter_mut().chain(
+            self.bulk_notifiers
+                .iter_mut()
+                .filter(|notify| notify.in_wal),
+        ) {
+            notify.await_durable(unconfirmed.clone());
+        }
+        self.deferred_ack = Some((barrier, entry_id));
+    }
+
+    /// Takes the writers whose answers wait for the WAL entry, see
+    /// [`defer_acks`](Self::defer_acks), once the memtables are written and
+    /// the entry is published. The other writers stay and are answered when
+    /// the context is dropped.
+    pub(crate) fn take_deferred_acks(&mut self) -> Option<DeferredAcks> {
+        let (barrier, entry_id) = self.deferred_ack.take()?;
+        let notifiers = self
+            .wal_notifiers
+            .drain(..)
+            .chain(self.bulk_notifiers.extract_if(.., |notify| notify.in_wal))
+            .collect();
+        Some(DeferredAcks {
+            region_id: self.region_id,
+            entry_id,
+            barrier,
+            notifiers,
+        })
     }
 
     /// Returns the next entry id to write.
@@ -323,7 +407,7 @@ impl RegionWriteCtx {
 
         if mutations.len() == 1 {
             if let Err(err) = mutable_memtable.write(&mutations[0].1) {
-                mutations[0].0.err = Some(Arc::new(err));
+                mutations[0].0.fail(Arc::new(err));
             }
         } else {
             let mut tasks = FuturesUnordered::new();
@@ -337,7 +421,7 @@ impl RegionWriteCtx {
             while let Some((notify, result)) = tasks.next().await {
                 // First unwrap the result from `spawn` above.
                 if let Err(err) = result.unwrap() {
-                    notify.err = Some(Arc::new(err));
+                    notify.fail(Arc::new(err));
                 }
             }
         }
@@ -374,7 +458,7 @@ impl RegionWriteCtx {
 
         self.has_skip_wal_writes |= bulk.num_rows() > 0 && self.is_skip_wal_write(skip_wal);
         self.bulk_notifiers
-            .push(WriteNotify::new(sender, bulk.num_rows()));
+            .push(WriteNotify::new(sender, bulk.num_rows(), !skip_wal));
 
         self.next_sequence += bulk.num_rows() as u64;
         self.bulk_parts.push(bulk);
@@ -402,7 +486,7 @@ impl RegionWriteCtx {
             let part = self.bulk_parts.swap_remove(0);
             let num_rows = part.num_rows();
             if let Err(e) = self.version.memtables.mutable.write_bulk(part) {
-                self.bulk_notifiers[0].err = Some(Arc::new(e));
+                self.bulk_notifiers[0].fail(Arc::new(e));
             } else {
                 self.put_num += num_rows;
             }
@@ -421,7 +505,7 @@ impl RegionWriteCtx {
             // first unwrap the result from `spawn` above
             let (i, result, num_rows) = result.unwrap();
             if let Err(err) = result {
-                self.bulk_notifiers[i].err = Some(Arc::new(err));
+                self.bulk_notifiers[i].fail(Arc::new(err));
             } else {
                 self.put_num += num_rows;
             }
@@ -444,6 +528,40 @@ impl RegionWriteCtx {
         }
         self.version_control
             .set_sequence_and_entry_id(self.next_sequence - 1, self.next_entry_id - 1);
+    }
+}
+
+/// The writers of a region whose answers wait until their WAL entry is
+/// confirmed durable. It holds only the writers, the barrier and the entry id,
+/// never the write context, the version or the memtables.
+pub(crate) struct DeferredAcks {
+    region_id: RegionId,
+    entry_id: EntryId,
+    barrier: DurabilityBarrier,
+    notifiers: Vec<WriteNotify>,
+}
+
+impl DeferredAcks {
+    /// Waits until the WAL entry is durable, then answers the writers: with
+    /// success, or with the error of the wait. The writers are answered when
+    /// this drops, so a task that is aborted or panics answers them with the
+    /// error [`RegionWriteCtx::defer_acks`] set.
+    pub(crate) async fn answer_when_durable(mut self) {
+        let _timer = metrics::WRITE_STAGE_ELAPSED
+            .with_label_values(&["wait_durable"])
+            .start_timer();
+        let failure = self.barrier.wait(self.entry_id).await.err().map(|err| {
+            Arc::new(
+                UnconfirmedWalWriteSnafu {
+                    region_id: self.region_id,
+                    entry_id: self.entry_id,
+                }
+                .into_error(Arc::new(err)),
+            )
+        });
+        for notify in &mut self.notifiers {
+            notify.settle_durable(failure.as_ref());
+        }
     }
 }
 
@@ -580,12 +698,14 @@ pub(crate) mod test_hooks {
 mod tests {
     use std::sync::Arc;
 
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use common_recordbatch::DfRecordBatch;
     use datatypes::arrow::array::{ArrayRef, TimestampMillisecondArray};
     use datatypes::arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
     use store_api::logstore::provider::Provider;
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, watch};
 
     use super::*;
     use crate::error::UnexpectedSnafu;
@@ -971,6 +1091,152 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A context with a WAL row write, a row write that skips the WAL, a WAL
+    /// bulk part and a bulk part that skips the WAL, whose entry the log store
+    /// admitted through entry 7, and the receivers of the four writers in that
+    /// order.
+    fn mixed_ctx_awaiting(
+        barrier: DurabilityBarrier,
+    ) -> (
+        RegionWriteCtx,
+        Vec<oneshot::Receiver<Result<store_api::region_request::AffectedRows>>>,
+    ) {
+        let builder = VersionControlBuilder::new();
+        let region_id = builder.region_id();
+        let version_control = Arc::new(builder.build());
+        let mut ctx = RegionWriteCtx::new(
+            region_id,
+            &version_control,
+            Provider::raft_engine_provider(region_id.as_u64()),
+            None,
+            WriteSource::Request,
+        );
+        let mut receivers = Vec::new();
+        for skip_wal in [false, true] {
+            let (tx, rx) = oneshot::channel();
+            ctx.push_mutation(
+                OpType::Put as i32,
+                Some(Rows {
+                    schema: vec![],
+                    rows: vec![api::v1::Row::default(); 2],
+                }),
+                None,
+                OptionOutputTx::from(tx),
+                None,
+                skip_wal,
+            );
+            receivers.push(rx);
+        }
+        for skip_wal in [false, true] {
+            let (tx, rx) = oneshot::channel();
+            assert!(ctx.push_bulk(OptionOutputTx::from(tx), new_bulk_part(), None, skip_wal));
+            receivers.push(rx);
+        }
+        ctx.defer_acks(barrier, 7);
+        (ctx, receivers)
+    }
+
+    /// A barrier that waits until `outcome` holds a value and answers with it.
+    fn barrier_answering(outcome: watch::Receiver<Option<bool>>) -> DurabilityBarrier {
+        DurabilityBarrier::from_fn(move |_| {
+            let mut outcome = outcome.clone();
+            Box::pin(async move {
+                let durable = *outcome
+                    .wait_for(Option::is_some)
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .unwrap();
+                if durable {
+                    Ok(())
+                } else {
+                    UnexpectedSnafu {
+                        reason: "the WAL failed".to_string(),
+                    }
+                    .fail()
+                }
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn test_deferred_acks_wait_only_for_writes_in_the_wal() {
+        for durable in [true, false] {
+            let (outcome_tx, outcome_rx) = watch::channel(None);
+            let (mut ctx, mut receivers) = mixed_ctx_awaiting(barrier_answering(outcome_rx));
+            let acks = ctx.take_deferred_acks().unwrap();
+            // The writes that skipped the WAL are answered with the context.
+            drop(ctx);
+            assert_eq!(2, receivers[1].try_recv().unwrap().unwrap());
+            assert_eq!(2, receivers[3].try_recv().unwrap().unwrap());
+            let answered = tokio::spawn(acks.answer_when_durable());
+            tokio::task::yield_now().await;
+            assert!(receivers[0].try_recv().is_err());
+            assert!(receivers[2].try_recv().is_err());
+
+            outcome_tx.send_replace(Some(durable));
+            answered.await.unwrap();
+            for index in [0, 2] {
+                match receivers[index].try_recv().unwrap() {
+                    Ok(rows) => {
+                        assert!(durable);
+                        assert_eq!(2, rows);
+                    }
+                    Err(error) => {
+                        assert!(!durable);
+                        assert_eq!(StatusCode::DeadlineExceeded, error.status_code());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deferred_acks_never_acknowledge_an_abandoned_wait() {
+        // The wait is aborted, or it panics.
+        for panics in [false, true] {
+            let barrier = DurabilityBarrier::from_fn(move |_| {
+                Box::pin(async move {
+                    if panics {
+                        panic!("the wait panics");
+                    }
+                    std::future::pending().await
+                })
+            });
+            let (mut ctx, mut receivers) = mixed_ctx_awaiting(barrier);
+            let acks = ctx.take_deferred_acks().unwrap();
+            drop(ctx);
+            let answered = tokio::spawn(acks.answer_when_durable());
+            if !panics {
+                tokio::task::yield_now().await;
+                answered.abort();
+            }
+            assert!(answered.await.is_err());
+            for index in [0, 2] {
+                let error = receivers[index].try_recv().unwrap().unwrap_err();
+                assert_eq!(StatusCode::DeadlineExceeded, error.status_code());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deferred_acks_keep_a_failed_memtable_write() {
+        let (outcome_tx, outcome_rx) = watch::channel(Some(true));
+        let (mut ctx, mut receivers) = mixed_ctx_awaiting(barrier_answering(outcome_rx));
+        ctx.wal_notifiers[0].fail(Arc::new(
+            UnexpectedSnafu {
+                reason: "memtable write failed".to_string(),
+            }
+            .build(),
+        ));
+        let acks = ctx.take_deferred_acks().unwrap();
+        drop(ctx);
+        acks.answer_when_durable().await;
+        drop(outcome_tx);
+        assert!(receivers[0].try_recv().unwrap().is_err());
+        assert_eq!(2, receivers[2].try_recv().unwrap().unwrap());
     }
 
     fn new_bulk_part() -> BulkPart {
