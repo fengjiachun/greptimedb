@@ -102,18 +102,37 @@ const MAX_SEALED_BATCHES: usize = 2 * MAX_IN_FLIGHT_CREATES;
 /// earlier instance can have handed out, which this instance therefore never
 /// assigns.
 ///
-/// An instance hands out a sequence only to a sealed batch, and every batch
-/// it sealed below its lowest sealed batch that is not indexed is indexed,
-/// hence durable and listed, or collected below a later indexed object.
-/// Sealed batches take consecutive sequences: a raised sequence floor moves
-/// the next sequence only while no batch is sealed or open, and the batch
-/// that marks the floor is indexed before any other batch is sealed, see
-/// [`Actor::raise_sequence_floor`]. At most [`MAX_SEALED_BATCHES`] batches are
-/// sealed and not indexed at a time, including the batches of releases and
-/// the batch `stop` seals. So every sequence an earlier instance handed out is
-/// at most this far above the newest listed object, or is the floor object
-/// of a raise whose object was never indexed, which holds no entry.
+/// An instance hands out a sequence when it admits the first entry into the
+/// open batch, which keeps it when it is sealed. Every batch it sealed below
+/// its lowest batch that is not indexed is indexed, hence durable and listed,
+/// or collected below a later indexed object. The sealed batches and the open
+/// batch take consecutive sequences: a raised sequence floor moves the next
+/// sequence only while no batch is sealed or open, and the batch that marks
+/// the floor is indexed before any other batch is sealed, see
+/// [`Actor::raise_sequence_floor`]. The sealed batches that are not indexed
+/// and an open batch that holds ids take at most [`MAX_SEALED_BATCHES`]
+/// sequences together: an admission needs room for two more sealed batches,
+/// so it leaves at most `MAX_SEALED_BATCHES - 1` sealed batches beside the
+/// open batch, also when it first seals the open batch because the append
+/// would exhaust its positions; every later seal takes the open batch with
+/// it, and a release, a timer tick and `stop` seal only while fewer than
+/// [`MAX_SEALED_BATCHES`] batches are sealed. So every sequence an earlier
+/// instance handed out is at most this far above the newest listed object,
+/// or is the floor object of a raise whose object was never indexed, which
+/// holds no entry.
 pub const UNLISTED_SEQUENCES: u64 = MAX_SEALED_BATCHES as u64;
+/// How long after an open a late object of an earlier instance can still
+/// land at a sequence the start object skipped, see [`UNLISTED_SEQUENCES`]:
+/// a create of that instance completes or fails within the timeouts and
+/// retries of its object store client, about two minutes with the defaults.
+const LATE_OBJECT_WINDOW: Duration = Duration::from_secs(300);
+/// How often the collections within [`LATE_OBJECT_WINDOW`] delete the
+/// skipped sequences again, since the delete of an absent object succeeds
+/// and a late object can land at its sequence afterwards.
+#[cfg(not(test))]
+const LATE_OBJECT_RECHECK: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const LATE_OBJECT_RECHECK: Duration = Duration::from_millis(50);
 /// Number of objects whose footers recovery fetches at a time. On S3 an
 /// object costs two reads, its header and its tail, tens of milliseconds per
 /// lane however many vCPUs the node has, and recovery time scales with objects
@@ -491,6 +510,7 @@ impl ObjectStoreLogStore {
             failing: None,
             transient_bound: config.max_unpersisted_age,
             healthy_since: Instant::now(),
+            stop_began_at: None,
             held_releases: Vec::new(),
             durable_waiters: DurableWaiters::default(),
             draining: false,
@@ -511,6 +531,12 @@ impl ObjectStoreLogStore {
                 .chain(next_object_seq..start_object_seq)
                 .chain(moved_past)
                 .collect(),
+            skipped: (next_object_seq < start_object_seq).then(|| SkippedSequences {
+                sequences: next_object_seq..start_object_seq,
+                until: Instant::now() + LATE_OBJECT_WINDOW,
+                next_check: Instant::now() + LATE_OBJECT_RECHECK,
+            }),
+            rechecked: HashSet::new(),
             failed_releases: BTreeMap::new(),
             creating: HashSet::new(),
             deleting: deleting.clone(),
@@ -621,7 +647,8 @@ impl ObjectStoreLogStore {
     /// fail with the stopped error. The open batch is sealed and the backlog
     /// keeps uploading, so the callers waiting for its entries are answered
     /// once their objects are durable, or with the error that drops the
-    /// backlog when an upload fails.
+    /// backlog when an upload fails or does not complete within
+    /// `max_unpersisted_age` of the stop beginning.
     pub async fn begin_stop(&self) {
         self.stopped.store(true, Ordering::Release);
         // A closed channel means the actor already exited.
@@ -893,6 +920,20 @@ impl ObjectStoreLogStore {
             .context(ObjectStoreWalStoppedSnafu)
     }
 
+    /// Returns the number of sealed batches that are not indexed yet, once
+    /// the actor handled every command sent before.
+    pub async fn sealed_batches(&self) -> Result<usize> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::SealedBatches {
+                response: response_tx,
+            })
+            .await
+            .ok()
+            .context(ObjectStoreWalStoppedSnafu)?;
+        response_rx.await.ok().context(ObjectStoreWalStoppedSnafu)
+    }
+
     /// Seals the open batch regardless of its size and age and returns once
     /// its object is durable and indexed, or with the error that failed it.
     pub async fn seal_open_batch(&self) -> Result<()> {
@@ -1021,11 +1062,14 @@ impl ObjectStoreLogStore {
         }
     }
 
-    /// Waits until no object delete is in flight. The deletes a collection
-    /// starts are in flight by the time the `obsolete`, `obsolete_all`,
-    /// `release_region`, [`seal_open_batch`](Self::seal_open_batch) or
-    /// durability wait answered by the indexing that started it returns.
+    /// Waits until the actor handled every command sent before, which
+    /// finishes the indexing or the `obsolete` that started a collection, and
+    /// then until no object delete is in flight. A durability wait can return
+    /// as soon as the catalog holds its entry, before the actor started the
+    /// collection that indexing the object starts.
     pub async fn wait_for_garbage_collection(&self) {
+        // An actor that exited has no delete left to start.
+        let _ = self.sealed_batches().await;
         self.deleting.wait_until_empty().await;
     }
 
@@ -1068,7 +1112,8 @@ impl LogStore for ObjectStoreLogStore {
     /// Stops the store, beginning the stop first if
     /// [`begin_stop`](ObjectStoreLogStore::begin_stop) did not. Returns once
     /// the backlog is uploaded, with the error that dropped it when an upload
-    /// failed.
+    /// failed, and at the latest `max_unpersisted_age` after the stop began,
+    /// when it gives up the creates and deletes still in flight.
     async fn stop(&self) -> Result<()> {
         self.begin_stop().await;
         let (response_tx, response_rx) = oneshot::channel();
@@ -1487,6 +1532,8 @@ enum Command {
         response: oneshot::Sender<Result<()>>,
     },
     #[cfg(any(test, feature = "testing"))]
+    SealedBatches { response: oneshot::Sender<usize> },
+    #[cfg(any(test, feature = "testing"))]
     Crash { response: oneshot::Sender<()> },
 }
 
@@ -1626,6 +1673,16 @@ type CreateOutcome = (u64, Result<PutResult>);
 
 /// Whether the store gave up its start object, see
 /// [`Actor::handle_withdraw`].
+/// The sequences the start object skipped, which a late object of an
+/// earlier instance can still take, see [`LATE_OBJECT_WINDOW`].
+struct SkippedSequences {
+    sequences: std::ops::Range<u64>,
+    /// When the collections stop deleting them again.
+    until: Instant,
+    /// When a collection deletes them again next.
+    next_check: Instant,
+}
+
 enum Withdrawal {
     Kept,
     /// The delete of the start object `object_seq` is in flight; `waiters`
@@ -1769,6 +1826,8 @@ struct Actor {
     transient_bound: Duration,
     /// When the store opened or last left the failing state.
     healthy_since: Instant,
+    /// When stop began, see [`stop_deadline`](Self::stop_deadline).
+    stop_began_at: Option<Instant>,
     /// Releases waiting for room to seal their batch, see
     /// [`seal`](Self::seal).
     held_releases: Vec<(Release, oneshot::Sender<Result<()>>)>,
@@ -1797,6 +1856,12 @@ struct Actor {
     /// objects recovery listed off the chain, the sequences the start object
     /// skipped and the batches a stop gave up.
     unindexed: BTreeSet<u64>,
+    /// The sequences the start object skipped, while collections still
+    /// delete them again, see [`LATE_OBJECT_WINDOW`].
+    skipped: Option<SkippedSequences>,
+    /// Skipped sequences whose delete a recheck started, which is not counted
+    /// as a deleted object: most of them hold none.
+    rechecked: HashSet<u64>,
     /// Release records whose release failed before their batch was sealed,
     /// or of batches a stop gave up, which the next sealed batch carries, so
     /// a release whose call failed still becomes durable while the store
@@ -1840,6 +1905,7 @@ impl Actor {
         loop {
             let probe_at = self.failing.as_ref().and_then(|failing| failing.probe_at);
             let transient_deadline = self.transient_deadline();
+            let stop_deadline = self.stop_deadline();
             tokio::select! {
                 _ = interval.tick() => {
                     // Nothing starts after stop began, which sealed the open
@@ -1862,6 +1928,9 @@ impl Actor {
                 }
                 Some(()) = OptionFuture::from(transient_deadline.map(|at| tokio::time::sleep_until(at.into()))) => {
                     self.on_transient_deadline();
+                }
+                Some(()) = OptionFuture::from(stop_deadline.map(|at| tokio::time::sleep_until(at.into()))) => {
+                    self.on_stop_deadline();
                 }
                 Some((entries, response)) = self.append_rx.recv(), if self.stalled.is_none() => {
                     self.handle_append(entries, response);
@@ -1892,6 +1961,10 @@ impl Actor {
                     #[cfg(any(test, feature = "testing"))]
                     Some(Command::Seal { response }) => {
                         self.handle_seal(response);
+                    }
+                    #[cfg(any(test, feature = "testing"))]
+                    Some(Command::SealedBatches { response }) => {
+                        let _ = response.send(self.sealed.len());
                     }
                     #[cfg(any(test, feature = "testing"))]
                     Some(Command::Crash { response }) => {
@@ -2481,6 +2554,55 @@ impl Actor {
         self.start_creates();
     }
 
+    /// Returns when stop gives up the creates and deletes it waits for:
+    /// `max_unpersisted_age` after stop began, while any is in flight.
+    fn stop_deadline(&self) -> Option<Instant> {
+        if self.creates.is_empty() && self.deletes.is_empty() {
+            return None;
+        }
+        self.stop_began_at.map(|at| at + self.transient_bound)
+    }
+
+    /// Gives up what stop still waits for once the stop deadline passed, so
+    /// that a create or a delete that never completes cannot hold the stop
+    /// up: the backlog is dropped and `stop` reports it, the creates in
+    /// flight are abandoned, whose objects may still land and are collected
+    /// like those of any dropped batch, and the deletes in flight are
+    /// abandoned, whose objects stay indexed.
+    fn on_stop_deadline(&mut self) {
+        let Some(deadline) = self.stop_deadline() else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        warn!(
+            "Object store WAL abandons {} creates and {} deletes that did not complete within {:?} after stop began",
+            self.creates.len(),
+            self.deletes.len(),
+            self.transient_bound
+        );
+        if let Some(front) = self.sealed.front() {
+            // The front batch was sealed before stop began, or when it did.
+            let error = WalObjectUnconfirmedSnafu {
+                path: self.io.object_path(front.object_seq),
+                bound: self.transient_bound,
+            }
+            .build();
+            self.drop_backlog(Arc::new(error));
+        }
+        self.creates = FuturesUnordered::new();
+        self.creating.clear();
+        self.deletes = FuturesUnordered::new();
+        if let Withdrawal::Deleting { waiters, .. } = &mut self.withdrawal {
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(());
+            }
+            self.withdrawal = Withdrawal::Settled;
+        }
+        self.deleting.abandon_all();
+    }
+
     /// Indexes the sealed batches from the front as far as they are created,
     /// admits releases and appends that waited for room, and starts the
     /// creates that a free slot allows.
@@ -2908,8 +3030,33 @@ impl Actor {
     /// Starts a collection, which also attempts the deletes that failed since
     /// the last one again.
     fn collect(&mut self) {
+        self.recheck_skipped_sequences();
         self.failed_deletes.clear();
         self.start_deletes();
+    }
+
+    /// Makes the collection delete the sequences the start object skipped
+    /// again, at most every [`LATE_OBJECT_RECHECK`] and only within
+    /// [`LATE_OBJECT_WINDOW`] of the open, so that a late object that landed
+    /// after the delete of its absent sequence is collected too.
+    fn recheck_skipped_sequences(&mut self) {
+        let Some(skipped) = &mut self.skipped else {
+            return;
+        };
+        let now = Instant::now();
+        if now < skipped.next_check {
+            return;
+        }
+        skipped.next_check = now + LATE_OBJECT_RECHECK;
+        let sequences = skipped.sequences.clone();
+        if now >= skipped.until {
+            self.skipped = None;
+        }
+        for object_seq in sequences {
+            if self.unindexed.insert(object_seq) {
+                self.rechecked.insert(object_seq);
+            }
+        }
     }
 
     /// Starts deleting the objects below the durable reclaim boundary while
@@ -2983,6 +3130,7 @@ impl Actor {
         match result {
             Ok(()) => {
                 self.unindexed.remove(&object_seq);
+                let rechecked = self.rechecked.remove(&object_seq);
                 let mut catalog = self.catalog.write().unwrap_or_else(PoisonError::into_inner);
                 let footer = catalog.remove_object(object_seq);
                 if let Some(footer) = &footer {
@@ -2998,7 +3146,9 @@ impl Actor {
                         holes.remove(&object_seq);
                     }
                 }
-                METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.inc();
+                if !rechecked {
+                    METRIC_OBJECT_STORE_WAL_DELETED_OBJECTS_TOTAL.inc();
+                }
             }
             Err(error) => {
                 warn!(
@@ -3081,6 +3231,7 @@ impl Actor {
     /// that failed, so that the whole backlog is uploaded at once, a failing
     /// store's included. Idempotent.
     fn begin_stop(&mut self) {
+        self.stop_began_at.get_or_insert_with(Instant::now);
         if let Some((_, response)) = self.take_stalled() {
             let _ = response.send(Err(ObjectStoreWalStoppedSnafu.build()));
         }
@@ -9663,6 +9814,171 @@ mod tests {
         store.stop().await.unwrap();
     }
 
+    /// A late object of an earlier instance that lands at a skipped sequence
+    /// after a collection deleted that absent sequence is collected by a
+    /// later collection.
+    #[tokio::test]
+    async fn test_store_collects_a_late_object_landing_after_its_absent_delete() {
+        let _serialized = SERIALIZED.lock().await;
+        let object_store = memory_store();
+        let io = ObjectStoreIo::new(object_store.clone(), PREFIX).unwrap();
+        put_object_with_header(&io, chain_header(0, 1, None), &[]).await;
+        let store = open(object_store.clone(), &eager()).await;
+        let start_seq = 1 + UNLISTED_SEQUENCES;
+        let writer = region(1);
+        let other = region(2);
+
+        // Once region 1 is flushed through its entry, the next object carries
+        // a boundary past every older object, the absent skipped ones
+        // included.
+        append(&store, writer, "a1").await.unwrap();
+        store
+            .obsolete(&provider(writer), writer, id(start_seq + 1, 1))
+            .await
+            .unwrap();
+        append(&store, other, "b1").await.unwrap();
+        assert_eq!(vec![start_seq + 2], collected_object_seqs(&store).await);
+
+        // An object of the earlier instance lands at a skipped sequence, and
+        // a collection after the recheck interval deletes it.
+        let late_seq = 5;
+        put_object_with_header(
+            &io,
+            chain_header(late_seq, 1, Some((late_seq - 1, 1))),
+            &[Record {
+                region_id: writer,
+                entry_id: id(late_seq, 1),
+                payload: Bytes::from_static(b"late"),
+            }],
+        )
+        .await;
+        tokio::time::sleep(LATE_OBJECT_RECHECK * 2).await;
+        store.obsolete(&provider(other), other, 0).await.unwrap();
+        assert_eq!(vec![start_seq + 2], collected_object_seqs(&store).await);
+        store.stop().await.unwrap();
+    }
+
+    /// The sequences an instance handed out stay within
+    /// [`UNLISTED_SEQUENCES`] of its newest durable object also with an open
+    /// batch that holds ids beside seven sealed batches, which an append that
+    /// exhausts the positions of the open batch leaves. The next instance
+    /// starts above that open batch, whose object lands late without meeting
+    /// any sequence of that instance.
+    #[tokio::test]
+    async fn test_store_earlier_instance_with_an_open_batch_beside_seven_sealed() {
+        let _serialized = SERIALIZED.lock().await;
+        let object_store = memory_store();
+        let (earlier, _io, mut parked) =
+            open_parking_creates(object_store.clone(), &manual()).await;
+        let writer = region(1);
+        let mut seals = Vec::new();
+        for index in 1..MAX_SEALED_BATCHES - 1 {
+            earlier
+                .append_batch(vec![entry(&earlier, writer, &format!("a{index}"))])
+                .await
+                .unwrap();
+            let sealing = earlier.clone();
+            seals.push(tokio::spawn(async move { sealing.seal_open_batch().await }));
+            timeout(WAIT, async {
+                while earlier.sealed_batches().await.unwrap() < index {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        // The open batch holds the ids of object 7; an append that would
+        // exhaust its positions seals it and takes ids of object 8.
+        earlier
+            .append_batch(vec![entry(&earlier, writer, "a7")])
+            .await
+            .unwrap();
+        let exhausting = (1..POSITION_LIMIT)
+            .map(|_| entry(&earlier, writer, ""))
+            .collect::<Vec<_>>();
+        let response = earlier.append_batch(exhausting).await.unwrap();
+        assert_eq!(
+            Some(&id(UNLISTED_SEQUENCES, POSITION_LIMIT - 1)),
+            response.last_entry_ids.get(&writer)
+        );
+        assert_eq!(
+            MAX_SEALED_BATCHES - 1,
+            earlier.sealed_batches().await.unwrap()
+        );
+
+        // The next instance lists the start object of the earlier one only.
+        let later = open(object_store.clone(), &eager()).await;
+        let start_seq = 1 + UNLISTED_SEQUENCES;
+        // Every object of the earlier instance lands now, the open batch's
+        // last.
+        let mut creates = HashMap::new();
+        seals.push({
+            let sealing = earlier.clone();
+            tokio::spawn(async move { sealing.seal_open_batch().await })
+        });
+        for object_seq in 1..=UNLISTED_SEQUENCES {
+            while !creates.contains_key(&object_seq) {
+                let (parked_seq, release) = next_parked_operation(&mut parked).await;
+                creates.insert(parked_seq, release);
+            }
+            creates.remove(&object_seq).unwrap().send(true).unwrap();
+        }
+        for seal in seals {
+            timeout(WAIT, seal).await.unwrap().unwrap().unwrap();
+        }
+        earlier.stop().await.unwrap();
+
+        append(&later, writer, "b1").await.unwrap();
+        assert_eq!(id(start_seq + 1, 1), latest(&later, writer));
+        later.stop().await.unwrap();
+        let store = open(object_store, &eager()).await;
+        assert_eq!(
+            expected_entries(writer, &[(id(start_seq + 1, 1), "b1")]),
+            read_entries(&store, writer, 0).await
+        );
+        store.stop().await.unwrap();
+    }
+
+    /// A create that never completes does not hold the stop up: once
+    /// `max_unpersisted_age` passed since the stop began, the stop drops the
+    /// backlog and reports it, and every caller waiting for it is answered.
+    #[tokio::test]
+    async fn test_store_stop_abandons_a_create_that_never_completes() {
+        let _serialized = SERIALIZED.lock().await;
+        for ack_mode in [AckMode::Durable, AckMode::Enqueued] {
+            let config = ObjectStoreWalConfig {
+                ack_mode,
+                max_unpersisted_age: Duration::from_millis(200),
+                ..manual()
+            };
+            let (store, io, mut parked) = open_parking_creates(memory_store(), &config).await;
+            let region_id = region(1);
+            store
+                .append_batch(vec![entry(&store, region_id, "a1")])
+                .await
+                .unwrap();
+            let seal = {
+                let store = store.clone();
+                tokio::spawn(async move { store.seal_open_batch().await })
+            };
+            let (object_seq, _never) = next_parked_operation(&mut parked).await;
+            assert_eq!(1, object_seq);
+            let waits = [WaitKind::Barrier, WaitKind::Write]
+                .map(|kind| spawn_wait(&store, region_id, id(1, 1), kind));
+
+            let error = timeout(WAIT, store.stop()).await.unwrap().unwrap_err();
+            assert!(
+                matches!(unwrap_shared(&error), Error::WalObjectUnconfirmed { .. }),
+                "unexpected error: {error:?}"
+            );
+            for wait in waits {
+                timeout(WAIT, wait).await.unwrap().unwrap().unwrap_err();
+            }
+            timeout(WAIT, seal).await.unwrap().unwrap().unwrap_err();
+            assert_eq!(vec![0], object_seqs(io.as_ref()).await);
+        }
+    }
+
     fn spawn_release(
         store: &Arc<ObjectStoreLogStore>,
         region_id: RegionId,
@@ -12724,6 +13040,14 @@ mod tests {
                 );
             }
             let sealed = MAX_SEALED_BATCHES as u64;
+            // An `enqueued` append returned before its object was durable.
+            timeout(
+                WAIT,
+                store.wait_durable(&provider(region_id), id(sealed, 1)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(
                 (1..=sealed).collect::<Vec<_>>(),
                 collected_object_seqs(&store).await

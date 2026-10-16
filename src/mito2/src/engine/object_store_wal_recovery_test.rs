@@ -2859,3 +2859,56 @@ async fn test_two_phase_stop_answers_every_wait_on_the_wal(
         );
     }
 }
+
+/// A create that never completes does not hold the two-phase stop up either:
+/// `max_unpersisted_age` after the stop began, the log store drops its
+/// backlog and reports it, and the deferred writer is answered with an error.
+#[tokio::test]
+async fn test_two_phase_stop_abandons_a_create_that_never_completes() {
+    let mut env = TestEnv::with_prefix("object-store-wal-stop-abandons").await;
+    let config = ObjectStoreWalConfig {
+        max_unpersisted_age: Duration::from_millis(300),
+        ..store_config(AckMode::Durable)
+    };
+    let store = ObjectStoreLogStore::try_new(memory_store(), &config, 0, STANDALONE_GENERATION)
+        .await
+        .unwrap();
+    let engine = new_engine(&mut env, store.clone()).await;
+    let (_, schema) = create_region(&engine, REGION_A, &[]).await;
+
+    store.hold_creates();
+    let deferred = {
+        let engine = engine.clone();
+        let rows = rows(&schema, 0, 3);
+        tokio::spawn(async move { try_put(&engine, REGION_A, rows).await })
+    };
+    wait_for(store.wait_for_admitted_appends(1)).await;
+    let seal = spawn_seal(&store);
+    wait_for(store.wait_for_parked_creates(1)).await;
+
+    // The create stays held throughout the stop.
+    store.begin_stop().await;
+    tokio::time::timeout(WAIT, engine.stop())
+        .await
+        .expect("the engine must stop")
+        .unwrap();
+    let error = tokio::time::timeout(WAIT, store.stop())
+        .await
+        .expect("the log store must stop")
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("did not become durable"),
+        "{error:?}"
+    );
+    assert!(seal.await.unwrap().is_err());
+    let error = tokio::time::timeout(WAIT, deferred)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        StatusCode::DeadlineExceeded,
+        error.status_code(),
+        "{error:?}"
+    );
+}
