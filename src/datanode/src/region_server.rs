@@ -551,6 +551,10 @@ impl RegionServer {
         let requests =
             RegionRequest::try_from_request_body(request).context(BuildRegionRequestsSnafu)?;
 
+        let requests = match self.try_handle_mito_batch_puts(requests).await? {
+            Either::Left(response) => return Ok(response),
+            Either::Right(requests) => requests,
+        };
         // Try to optimize batch Put requests for metric engine
         // Returns either Some(response) or None(requests_back)
         match self.try_handle_metric_batch_puts(requests).await? {
@@ -717,6 +721,73 @@ impl RegionServer {
                 crate::metrics::REGION_SERVER_INSERT_FAIL_COUNT
                     .with_label_values(&[request_type, err.status_code().as_ref()])
                     .inc_by(batch_size as u64);
+                Err(err)
+            }
+        }
+    }
+
+    /// Puts into several ready mito regions together, so that each mito worker gets the puts of
+    /// the request to its regions at once and writes them in one batch.
+    ///
+    /// Returns Either::Right(original_requests) unless every request is a put into a ready mito
+    /// region and there are several of them.
+    async fn try_handle_mito_batch_puts(
+        &self,
+        requests: Vec<(RegionId, RegionRequest)>,
+    ) -> Result<Either<RegionResponse, Vec<(RegionId, RegionRequest)>>> {
+        if requests.len() < 2 {
+            return Ok(Either::Right(requests));
+        }
+        let first_region_id = requests[0].0;
+        let mito = match self.inner.region_map.get(&first_region_id).as_deref() {
+            Some(RegionEngineWithStatus::Ready(engine)) => {
+                engine.as_any().downcast_ref::<MitoEngine>().cloned()
+            }
+            _ => None,
+        };
+        let all_puts_to_ready_mito_regions = requests.iter().all(|(region_id, request)| {
+            matches!(request, RegionRequest::Put(_))
+                && matches!(
+                    self.inner.region_map.get(region_id).as_deref(),
+                    Some(RegionEngineWithStatus::Ready(engine)) if engine.name() == MITO_ENGINE_NAME
+                )
+        });
+        let Some(mito) = mito.filter(|_| all_puts_to_ready_mito_regions) else {
+            return Ok(Either::Right(requests));
+        };
+
+        let request_type = requests[0].1.request_type();
+        let num_requests = requests.len();
+        let puts = requests
+            .into_iter()
+            .map(|(region_id, request)| match request {
+                RegionRequest::Put(put) => (region_id, put),
+                _ => unreachable!("Already checked all are Put"),
+            })
+            .collect();
+        let _timer = crate::metrics::HANDLE_REGION_REQUEST_ELAPSED
+            .with_label_values(&[request_type])
+            .start_timer();
+        let result =
+            common_runtime::spawn_ingest(async move { mito.put_regions_batch(puts).await })
+                .await
+                .context(RuntimeJoinSnafu { request_type })?
+                .map_err(BoxedError::new)
+                .context(HandleRegionRequestSnafu {
+                    region_id: first_region_id,
+                });
+
+        match result {
+            Ok(affected_rows) => {
+                crate::metrics::REGION_CHANGED_ROW_COUNT
+                    .with_label_values(&[request_type])
+                    .inc_by(affected_rows as u64);
+                Ok(Either::Left(RegionResponse::new(affected_rows)))
+            }
+            Err(err) => {
+                crate::metrics::REGION_SERVER_INSERT_FAIL_COUNT
+                    .with_label_values(&[request_type, err.status_code().as_ref()])
+                    .inc_by(num_requests as u64);
                 Err(err)
             }
         }
@@ -2086,15 +2157,22 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use api::v1::region::{InsertRequest, InsertRequests};
     use api::v1::{Rows, SemanticType};
     use common_error::ext::{ErrorExt, RetryHint};
     use common_recordbatch::RecordBatches;
     use common_recordbatch::adapter::{RecordBatchMetrics, RegionWatermarkEntry};
+    use common_wal::config::object_store::{ObjectStoreWalConfig, STANDALONE_GENERATION};
+    use common_wal::options::{ObjectStoreWalOptions, WAL_OPTIONS_KEY, WalOptions};
     use datatypes::prelude::{ConcreteDataType, VectorRef};
     use datatypes::schema::{ColumnSchema, Schema};
     use datatypes::vectors::Int32Vector;
     use futures_util::StreamExt;
-    use mito2::test_util::CreateRequestBuilder;
+    use log_store::ObjectStoreLogStore;
+    use mito2::config::MitoConfig;
+    use mito2::test_util::{CreateRequestBuilder, TestEnv, build_rows, rows_schema};
+    use object_store::ObjectStore;
+    use object_store::services::Memory;
     use query::options::FLOW_RETURN_REGION_SEQ;
     use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
     use store_api::region_engine::RegionEngine;
@@ -3009,5 +3087,108 @@ mod tests {
             .handle_list_metadata_request(&list_metadata_request)
             .await
             .unwrap_err();
+    }
+
+    fn insert_request(region_id: RegionId, rows: Rows) -> InsertRequest {
+        InsertRequest {
+            region_id: region_id.as_u64(),
+            rows: Some(rows),
+            partition_expr_version: None,
+            skip_wal: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mito_puts_of_one_request_share_a_wal_append() {
+        // One worker that takes one message at a time, so that only puts that
+        // arrive in one message share a WAL append.
+        let mut env = TestEnv::with_prefix("region-server-mito-batch-puts").await;
+        let wal_config = ObjectStoreWalConfig::default();
+        let log_store = ObjectStoreLogStore::try_new(
+            ObjectStore::new(Memory::default()).unwrap(),
+            &wal_config,
+            0,
+            STANDALONE_GENERATION,
+        )
+        .await
+        .unwrap();
+        let config = MitoConfig {
+            num_workers: 1,
+            worker_request_batch_size: 1,
+            ..Default::default()
+        };
+        let engine = env
+            .create_engine_with_log_store(config, log_store.clone())
+            .await;
+        let mut region_server = mock_region_server();
+        region_server.register_engine(Arc::new(engine));
+        let wal_options = serde_json::to_string(&WalOptions::ObjectStore(
+            ObjectStoreWalOptions::new(wal_config.node_prefix(0, STANDALONE_GENERATION)),
+        ))
+        .unwrap();
+
+        let mut requests = Vec::new();
+        for region_number in 1..=2 {
+            let region_id = RegionId::new(1, region_number);
+            let request = CreateRequestBuilder::new()
+                .insert_option(WAL_OPTIONS_KEY, &wal_options)
+                .build();
+            let rows = Rows {
+                schema: rows_schema(&request),
+                rows: build_rows(0, 3),
+            };
+            region_server
+                .handle_request(region_id, RegionRequest::Create(request))
+                .await
+                .unwrap();
+            requests.push(insert_request(region_id, rows));
+        }
+        let response = region_server
+            .handle_requests_in_parallel(region_request::Body::Inserts(InsertRequests { requests }))
+            .await
+            .unwrap();
+
+        assert_eq!(6, response.affected_rows);
+        // The worker got both puts at once and appended them together.
+        log_store.wait_for_admitted_appends(1).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::ZERO, log_store.wait_for_admitted_appends(2))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_puts_to_other_engines_are_handled_per_region() {
+        let mut region_server = mock_region_server();
+        let (engine, mut receiver) = MockRegionEngine::new("mock");
+        region_server.register_engine(engine.clone());
+        let region_ids = [RegionId::new(1, 1), RegionId::new(1, 2)];
+        let requests = region_ids
+            .iter()
+            .map(|region_id| {
+                region_server
+                    .inner
+                    .region_map
+                    .insert(*region_id, RegionEngineWithStatus::Ready(engine.clone()));
+                let rows = Rows {
+                    schema: Vec::new(),
+                    rows: Vec::new(),
+                };
+                insert_request(*region_id, rows)
+            })
+            .collect();
+
+        region_server
+            .handle_requests_in_parallel(region_request::Body::Inserts(InsertRequests { requests }))
+            .await
+            .unwrap();
+
+        let mut handled = vec![
+            receiver.recv().await.unwrap().0,
+            receiver.recv().await.unwrap().0,
+        ];
+        handled.sort();
+        assert_eq!(region_ids.to_vec(), handled);
     }
 }
