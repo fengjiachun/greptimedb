@@ -1,0 +1,64 @@
+name: Issue 10455 Windows fix validation
+on:
+  push:
+    branches: [validate/issue-10455-windows-fix]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_RUSTFLAGS: '-C linker=lld-link'
+      RUST_BACKTRACE: 1
+      RUST_MIN_STACK: 8388608
+      PYTHONUTF8: 1
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cyborg
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.23.4,cargo-nextest
+      - uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: '14.0'
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: issue-10455-windows-fix
+          cache-on-failure: true
+      - name: Build patched Windows binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          git rev-parse HEAD | Set-Content evidence/source-commit.txt
+          cargo build --locked -p cmd --bin greptime
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash target/debug/greptime.exe | Format-List | Out-File evidence/binary-sha256.txt
+      - name: Rerun original SQL, NTFS and CLI cases with strict assertions
+        shell: pwsh
+        run: python .github/scripts/issue-10455-windows-fixed.py target/debug/greptime.exe
+      - name: Run unit and integration regressions
+        shell: pwsh
+        run: |
+          cargo nextest run --locked -p common-datasource -p operator -p cli -p tests-integration --test-threads 2 -E 'test(object_store::tests) | test(database_copy::tests) | test(database_export_) | test(data_cli_propagates_copy_failures) | test(packed_export_v2_cli_local_roundtrip) | test(packed_import_v2_without_batch_ddl_roundtrip) | test(metric_export_v2_cli_resume_roundtrip)'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-10455-windows-fixed-evidence
+          path: |
+            evidence/
+            target/nextest/default/junit.xml
+          retention-days: 14
+          if-no-files-found: error
