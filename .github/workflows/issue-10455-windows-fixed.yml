@@ -64,3 +64,32 @@ jobs:
             target/nextest/default/junit.xml
           retention-days: 14
           if-no-files-found: error
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_RUSTFLAGS: '-C link-arg=-fuse-ld=lld'
+      RUST_BACKTRACE: 1
+      RUST_MIN_STACK: 8388608
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cyborg
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.23.4,cargo-nextest
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: issue-10455-linux-fix
+          cache-on-failure: true
+      - name: Run Linux case-sensitive export and CLI regressions
+        run: |
+          cargo nextest run --locked -p operator -p cli -p tests-integration --test-threads 2 --retries 0 --no-fail-fast -E 'package(operator) | package(cli) | test(export_logical_tables::)'
