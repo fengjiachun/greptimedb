@@ -1,0 +1,46 @@
+name: Issue 10455 Windows reproduction
+on:
+  push:
+    branches: [investigate/issue-10455-windows]
+    paths:
+      - .github/workflows/issue-10455-windows.yml
+      - .github/scripts/issue-10455-windows.py
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download and verify fixed Windows build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force evidence, binary | Out-Null
+          $url = 'https://github.com/GreptimeTeam/greptimedb/releases/download/v1.4.0-nightly-20261116/greptime-windows-amd64-v1.4.0-nightly-20261116.tar.gz'
+          $expected = 'd31c88d097e62c45511d4798931513780e714f0809c31d38de61c4017ea216ed'
+          Invoke-WebRequest -Uri $url -OutFile binary.tar.gz
+          $actual = (Get-FileHash binary.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant()
+          @{url=$url; expected_sha256=$expected; actual_sha256=$actual} | ConvertTo-Json | Set-Content evidence/build.json
+          if ($actual -ne $expected) { throw 'Build SHA256 mismatch' }
+          tar -xzf binary.tar.gz -C binary
+          if ($LASTEXITCODE -ne 0) { throw 'Build extraction failed' }
+          $exe = @(Get-ChildItem binary -Recurse -Filter greptime.exe)
+          if ($exe.Count -ne 1) { throw 'Expected exactly one greptime.exe' }
+          "GREPTIME_EXE=$($exe[0].FullName)" >> $env:GITHUB_ENV
+      - name: Exercise SQL, NTFS streams, Prometheus, and CLI roundtrips
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: python .github/scripts/issue-10455-windows.py "$env:GREPTIME_EXE"
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-10455-windows-evidence
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
