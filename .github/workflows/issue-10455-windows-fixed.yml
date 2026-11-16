@@ -39,10 +39,12 @@ jobs:
       - name: Build patched Windows binary
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force evidence | Out-Null
-          git rev-parse HEAD | Set-Content evidence/source-commit.txt
+          $status = git status --porcelain
+          if ($status) { $status; throw 'Source checkout is not clean before build' }
           cargo build --locked -p cmd --bin greptime
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          git rev-parse HEAD | Set-Content evidence/source-commit.txt
           Get-FileHash target/debug/greptime.exe | Format-List | Out-File evidence/binary-sha256.txt
       - name: Rerun original SQL, NTFS and CLI cases with strict assertions
         shell: pwsh
@@ -50,7 +52,7 @@ jobs:
       - name: Run unit and integration regressions
         shell: pwsh
         run: |
-          cargo nextest run --locked -p common-datasource -p operator -p cli -p tests-integration --test-threads 2 -E 'test(object_store::tests) | test(database_copy::tests) | test(database_export_) | test(data_cli_propagates_copy_failures) | test(packed_export_v2_cli_local_roundtrip) | test(packed_import_v2_without_batch_ddl_roundtrip) | test(metric_export_v2_cli_resume_roundtrip)'
+          cargo nextest run --locked -p common-datasource -p operator -p cli -p tests-integration --test-threads 2 --retries 0 --no-fail-fast -E 'test(object_store::tests) | test(database_copy::tests) | test(database_export_) | test(data_cli_propagates_copy_failures) | test(packed_export_v2_cli_local_roundtrip) | test(packed_import_v2_without_batch_ddl_roundtrip) | test(metric_export_v2_cli_resume_roundtrip)'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve evidence
         if: always()
