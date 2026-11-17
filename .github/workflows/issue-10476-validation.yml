@@ -1,0 +1,50 @@
+name: Issue 10476 packed backend validation
+on:
+  push:
+    branches: [validate/issue-10476-windows]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_RUSTFLAGS: '-C linker=lld-link'
+      RUST_BACKTRACE: 1
+      RUST_MIN_STACK: 8388608
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cyborg
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.23.4,cargo-nextest
+      - uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: '14.0'
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: issue-10476-windows
+          cache-on-failure: true
+      - name: Run writer, cleanup and local export/import regressions
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          cargo nextest run --locked -p common-datasource -p operator -p tests-integration --test-threads 2 --retries 0 --no-fail-fast -E 'test(parquet_writer::tests) | test(packed_writer::tests) | test(copy_table_to::tests) | test(export_logical_tables::tests) | test(database_export_standalone_roundtrip) | test(database_export_distributed_roundtrip) | test(packed_export_v2_cli_local_roundtrip) | test(packed_import_v2_without_batch_ddl_roundtrip) | test(metric_export_v2_cli_resume_roundtrip)'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-10476-windows-results
+          path: target/nextest/default/junit.xml
+          retention-days: 14
