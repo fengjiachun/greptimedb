@@ -224,6 +224,18 @@ impl StatementExecutor {
             _ => unreachable!(),
         };
 
+        if let (Some((budget, token)), Some(packed)) = (managed, packed) {
+            let path = packed.path().to_owned();
+            return stream_to_managed_parquet_with_packed(
+                stream,
+                ManagedParquetDestination::Packed(packed),
+                &path,
+                budget,
+                token,
+            )
+            .await;
+        }
+
         let backend =
             build_backend_for_write_with_path(location, connection, &self.local_file_access)
                 .await
@@ -234,11 +246,10 @@ impl StatementExecutor {
         if let Some((budget, token)) = managed {
             stream_to_managed_parquet_with_packed(
                 stream,
-                backend.object_store,
+                ManagedParquetDestination::Object(backend.object_store),
                 &filename,
                 budget,
                 token,
-                packed,
             )
             .await
         } else {
@@ -246,6 +257,11 @@ impl StatementExecutor {
                 .await
         }
     }
+}
+
+enum ManagedParquetDestination {
+    Object(ObjectStore),
+    Packed(PackedTableWriter),
 }
 
 #[cfg(test)]
@@ -256,16 +272,22 @@ pub(crate) async fn stream_to_managed_parquet(
     budget: &ExportWriteBudget,
     token: &CancellationToken,
 ) -> Result<usize> {
-    stream_to_managed_parquet_with_packed(stream, store, path, budget, token, None).await
+    stream_to_managed_parquet_with_packed(
+        stream,
+        ManagedParquetDestination::Object(store),
+        path,
+        budget,
+        token,
+    )
+    .await
 }
 
 async fn stream_to_managed_parquet_with_packed(
     mut stream: SendableRecordBatchStream,
-    store: ObjectStore,
+    destination: ManagedParquetDestination,
     path: &str,
     budget: &ExportWriteBudget,
     token: &CancellationToken,
-    packed: Option<PackedTableWriter>,
 ) -> Result<usize> {
     use common_recordbatch::{RecordBatch, map_dictionary_to_values_schema};
     let original = stream.schema();
@@ -284,19 +306,19 @@ async fn stream_to_managed_parquet_with_packed(
     } else {
         expanded_schema.clone()
     };
-    let packed_destination = packed.is_some();
-    let mut writer = if let Some(packed) = packed {
-        ParquetFileWriter::open_packed(
+    let packed_destination = matches!(destination, ManagedParquetDestination::Packed(_));
+    let mut writer = match destination {
+        ManagedParquetDestination::Packed(packed) => ParquetFileWriter::open_packed(
             output_schema.arrow_schema().clone(),
-            store,
-            path,
             Some(
                 crate::statement::export_logical_tables::LogicalTableExportLimits::default().writer,
             ),
             packed,
-        )
-    } else {
-        ParquetFileWriter::open(output_schema.arrow_schema().clone(), store, path, 1, None).await
+        ),
+        ManagedParquetDestination::Object(store) => {
+            ParquetFileWriter::open(output_schema.arrow_schema().clone(), store, path, 1, None)
+                .await
+        }
     }
     .context(error::WriteStreamToFileSnafu { path })?;
     let mut started = false;
