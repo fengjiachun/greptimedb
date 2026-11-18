@@ -98,6 +98,10 @@ mod truncate_test;
 mod copy_region_from_test;
 #[cfg(test)]
 mod remap_manifests_test;
+#[cfg(test)]
+mod repartition_fault_test;
+#[cfg(test)]
+mod repartition_window_bench_test;
 
 #[cfg(test)]
 mod apply_staging_manifest_test;

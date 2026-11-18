@@ -2084,6 +2084,110 @@ mod tests {
         assert!(manager.procedure_state(child_id).await.unwrap().is_none());
     }
 
+    /// Records the order in which procedures execute.
+    #[derive(Debug)]
+    struct OrderRecordingProcedure {
+        name: String,
+        lock_key: LockKey,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Procedure for OrderRecordingProcedure {
+        fn type_name(&self) -> &str {
+            "OrderRecordingProcedure"
+        }
+
+        async fn execute(&mut self, _ctx: &Context) -> Result<Status> {
+            self.order.lock().unwrap().push(self.name.clone());
+            sleep(Duration::from_millis(5)).await;
+            Ok(Status::done())
+        }
+
+        fn dump(&self) -> Result<String> {
+            Ok(self.name.clone())
+        }
+
+        fn lock_key(&self) -> LockKey {
+            self.lock_key.clone()
+        }
+    }
+
+    /// A procedure that needs two keys does not run while another procedure
+    /// holds one of them, and does not keep a later procedure off the other key.
+    /// The keys stand for region locks: a repartition group holding region S,
+    /// a migration batch over S and X, and a migration of X alone.
+    #[tokio::test]
+    async fn rpfault_r12_procedure_waiting_for_one_of_two_keys() {
+        let dir = create_temp_dir("rpfault_r12");
+        let state_store = Arc::new(ObjectStateStore::new(test_util::new_object_store(&dir)));
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(
+            ManagerConfig::default(),
+            state_store,
+            poison_manager,
+            None,
+            None,
+        );
+        manager.start().await.unwrap();
+
+        // A group holding the lock of region S.
+        let (started_tx, started_rx) = oneshot::channel();
+        manager
+            .submit(ProcedureWithId {
+                id: ProcedureId::random(),
+                procedure: Box::new(BlockingProcedure {
+                    started_tx: Some(started_tx),
+                    dropped: Arc::new(AtomicBool::new(false)),
+                    lock_key: LockKey::single_exclusive("region/S"),
+                }),
+                context: ProcedureContext::default(),
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        // One migration batch over regions S and X.
+        manager
+            .submit(ProcedureWithId {
+                id: ProcedureId::random(),
+                procedure: Box::new(OrderRecordingProcedure {
+                    name: "batch[S,X]".to_string(),
+                    lock_key: LockKey::new_exclusive([
+                        "region/S".to_string(),
+                        "region/X".to_string(),
+                    ]),
+                    order: order.clone(),
+                }),
+                context: ProcedureContext::default(),
+            })
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(200)).await;
+        // A later migration of region X alone.
+        manager
+            .submit(ProcedureWithId {
+                id: ProcedureId::random(),
+                procedure: Box::new(OrderRecordingProcedure {
+                    name: "single[X]".to_string(),
+                    lock_key: LockKey::single_exclusive("region/X"),
+                    order: order.clone(),
+                }),
+                context: ProcedureContext::default(),
+            })
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(500)).await;
+        let ran = order.lock().unwrap().clone();
+        println!("OBSERVED r12 executed while region/S is held: {ran:?}");
+        assert_eq!(vec!["single[X]".to_string()], ran);
+        manager.stop().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_submit_procedure() {
         let dir = create_temp_dir("submit");

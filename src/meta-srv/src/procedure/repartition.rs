@@ -1525,6 +1525,155 @@ mod tests {
         assert_eq!(region_routes[1].region.id, RegionId::new(table_id, 2));
     }
 
+    /// Whether a plan's route switch has been written can be read from the
+    /// routes and the plan the parent persists, during staging and after it.
+    #[test]
+    fn rpfault_h4_switch_is_visible_in_routes_for_split_and_merge() {
+        let table_id = 1024;
+        let split = test_plan(table_id);
+        let merge = RepartitionPlanEntry {
+            group_id: uuid::Uuid::new_v4(),
+            source_regions: vec![
+                SourceRegionDescriptor::partitioned(
+                    RegionId::new(table_id, 1),
+                    range_expr("x", 0, 50),
+                ),
+                SourceRegionDescriptor::partitioned(
+                    RegionId::new(table_id, 2),
+                    range_expr("x", 50, 100),
+                ),
+            ],
+            target_regions: vec![TargetRegionDescriptor {
+                region_id: RegionId::new(table_id, 1),
+                partition_expr: range_expr("x", 0, 100),
+            }],
+            allocated_region_ids: vec![],
+            pending_deallocate_region_ids: vec![RegionId::new(table_id, 2)],
+            transition_map: vec![vec![0], vec![0]],
+            original_target_routes: vec![],
+        };
+        let split_routes = vec![
+            test_region_route(
+                RegionId::new(table_id, 1),
+                &range_expr("x", 0, 100).as_json_str().unwrap(),
+            ),
+            test_region_route(
+                RegionId::new(table_id, 3),
+                &range_expr("x", 50, 100).as_json_str().unwrap(),
+            ),
+        ];
+        let merge_routes = vec![
+            test_region_route(
+                RegionId::new(table_id, 1),
+                &range_expr("x", 0, 50).as_json_str().unwrap(),
+            ),
+            test_region_route(
+                RegionId::new(table_id, 2),
+                &range_expr("x", 50, 100).as_json_str().unwrap(),
+            ),
+        ];
+        // "Not switched" as the parent could compute it from its persisted plan:
+        // every source route still equals what it was before the switch.
+        let untouched = |plan: &RepartitionPlanEntry,
+                         before: &[RegionRoute],
+                         now: &[RegionRoute]| {
+            plan.source_regions.iter().all(|source| {
+                let id = source.region_id();
+                before.iter().find(|r| r.region.id == id) == now.iter().find(|r| r.region.id == id)
+            })
+        };
+        for (name, plan, routes) in [
+            ("split", &split, &split_routes),
+            ("merge", &merge, &merge_routes),
+        ] {
+            let staged = apply_group_staging(plan, routes);
+            let exited = exit_group_staging(plan, &staged);
+            println!(
+                "OBSERVED h4 {name}: sources untouched before={} during staging={} after exit={}",
+                untouched(plan, routes, routes),
+                untouched(plan, routes, &staged),
+                untouched(plan, routes, &exited)
+            );
+            assert!(untouched(plan, routes, routes));
+            assert!(!untouched(plan, routes, &staged));
+            assert!(!untouched(plan, routes, &exited));
+        }
+    }
+
+    /// The parent's rollback in the Dispatch state, for a plan whose route switch
+    /// has been written (a metasrv restart after the switch, then a parent failure).
+    #[tokio::test]
+    async fn rpfault_h5_dispatch_rollback_of_a_switched_plan() {
+        let env = TestingEnv::new();
+        let table_id = 1024;
+        let node_manager = Arc::new(MockDatanodeManager::new(UnexpectedErrorDatanodeHandler));
+        let ddl_ctx = env.ddl_context(node_manager);
+        let original_region_routes = vec![
+            test_region_route(
+                RegionId::new(table_id, 1),
+                &range_expr("x", 0, 100).as_json_str().unwrap(),
+            ),
+            test_region_route(
+                RegionId::new(table_id, 3),
+                &range_expr("x", 50, 100).as_json_str().unwrap(),
+            ),
+        ];
+        let plan = with_rollback_metadata(
+            test_plan(table_id),
+            vec![test_region_route(
+                RegionId::new(table_id, 1),
+                &range_expr("x", 0, 100).as_json_str().unwrap(),
+            )],
+        );
+        let switched = apply_group_staging(&plan, &original_region_routes);
+        env.create_physical_table_metadata_with_wal_options(
+            table_id,
+            switched,
+            test_region_wal_options(&[1, 3]),
+        )
+        .await;
+        let mut persistent_ctx = PersistentContext::new(
+            TableName::new("test_catalog", "test_schema", "test_table"),
+            table_id,
+            None,
+        );
+        persistent_ctx.plans = vec![plan];
+        let context = Context::new(
+            &ddl_ctx,
+            env.mailbox_ctx.mailbox().clone(),
+            env.server_addr.clone(),
+            persistent_ctx,
+        );
+        let mut procedure = RepartitionProcedure {
+            state: Box::new(Dispatch),
+            context,
+        };
+        let result = procedure.rollback(&TestingEnv::procedure_context()).await;
+        let region_routes = current_parent_region_routes(&procedure.context).await;
+        // The new region's route is gone; the source keeps the mark and the target expression.
+        assert!(result.is_ok());
+        assert_eq!(1, region_routes.len());
+        assert_eq!(RegionId::new(table_id, 1), region_routes[0].region.id);
+        assert!(region_routes[0].is_leader_staging());
+        assert_eq!(
+            range_expr("x", 0, 50).as_json_str().unwrap(),
+            region_routes[0].region.partition_expr
+        );
+        println!(
+            "OBSERVED h5 rollback result: {:?}; routes after: {:?}",
+            result.as_ref().map_err(|e| e.to_string()),
+            region_routes
+                .iter()
+                .map(|r| (
+                    r.region.id.region_number(),
+                    r.region.partition_expr.clone(),
+                    format!("{:?}", r.leader_state),
+                    format!("{:?}", r.write_route_policy)
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn test_repartition_rollback_removes_allocated_routes_from_allocate() {
         let env = TestingEnv::new();
@@ -1762,6 +1911,149 @@ mod tests {
             .rollback(&TestingEnv::procedure_context())
             .await
             .unwrap();
+
+        assert_eq!(
+            current_parent_region_routes(&procedure.context).await,
+            vec![
+                test_region_route(
+                    RegionId::new(table_id, 1),
+                    &range_expr("x", 0, 100).as_json_str().unwrap(),
+                ),
+                RegionRoute {
+                    region: Region {
+                        id: RegionId::new(table_id, 2),
+                        partition_expr: range_expr("x", 100, 150).as_json_str().unwrap(),
+                        ..Default::default()
+                    },
+                    leader_peer: Some(Peer::empty(1)),
+                    ..Default::default()
+                },
+                RegionRoute {
+                    region: Region {
+                        id: RegionId::new(table_id, 4),
+                        partition_expr: range_expr("x", 150, 200).as_json_str().unwrap(),
+                        ..Default::default()
+                    },
+                    leader_peer: Some(Peer::empty(1)),
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rpfault_r11_rollback_undoes_table_partition_metadata_next_to_a_finished_plan() {
+        let env = TestingEnv::new();
+        let table_id = 1024;
+        let node_manager = Arc::new(MockDatanodeManager::new(UnexpectedErrorDatanodeHandler));
+        let ddl_ctx = env.ddl_context(node_manager);
+        let original_region_routes = vec![
+            test_region_route(
+                RegionId::new(table_id, 1),
+                &range_expr("x", 0, 100).as_json_str().unwrap(),
+            ),
+            test_region_route(
+                RegionId::new(table_id, 2),
+                &range_expr("x", 100, 200).as_json_str().unwrap(),
+            ),
+            test_region_route(RegionId::new(table_id, 3), ""),
+            test_region_route(RegionId::new(table_id, 4), ""),
+        ];
+
+        let failed_plan = with_rollback_metadata(
+            test_plan(table_id),
+            vec![
+                original_region_routes[0].clone(),
+                original_region_routes[2].clone(),
+            ],
+        );
+        let succeeded_plan = RepartitionPlanEntry {
+            group_id: Uuid::new_v4(),
+            source_regions: vec![SourceRegionDescriptor::partitioned(
+                RegionId::new(table_id, 2),
+                range_expr("x", 100, 200),
+            )],
+            target_regions: vec![
+                TargetRegionDescriptor {
+                    region_id: RegionId::new(table_id, 2),
+                    partition_expr: range_expr("x", 100, 150),
+                },
+                TargetRegionDescriptor {
+                    region_id: RegionId::new(table_id, 4),
+                    partition_expr: range_expr("x", 150, 200),
+                },
+            ],
+            allocated_region_ids: vec![RegionId::new(table_id, 4)],
+            pending_deallocate_region_ids: vec![],
+            transition_map: vec![vec![0, 1]],
+            original_target_routes: vec![
+                original_region_routes[1].clone(),
+                original_region_routes[3].clone(),
+            ],
+        };
+        let current_region_routes = apply_group_staging(&failed_plan, &original_region_routes);
+        let current_region_routes = apply_group_staging(&succeeded_plan, &current_region_routes);
+        let current_region_routes = exit_group_staging(&succeeded_plan, &current_region_routes);
+        env.create_physical_table_metadata_with_wal_options(
+            table_id,
+            current_region_routes,
+            test_region_wal_options(&[1, 2, 3, 4]),
+        )
+        .await;
+
+        let mut persistent_ctx = PersistentContext::new(
+            TableName::new("test_catalog", "test_schema", "test_table"),
+            table_id,
+            None,
+        );
+        persistent_ctx.plans = vec![failed_plan, succeeded_plan.clone()];
+        persistent_ctx.failed_procedures = vec![ProcedureMeta {
+            plan_index: 0,
+            group_id: persistent_ctx.plans[0].group_id,
+            procedure_id: ProcedureId::random(),
+        }];
+
+        let mut context = Context::new(
+            &ddl_ctx,
+            env.mailbox_ctx.mailbox().clone(),
+            env.server_addr.clone(),
+            persistent_ctx,
+        );
+        // The repartition also changed the table's partition columns from [1] to [0, 1].
+        let current = context.get_raw_table_info_value().await.unwrap();
+        let mut table_info = current.table_info.clone();
+        table_info.meta.partition_key_indices = vec![0, 1];
+        context
+            .update_table_info(&current, current.update(table_info))
+            .await
+            .unwrap();
+        context.persistent_ctx.partition_metadata_update = Some(
+            PartitionMetadataUpdate::from_partitioned(vec![1], vec![0, 1]),
+        );
+        let mut procedure = RepartitionProcedure {
+            state: Box::new(Collect::new(vec![])),
+            context,
+        };
+
+        procedure
+            .rollback(&TestingEnv::procedure_context())
+            .await
+            .unwrap();
+
+        // One plan succeeded and keeps its target expressions (asserted below);
+        // what happened to the table-level partition columns?
+        let indices = procedure
+            .context
+            .get_table_info_value()
+            .await
+            .unwrap()
+            .table_info
+            .meta
+            .partition_key_indices;
+        println!(
+            "OBSERVED r11 partition_key_indices after rollback with one finished plan: {indices:?}"
+        );
+        assert_eq!(vec![1], indices);
 
         assert_eq!(
             current_parent_region_routes(&procedure.context).await,

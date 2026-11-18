@@ -212,9 +212,173 @@ mod tests {
     use uuid::Uuid;
 
     use crate::error::Error;
+    use crate::procedure::repartition::group::State;
     use crate::procedure::repartition::group::repartition_start::RepartitionStart;
+    use crate::procedure::repartition::group::update_metadata::UpdateMetadata;
     use crate::procedure::repartition::plan::{SourceRegionDescriptor, TargetRegionDescriptor};
-    use crate::procedure::repartition::test_util::range_expr;
+    use crate::procedure::repartition::test_util::{
+        TestingEnv, new_persistent_context, range_expr, test_region_route,
+    };
+
+    /// A group whose deadline has already passed still writes the route switch
+    /// and fails on the next step.
+    #[tokio::test]
+    async fn rpfault_s1_group_past_its_deadline_still_switches() {
+        use crate::procedure::repartition::group::enter_staging_region::EnterStagingRegion;
+
+        let env = TestingEnv::new();
+        let table_id = 1024;
+        let source_id = RegionId::new(table_id, 1);
+        let new_target_id = RegionId::new(table_id, 2);
+        env.create_physical_table_metadata(
+            table_id,
+            vec![
+                test_region_route(source_id, &range_expr("x", 0, 100).as_json_str().unwrap()),
+                test_region_route(
+                    new_target_id,
+                    &range_expr("x", 50, 100).as_json_str().unwrap(),
+                ),
+            ],
+        )
+        .await;
+        let sources = vec![SourceRegionDescriptor::partitioned(
+            source_id,
+            range_expr("x", 0, 100),
+        )];
+        let targets = vec![
+            TargetRegionDescriptor {
+                region_id: source_id,
+                partition_expr: range_expr("x", 0, 50),
+            },
+            TargetRegionDescriptor {
+                region_id: new_target_id,
+                partition_expr: range_expr("x", 50, 100),
+            },
+        ];
+        let mut persistent_ctx = new_persistent_context(table_id, sources, targets);
+        persistent_ctx.timeout = std::time::Duration::ZERO;
+        let mut ctx = env.create_context(persistent_ctx);
+        let procedure_ctx = TestingEnv::procedure_context();
+        assert!(ctx.next_operation_timeout().is_none());
+
+        RepartitionStart
+            .next(&mut ctx, &procedure_ctx)
+            .await
+            .unwrap();
+        // The switch is written although the deadline has passed.
+        UpdateMetadata::ApplyStaging
+            .next(&mut ctx, &procedure_ctx)
+            .await
+            .unwrap();
+        let table_route = ctx.get_table_route_value().await.unwrap();
+        let routes = table_route.region_routes().unwrap();
+        let source_route = routes.iter().find(|r| r.region.id == source_id).unwrap();
+        assert_eq!(
+            range_expr("x", 0, 50).as_json_str().unwrap(),
+            source_route.region.partition_expr
+        );
+        assert!(source_route.is_leader_staging());
+        // The next step fails with a non-retryable error.
+        let err = EnterStagingRegion
+            .next(&mut ctx, &procedure_ctx)
+            .await
+            .unwrap_err();
+        println!("OBSERVED s1 step after the switch: {err}");
+        assert_matches!(err, Error::ExceededDeadline { .. });
+    }
+
+    /// The group's lock keys cover its sources only, not newly allocated targets.
+    #[test]
+    fn rpfault_s3_group_lock_keys_do_not_cover_new_targets() {
+        let table_id = 1024;
+        let source_id = RegionId::new(table_id, 1);
+        let new_target_id = RegionId::new(table_id, 2);
+        let persistent_ctx = new_persistent_context(
+            table_id,
+            vec![SourceRegionDescriptor::partitioned(
+                source_id,
+                range_expr("x", 0, 100),
+            )],
+            vec![
+                TargetRegionDescriptor {
+                    region_id: source_id,
+                    partition_expr: range_expr("x", 0, 50),
+                },
+                TargetRegionDescriptor {
+                    region_id: new_target_id,
+                    partition_expr: range_expr("x", 50, 100),
+                },
+            ],
+        );
+        let keys = format!("{:?}", persistent_ctx.lock_key());
+        println!("OBSERVED s3 group lock keys: {keys}");
+        assert!(keys.contains(&source_id.as_u64().to_string()));
+        assert!(!keys.contains(&new_target_id.as_u64().to_string()));
+    }
+
+    /// The parent persists nothing after Dispatch, so after a metasrv restart
+    /// it re-dispatches every group with a fresh context. A group that already
+    /// ran ApplyStaging must still get past RepartitionStart when re-dispatched.
+    #[tokio::test]
+    async fn rpfault_f2_redispatched_group_after_switch_is_rejected() {
+        let env = TestingEnv::new();
+        let table_id = 1024;
+        let source_id = RegionId::new(table_id, 1);
+        let new_target_id = RegionId::new(table_id, 2);
+        env.create_physical_table_metadata(
+            table_id,
+            vec![
+                test_region_route(source_id, &range_expr("x", 0, 100).as_json_str().unwrap()),
+                test_region_route(
+                    new_target_id,
+                    &range_expr("x", 50, 100).as_json_str().unwrap(),
+                ),
+            ],
+        )
+        .await;
+        // Split: the source keeps [0, 50), the new region takes [50, 100).
+        let sources = vec![SourceRegionDescriptor::partitioned(
+            source_id,
+            range_expr("x", 0, 100),
+        )];
+        let targets = vec![
+            TargetRegionDescriptor {
+                region_id: source_id,
+                partition_expr: range_expr("x", 0, 50),
+            },
+            TargetRegionDescriptor {
+                region_id: new_target_id,
+                partition_expr: range_expr("x", 50, 100),
+            },
+        ];
+        let procedure_ctx = TestingEnv::procedure_context();
+
+        // First dispatch: RepartitionStart, then ApplyStaging commits the new routes.
+        let mut ctx = env.create_context(new_persistent_context(
+            table_id,
+            sources.clone(),
+            targets.clone(),
+        ));
+        let (next, _) = RepartitionStart
+            .next(&mut ctx, &procedure_ctx)
+            .await
+            .unwrap();
+        assert!(next.as_any().is::<UpdateMetadata>());
+        UpdateMetadata::ApplyStaging
+            .next(&mut ctx, &procedure_ctx)
+            .await
+            .unwrap();
+
+        // Metasrv restarts and Dispatch re-creates the group with a fresh context.
+        let mut ctx = env.create_context(new_persistent_context(table_id, sources, targets));
+        let result = RepartitionStart.next(&mut ctx, &procedure_ctx).await;
+        // On main the re-dispatched group is rejected, which ends in the parent rollback.
+        println!(
+            "OBSERVED f2 re-dispatched group: {:?}",
+            result.as_ref().map(|_| ()).map_err(|e| e.to_string())
+        );
+        assert_matches!(result.unwrap_err(), Error::PartitionExprMismatch { .. });
+    }
 
     #[test]
     fn test_ensure_route_present_missing_source_region() {

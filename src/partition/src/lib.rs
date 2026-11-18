@@ -24,6 +24,8 @@ pub mod manager;
 pub mod multi_dim;
 pub mod overlap;
 pub mod partition;
+#[cfg(test)]
+mod repartition_fault_test;
 pub mod simplify;
 pub mod splitter;
 pub mod subtask;

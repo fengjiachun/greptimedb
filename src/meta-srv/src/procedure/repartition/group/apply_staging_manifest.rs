@@ -402,3 +402,60 @@ impl ApplyStagingManifest {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod rpfault_tests {
+    use std::collections::HashMap;
+
+    use common_meta::peer::Peer;
+    use common_meta::rpc::router::{Region, RegionRoute};
+    use store_api::storage::RegionId;
+
+    use super::ApplyStagingManifest;
+    use crate::procedure::repartition::plan::TargetRegionDescriptor;
+    use crate::procedure::repartition::test_util::range_expr;
+
+    /// When the remap result lacks a path for a target, building the apply
+    /// instructions panics.
+    #[test]
+    fn rpfault_s2_missing_manifest_path_panics() {
+        let table_id = 1024;
+        let central = RegionId::new(table_id, 1);
+        let new_target = RegionId::new(table_id, 2);
+        let route = |region_id: RegionId| RegionRoute {
+            region: Region {
+                id: region_id,
+                ..Default::default()
+            },
+            leader_peer: Some(Peer::empty(1)),
+            ..Default::default()
+        };
+        let targets = vec![
+            TargetRegionDescriptor {
+                region_id: central,
+                partition_expr: range_expr("x", 0, 50),
+            },
+            TargetRegionDescriptor {
+                region_id: new_target,
+                partition_expr: range_expr("x", 50, 100),
+            },
+        ];
+        // A path for the central region only.
+        let paths: HashMap<RegionId, String> = [(central, "remap_manifest_central".to_string())]
+            .into_iter()
+            .collect();
+        let routes = vec![route(central), route(new_target)];
+        let result = std::panic::catch_unwind(|| {
+            ApplyStagingManifest::build_apply_staging_manifest_instructions(
+                &paths, &routes, &targets, central,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        });
+        println!(
+            "OBSERVED s2 building instructions with a missing path panicked: {}",
+            result.is_err()
+        );
+        assert!(result.is_err());
+    }
+}
