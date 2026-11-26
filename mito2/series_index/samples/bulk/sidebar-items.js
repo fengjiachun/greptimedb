@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["NarthexBulkColumn"],"struct":["NarthexBulkBlock","NarthexBulkPart"]};
